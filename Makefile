@@ -19,14 +19,6 @@ format:
 	ruff format src/ tests/
 
 skylos:
-	@python -c "\
-	import pathlib, importlib.util; \
-	spec = importlib.util.find_spec('skylos.visitors.languages.go.go'); \
-	p = pathlib.Path(spec.origin) if spec else None; \
-	p and 'try:' not in p.read_text() and p.write_text(p.read_text().replace( \
-	  'from skylos.engines.go_runner import run_go_engine_for_module', \
-	  'try:\n    from skylos.engines.go_runner import run_go_engine_for_module\nexcept ModuleNotFoundError:\n    run_go_engine_for_module = None')) \
-	" 2>/dev/null || true
 	skylos src/
 
 clean:

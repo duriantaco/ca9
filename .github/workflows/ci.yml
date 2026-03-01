@@ -41,18 +41,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install skylos==3.5.1
-      - name: Patch skylos 3.5.1 missing engines module
-        run: |
-          python -c "
-          import pathlib, importlib.util
-          spec = importlib.util.find_spec('skylos.visitors.languages.go.go')
-          if spec and spec.origin:
-              p = pathlib.Path(spec.origin)
-              txt = p.read_text()
-              if 'try:' not in txt:
-                  p.write_text(txt.replace(
-                      'from skylos.engines.go_runner import run_go_engine_for_module',
-                      'try:\n    from skylos.engines.go_runner import run_go_engine_for_module\nexcept ModuleNotFoundError:\n    run_go_engine_for_module = None'))
-          "
+      - run: pip install skylos==3.5.2
       - run: skylos src/ --json
