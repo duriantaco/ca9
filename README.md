@@ -143,39 +143,14 @@ ca9 check snyk.json --repo . --coverage coverage.json
 ca9 check dependabot.json --repo .
 ```
 
-Format is auto-detected. Currently supports Snyk (`snyk test --json`) and Dependabot (`gh api repos/{owner}/{repo}/dependabot/alerts`).
+Format is auto-detected. Supports **Snyk**, **Dependabot**, **Trivy**, and **pip-audit**:
 
-## Using a different SCA tool
-
-If you use Trivy, Grype, or anything else ca9 doesn't parse yet:
-
-**Option 1:** Use `ca9 scan` — it queries OSV.dev directly, no SCA report needed.
-
-**Option 2:** Add a parser (~30 lines):
-
-```python
-from ca9.models import Vulnerability
-
-class TrivyParser:
-    def can_parse(self, data):
-        return isinstance(data, dict) and "Results" in data
-
-    def parse(self, data):
-        vulns = []
-        for result in data.get("Results", []):
-            for v in result.get("Vulnerabilities", []):
-                vulns.append(Vulnerability(
-                    id=v["VulnerabilityID"],
-                    package_name=v["PkgName"],
-                    package_version=v.get("InstalledVersion", ""),
-                    severity=v.get("Severity", "unknown").lower(),
-                    title=v.get("Title", ""),
-                    description=v.get("Description", ""),
-                ))
-        return vulns
+```bash
+ca9 check snyk.json --repo .
+ca9 check dependabot.json --repo .
+ca9 check trivy.json --repo .
+ca9 check pip-audit.json --repo .
 ```
-
-Register it in `src/ca9/parsers/__init__.py` and `ca9 check trivy.json` works.
 
 ## Verdicts
 
@@ -193,12 +168,30 @@ ca9 scan [OPTIONS]              Scan installed packages via OSV.dev
 ca9 check SCA_REPORT [OPTIONS]  Analyze a Snyk/Dependabot report
 
 Options:
-  -r, --repo PATH           Path to the project repository  [default: .]
-  -c, --coverage PATH       Path to coverage.json for dynamic analysis
-  -f, --format [table|json] Output format  [default: table]
-  -o, --output PATH         Write output to file instead of stdout
-  -v, --verbose             Show reasoning trace for each verdict
+  -r, --repo PATH                  Path to the project repository  [default: .]
+  -c, --coverage PATH              Path to coverage.json for dynamic analysis
+  -f, --format [table|json|sarif]  Output format  [default: table]
+  -o, --output PATH                Write output to file instead of stdout
+  -v, --verbose                    Show reasoning trace for each verdict
+
+Exit codes:
+  0  Clean — no reachable CVEs
+  1  Reachable CVEs found — action needed
+  2  Inconclusive only — need more coverage data
 ```
+
+### Config file
+
+Create a `.ca9.toml` in your project root to set defaults:
+
+```toml
+repo = "src"
+coverage = "coverage.json"
+format = "json"
+verbose = true
+```
+
+Config is auto-discovered from the current directory upward. CLI flags override config values.
 
 ## Library usage
 

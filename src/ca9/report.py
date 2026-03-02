@@ -215,7 +215,7 @@ def write_sarif(report: Report, output: Path | TextIO | None = None) -> str:
                     "driver": {
                         "name": "ca9",
                         "informationUri": "https://github.com/oha/ca9",
-                        "version": "0.1.0",
+                        "version": "0.1.1",
                         "rules": rules,
                     },
                 },
