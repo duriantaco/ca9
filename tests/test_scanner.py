@@ -1,5 +1,3 @@
-"""Tests for the OSV.dev scanner."""
-
 from __future__ import annotations
 
 import json
@@ -27,15 +25,11 @@ class TestGetInstalledPackages:
         assert isinstance(version, str)
 
     def test_contains_known_packages(self):
-        """Our dev environment has pytest and click installed."""
         packages = get_installed_packages()
         names = {name.lower() for name, _ in packages}
         assert "pytest" in names
 
 
-# -- Canned data for mocking --------------------------------------------------
-
-# Batch API returns minimal data (just IDs)
 _BATCH_SINGLE = {"results": [{"vulns": [{"id": "PYSEC-2023-001"}]}]}
 _BATCH_MULTIPLE = {
     "results": [
@@ -51,7 +45,6 @@ _BATCH_DEDUP = {
     ]
 }
 
-# Full vuln details (returned by individual fetch)
 _VULN_DETAILS = {
     "PYSEC-2023-001": {
         "id": "PYSEC-2023-001",
@@ -68,7 +61,6 @@ _VULN_DETAILS = {
 
 
 def _mock_urlopen(response_data):
-    """Create a mock for urllib.request.urlopen that returns canned JSON."""
     mock_resp = MagicMock()
     mock_resp.read.return_value = json.dumps(response_data).encode()
     mock_resp.__enter__ = lambda s: s
@@ -81,7 +73,7 @@ class TestQueryOsvBatch:
     @patch("ca9.scanner.urllib.request.urlopen")
     def test_single_vuln(self, mock_urlopen_fn, mock_fetch):
         mock_urlopen_fn.return_value = _mock_urlopen(_BATCH_SINGLE)
-        mock_fetch.side_effect = lambda vid: _VULN_DETAILS.get(vid, {})
+        mock_fetch.side_effect = lambda vid, offline=False: _VULN_DETAILS.get(vid, {})
 
         vulns = query_osv_batch([("example-pkg", "1.0.0")])
         assert len(vulns) == 1
@@ -95,7 +87,7 @@ class TestQueryOsvBatch:
     @patch("ca9.scanner.urllib.request.urlopen")
     def test_multiple_vulns(self, mock_urlopen_fn, mock_fetch):
         mock_urlopen_fn.return_value = _mock_urlopen(_BATCH_MULTIPLE)
-        mock_fetch.side_effect = lambda vid: _VULN_DETAILS.get(vid, {})
+        mock_fetch.side_effect = lambda vid, offline=False: _VULN_DETAILS.get(vid, {})
 
         vulns = query_osv_batch([("requests", "2.19.1"), ("flask", "2.0.0")])
         assert len(vulns) == 2
@@ -112,12 +104,28 @@ class TestQueryOsvBatch:
 
     @patch("ca9.scanner._fetch_vuln_details")
     @patch("ca9.scanner.urllib.request.urlopen")
-    def test_deduplication(self, mock_urlopen_fn, mock_fetch):
+    def test_dedup_same_package(self, mock_urlopen_fn, mock_fetch):
+        batch = {
+            "results": [
+                {"vulns": [{"id": "PYSEC-2023-001"}, {"id": "PYSEC-2023-001"}]},
+            ]
+        }
+        mock_urlopen_fn.return_value = _mock_urlopen(batch)
+        mock_fetch.side_effect = lambda vid, offline=False: _VULN_DETAILS.get(vid, {})
+
+        vulns = query_osv_batch([("pkg-a", "1.0")])
+        assert len(vulns) == 1
+
+    @patch("ca9.scanner._fetch_vuln_details")
+    @patch("ca9.scanner.urllib.request.urlopen")
+    def test_same_cve_different_packages_preserved(self, mock_urlopen_fn, mock_fetch):
         mock_urlopen_fn.return_value = _mock_urlopen(_BATCH_DEDUP)
-        mock_fetch.side_effect = lambda vid: _VULN_DETAILS.get(vid, {})
+        mock_fetch.side_effect = lambda vid, offline=False: _VULN_DETAILS.get(vid, {})
 
         vulns = query_osv_batch([("pkg-a", "1.0"), ("pkg-b", "2.0")])
-        assert len(vulns) == 1  # Duplicate PYSEC-2023-001 is deduplicated
+        assert len(vulns) == 2
+        pkg_names = {v.package_name for v in vulns}
+        assert pkg_names == {"pkg-a", "pkg-b"}
 
     def test_empty_input(self):
         vulns = query_osv_batch([])
@@ -144,7 +152,6 @@ class TestQueryOsvBatch:
     @patch("ca9.scanner._fetch_vuln_details")
     @patch("ca9.scanner.urllib.request.urlopen")
     def test_fetch_failure_graceful(self, mock_urlopen_fn, mock_fetch):
-        """If individual vuln fetch fails, we still get the vuln with unknown severity."""
         mock_urlopen_fn.return_value = _mock_urlopen(_BATCH_SINGLE)
         mock_fetch.return_value = {}  # Simulate fetch failure
 
@@ -155,7 +162,6 @@ class TestQueryOsvBatch:
 
 class TestExtractSeverity:
     def test_database_specific_first(self):
-        """database_specific.severity takes priority."""
         vuln = {
             "database_specific": {"severity": "HIGH"},
             "severity": [{"type": "CVSS_V3", "score": "5.0"}],
@@ -179,7 +185,6 @@ class TestExtractSeverity:
         assert _extract_severity(vuln) == "medium"
 
     def test_cvss_vector_string(self):
-        """CVSS vector strings should now parse correctly."""
         vuln = {
             "severity": [
                 {"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}
@@ -193,33 +198,26 @@ class TestExtractSeverity:
 
 
 class TestParseCvssScore:
-    """CVSS vector string parsing."""
-
     def test_plain_numeric(self):
         assert _parse_cvss_score("9.8") == 9.8
 
     def test_cvss_v3_critical_vector(self):
-        # CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H → 9.8
         score = _parse_cvss_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
         assert score == 9.8
 
     def test_cvss_v3_high_vector(self):
-        # CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H → 7.2
         score = _parse_cvss_score("CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H")
         assert score == 7.2
 
     def test_cvss_v3_medium_vector(self):
-        # CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N → 4.2
         score = _parse_cvss_score("CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N")
         assert score == 4.2
 
     def test_cvss_v3_scope_changed(self):
-        # CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H → 10.0
         score = _parse_cvss_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H")
         assert score == 10.0
 
     def test_cvss_v30(self):
-        # Also handles CVSS:3.0 prefix
         score = _parse_cvss_score("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
         assert score == 9.8
 
@@ -236,7 +234,6 @@ class TestParseCvssScore:
         assert _parse_cvss_score(None) is None
 
     def test_no_impact_returns_zero(self):
-        # All CIA = None → impact ≤ 0 → score = 0.0
         score = _parse_cvss_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N")
         assert score == 0.0
 
@@ -261,5 +258,106 @@ class TestScanInstalled:
         mock_query.return_value = []
         result = scan_installed()
         mock_get.assert_called_once()
-        mock_query.assert_called_once_with([("requests", "2.19.1")])
+        mock_query.assert_called_once_with(
+            [("requests", "2.19.1")],
+            offline=False,
+            refresh_cache=False,
+            max_workers=8,
+        )
         assert result == []
+
+
+class TestOfflineMode:
+    def test_offline_returns_cached_vulns(self, tmp_path, monkeypatch):
+        from ca9 import scanner
+
+        cache_dir = tmp_path / "osv_cache"
+        cache_dir.mkdir()
+        monkeypatch.setattr(scanner, "CACHE_DIR", cache_dir)
+
+        vuln_data = {
+            "id": "PYSEC-2023-TEST",
+            "summary": "Test vuln in requests",
+            "details": "A test vulnerability",
+            "affected": [
+                {
+                    "package": {"ecosystem": "PyPI", "name": "requests"},
+                    "ranges": [
+                        {
+                            "type": "ECOSYSTEM",
+                            "events": [
+                                {"introduced": "2.0.0"},
+                                {"fixed": "2.25.0"},
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "database_specific": {"severity": "HIGH"},
+        }
+        (cache_dir / "PYSEC-2023-TEST.json").write_text(json.dumps(vuln_data))
+
+        vulns = scanner._query_from_cache_only([("requests", "2.19.1")])
+        assert len(vulns) == 1
+        assert vulns[0].id == "PYSEC-2023-TEST"
+        assert vulns[0].package_name == "requests"
+        assert vulns[0].package_version == "2.19.1"
+        assert vulns[0].severity == "high"
+
+    def test_offline_skips_unrelated_packages(self, tmp_path, monkeypatch):
+        from ca9 import scanner
+
+        cache_dir = tmp_path / "osv_cache"
+        cache_dir.mkdir()
+        monkeypatch.setattr(scanner, "CACHE_DIR", cache_dir)
+
+        vuln_data = {
+            "id": "PYSEC-2023-TEST",
+            "summary": "Test vuln",
+            "affected": [
+                {"package": {"ecosystem": "PyPI", "name": "requests"}},
+            ],
+        }
+        (cache_dir / "PYSEC-2023-TEST.json").write_text(json.dumps(vuln_data))
+
+        vulns = scanner._query_from_cache_only([("flask", "2.0.0")])
+        assert len(vulns) == 0
+
+    def test_offline_empty_cache(self, tmp_path, monkeypatch):
+        from ca9 import scanner
+
+        cache_dir = tmp_path / "osv_cache"
+        cache_dir.mkdir()
+        monkeypatch.setattr(scanner, "CACHE_DIR", cache_dir)
+
+        vulns = scanner._query_from_cache_only([("requests", "2.19.1")])
+        assert vulns == []
+
+    def test_offline_no_cache_dir(self, tmp_path, monkeypatch):
+        from ca9 import scanner
+
+        monkeypatch.setattr(scanner, "CACHE_DIR", tmp_path / "nonexistent")
+
+        vulns = scanner._query_from_cache_only([("requests", "2.19.1")])
+        assert vulns == []
+
+    def test_query_osv_batch_offline_delegates(self, tmp_path, monkeypatch):
+        from ca9 import scanner
+
+        cache_dir = tmp_path / "osv_cache"
+        cache_dir.mkdir()
+        monkeypatch.setattr(scanner, "CACHE_DIR", cache_dir)
+
+        vuln_data = {
+            "id": "PYSEC-2023-OFFLINE",
+            "summary": "Offline test",
+            "affected": [
+                {"package": {"ecosystem": "PyPI", "name": "requests"}},
+            ],
+            "database_specific": {"severity": "MEDIUM"},
+        }
+        (cache_dir / "PYSEC-2023-OFFLINE.json").write_text(json.dumps(vuln_data))
+
+        vulns = query_osv_batch([("requests", "2.19.1")], offline=True)
+        assert len(vulns) == 1
+        assert vulns[0].id == "PYSEC-2023-OFFLINE"

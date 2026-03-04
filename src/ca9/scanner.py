@@ -2,13 +2,23 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import os
+import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
-from ca9.models import VersionRange, Vulnerability
+from ca9.models import VersionRange, Vulnerability, finding_key
 
 OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 OSV_VULN_URL = "https://api.osv.dev/v1/vulns"
+
+CACHE_DIR = Path(os.environ.get("CA9_CACHE_DIR", Path.home() / ".cache" / "ca9" / "osv"))
+CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 hours
+DEFAULT_MAX_WORKERS = 8
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 0.5
 
 
 def get_installed_packages() -> list[tuple[str, str]]:
@@ -88,7 +98,10 @@ def _compute_cvss3_base_score(vector: str) -> float | None:
     ui = _CVSS3_UI.get(metrics["UI"])
     scope_changed = metrics["S"] == "C"
 
-    pr_table = _CVSS3_PR_CHANGED if scope_changed else _CVSS3_PR_UNCHANGED
+    if scope_changed:
+        pr_table = _CVSS3_PR_CHANGED
+    else:
+        pr_table = _CVSS3_PR_UNCHANGED
     pr = pr_table.get(metrics["PR"])
 
     c = _CVSS3_CIA.get(metrics["C"])
@@ -171,19 +184,86 @@ def _extract_references(osv_vuln: dict) -> tuple[str, ...]:
     return tuple(urls)
 
 
-def _fetch_vuln_details(vuln_id: str) -> dict:
-    url = f"{OSV_VULN_URL}/{vuln_id}"
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+def _cache_path(vuln_id: str) -> Path:
+    safe_id = vuln_id.replace("/", "_").replace("\\", "_")
+    return CACHE_DIR / f"{safe_id}.json"
+
+
+def _read_cache(vuln_id: str) -> dict | None:
+    path = _cache_path(vuln_id)
+    if not path.exists():
+        return None
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
+        stat = path.stat()
+        if time.time() - stat.st_mtime > CACHE_TTL_SECONDS:
+            return None
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_cache(vuln_id: str, data: dict) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _cache_path(vuln_id).write_text(json.dumps(data))
+    except OSError:
+        pass
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in (429, 500, 502, 503, 504)
+    if isinstance(exc, (urllib.error.URLError, OSError)):
+        return True
+    return False
+
+
+def _fetch_vuln_details(vuln_id: str, offline: bool = False) -> dict:
+    cached = _read_cache(vuln_id)
+    if cached is not None:
+        return cached
+
+    if offline:
         return {}
 
+    url = f"{OSV_VULN_URL}/{vuln_id}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
 
-def query_osv_batch(packages: list[tuple[str, str]]) -> list[Vulnerability]:
+    for attempt in range(MAX_RETRIES):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            _write_cache(vuln_id, data)
+            return data
+        except Exception as exc:
+            if attempt < MAX_RETRIES - 1 and _is_retryable(exc):
+                time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+                continue
+            return {}
+
+    return {}
+
+
+def query_osv_batch(
+    packages: list[tuple[str, str]],
+    offline: bool = False,
+    refresh_cache: bool = False,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+) -> list[Vulnerability]:
     if not packages:
         return []
+
+    if refresh_cache:
+        try:
+            if CACHE_DIR.exists():
+                for f in CACHE_DIR.iterdir():
+                    if f.suffix == ".json":
+                        f.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if offline:
+        return _query_from_cache_only(packages)
 
     queries = [
         {"package": {"name": name, "ecosystem": "PyPI"}, "version": version}
@@ -206,34 +286,76 @@ def query_osv_batch(packages: list[tuple[str, str]]) -> list[Vulnerability]:
     except json.JSONDecodeError as e:
         raise ValueError(f"OSV.dev returned malformed JSON: {e}") from e
 
-    seen_ids: set[str] = set()
+    seen_keys: set[tuple[str, str, str]] = set()
     vuln_refs: list[tuple[str, str, str]] = []
 
     for i, result in enumerate(data.get("results", [])):
-        pkg_name = packages[i][0] if i < len(packages) else "unknown"
-        pkg_version = packages[i][1] if i < len(packages) else "unknown"
+        if i < len(packages):
+            pkg_name = packages[i][0]
+        else:
+            pkg_name = "unknown"
+        if i < len(packages):
+            pkg_version = packages[i][1]
+        else:
+            pkg_version = "unknown"
 
         for osv_vuln in result.get("vulns", []):
             vuln_id = osv_vuln.get("id", "")
-            if not vuln_id or vuln_id in seen_ids:
+            if not vuln_id:
                 continue
-            seen_ids.add(vuln_id)
+            key = finding_key(vuln_id, pkg_name, pkg_version)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             vuln_refs.append((vuln_id, pkg_name, pkg_version))
+
+    details_map: dict[str, dict] = {}
+    unique_ids = list({vid for vid, _, _ in vuln_refs})
+
+    if unique_ids:
+        effective_workers = min(max_workers, len(unique_ids))
+    else:
+        effective_workers = 1
+    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        future_to_id = {
+            executor.submit(_fetch_vuln_details, vid, offline): vid
+            for vid in unique_ids
+        }
+        for future in as_completed(future_to_id):
+            vid = future_to_id[future]
+            try:
+                details_map[vid] = future.result()
+            except Exception:
+                details_map[vid] = {}
 
     vulns: list[Vulnerability] = []
     for vuln_id, pkg_name, pkg_version in vuln_refs:
-        details = _fetch_vuln_details(vuln_id)
-        severity = _extract_severity(details) if details else "unknown"
-        title = (
-            details.get("summary", "") or details.get("details", "No description")[:120]
-            if details
-            else vuln_id
-        )
+        details = details_map.get(vuln_id, {})
+        if details:
+            severity = _extract_severity(details)
+        else:
+            severity = "unknown"
+        if details:
+            title = (
+                details.get("summary", "") or details.get("details", "No description")[:120]
+            )
+        else:
+            title = vuln_id
 
-        description = details.get("details", "") if details else ""
+        if details:
+            description = details.get("details", "")
+        else:
+            description = ""
 
-        affected_ranges = _extract_version_ranges(details, pkg_name) if details else ()
-        references = _extract_references(details) if details else ()
+        if details:
+            affected_ranges = _extract_version_ranges(details, pkg_name)
+        else:
+            affected_ranges = ()
+
+        if details:
+            references = _extract_references(details)
+        else:
+            references = ()
 
         vulns.append(
             Vulnerability(
@@ -251,6 +373,71 @@ def query_osv_batch(packages: list[tuple[str, str]]) -> list[Vulnerability]:
     return vulns
 
 
-def scan_installed() -> list[Vulnerability]:
+def _query_from_cache_only(packages: list[tuple[str, str]]) -> list[Vulnerability]:
+    if not CACHE_DIR.exists():
+        return []
+
+    cached_vulns: dict[str, dict] = {}
+    try:
+        for path in CACHE_DIR.iterdir():
+            if not path.suffix == ".json":
+                continue
+            if time.time() - path.stat().st_mtime > CACHE_TTL_SECONDS:
+                continue
+            try:
+                data = json.loads(path.read_text())
+                vuln_id = data.get("id", "")
+                if vuln_id:
+                    cached_vulns[vuln_id] = data
+            except (json.JSONDecodeError, OSError):
+                continue
+    except OSError:
+        return []
+
+    if not cached_vulns:
+        return []
+
+    vulns: list[Vulnerability] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+
+    for pkg_name, pkg_version in packages:
+        for vuln_id, details in cached_vulns.items():
+            affected_pkgs = set()
+            for affected in details.get("affected", []):
+                pkg = affected.get("package", {})
+                if pkg.get("ecosystem", "").lower() == "pypi":
+                    affected_pkgs.add(pkg.get("name", "").lower())
+
+            if pkg_name.lower() not in affected_pkgs:
+                continue
+
+            key = finding_key(vuln_id, pkg_name, pkg_version)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            vulns.append(
+                Vulnerability(
+                    id=vuln_id,
+                    package_name=pkg_name,
+                    package_version=pkg_version,
+                    severity=_extract_severity(details),
+                    title=details.get("summary", "") or vuln_id,
+                    description=details.get("details", ""),
+                    affected_ranges=_extract_version_ranges(details, pkg_name),
+                    references=_extract_references(details),
+                )
+            )
+
+    return vulns
+
+
+def scan_installed(
+    offline: bool = False,
+    refresh_cache: bool = False,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+) -> list[Vulnerability]:
     packages = get_installed_packages()
-    return query_osv_batch(packages)
+    return query_osv_batch(
+        packages, offline=offline, refresh_cache=refresh_cache, max_workers=max_workers
+    )
