@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ca9.models import VersionRange
-from ca9.version import VersionCheckResult, check_version, is_version_affected
+from ca9.version import check_version, is_version_affected
 
 
 class TestIsVersionAffected:

@@ -6,13 +6,12 @@ import pytest
 
 from ca9.intel_rules import (
     VulnIntelResolution,
-    VulnIntelRule,
     _ensure_rules_loaded,
     load_rule_from_dict,
     load_rules_from_yaml,
     resolve_vuln_intel,
 )
-from ca9.models import ApiTarget, Vulnerability, VersionRange
+from ca9.models import Vulnerability
 
 
 class TestLoadRuleFromDict:
@@ -141,7 +140,7 @@ class TestResolveVulnIntel:
         )
         result = resolve_vuln_intel(vuln)
         assert len(result.matched_rules) >= 1
-        assert any("requests.get" == t.fqname for t in result.api_targets)
+        assert any(t.fqname == "requests.get" for t in result.api_targets)
         assert result.source == "rulepack"
 
     def test_match_by_keyword(self):
