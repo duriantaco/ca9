@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ca9"
-version = "0.1.1"
+version = "0.1.2"
 description = "Reduce false-positive CVE alerts by checking whether vulnerable dependency code is actually reachable"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Security",
     "Topic :: Software Development :: Quality Assurance",
 ]
-dependencies = []
+dependencies = ["packaging>=21.0"]
 
 [project.optional-dependencies]
 cli = ["click>=8.0"]

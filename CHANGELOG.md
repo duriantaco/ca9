@@ -5,6 +5,39 @@ All notable changes to ca9 will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-03-04
+
+### Added
+
+- **Evidence model** — every verdict now carries structured evidence (version range, import status, dependency kind, coverage, affected component source/confidence).
+- **Confidence scoring** — verdict-aware 0-100 confidence score. Signals boost or penalize depending on whether they support the verdict direction.
+- **Affected component inference** — commit analysis, curated mappings, regex extraction, and class name resolution each produce confidence-scored component matches.
+- **OSV caching** — vulnerability details cached to `~/.cache/ca9/osv/` with 24h TTL. Commit file lists cached to `~/.cache/ca9/commits/` with 7-day TTL.
+- **Concurrent OSV fetches** — `ThreadPoolExecutor` for parallel vulnerability detail lookups (`--max-osv-workers`, default 8).
+- **Offline mode** — `--offline` flag returns results from cache only, no network requests.
+- **`--refresh-cache`** — clears OSV cache before fetching.
+- **`--show-confidence`** — display confidence score in table output.
+- **`--show-evidence-source`** — display evidence extraction source in table output.
+- **SARIF fingerprints** — stable `ca9/v1` fingerprints based on `(vuln_id, package, version, verdict)`.
+- **SARIF/JSON evidence** — confidence score and full evidence object included in SARIF properties and JSON output.
+- **GitHub token support** — `GITHUB_TOKEN` env var for commit fetch rate limit mitigation.
+- 55 new tests (260 total).
+
+### Changed
+
+- **PEP 440 version parsing** — replaced naive tuple-based comparison with `packaging.version.Version`. Handles pre-releases, post-releases, dev releases, epochs, and local versions correctly.
+- **Parser deduplication** — widened dedupe key from `vuln_id` to `(vuln_id, package_name, package_version)`. Same CVE across different packages is now preserved.
+- **Engine refactored to evidence-first** — `collect_evidence()` gathers all signals into an Evidence object, `derive_verdict()` applies deterministic policy on evidence.
+- **Bare import no longer over-claims submodule reachability** — `import requests` sets `submodule_imported=None` (unknown) instead of `True`.
+- **Commit fetch warnings propagated** — GitHub fetch failures now flow into `Evidence.external_fetch_warnings` and degrade confidence scores.
+- **Confidence scoring is verdict-directional** — `package_imported=True` boosts REACHABLE confidence but penalizes UNREACHABLE, and vice versa. Same for `version_in_range`, `coverage_seen`, `submodule_imported`.
+
+### Fixed
+
+- **Duplicate `extract_affected_component()` call** — was computed twice per vulnerability (once in `collect_evidence`, once in `analyze`). Now computed once and passed through.
+- **`--offline` was a no-op** — `_query_from_cache_only()` was a stub. Now scans cache directory and matches cached vulns to requested packages.
+- **Version ranges without `introduced` skipped silently** — ranges missing the introduced field were dropped entirely.
+
 ## [0.1.1] - 2026-03-02
 
 ### Added

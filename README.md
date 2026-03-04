@@ -10,7 +10,7 @@
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
   <a href="https://mozilla.org/MPL/2.0/"><img src="https://img.shields.io/badge/license-MPL--2.0-blue.svg" alt="License: MPL-2.0"></a>
   <a href="https://pypi.org/project/ca9/"><img src="https://img.shields.io/badge/pypi-ca9-orange.svg" alt="PyPI"></a>
-  <a href="#zero-dependencies"><img src="https://img.shields.io/badge/zero-dependencies-brightgreen.svg" alt="Zero Dependencies"></a>
+  <a href="#zero-heavy-dependencies"><img src="https://img.shields.io/badge/minimal--deps-brightgreen.svg" alt="Minimal Dependencies"></a>
   <img src="https://img.shields.io/badge/Skylos-A%2B%20%2899%29-brightgreen" alt="Skylos A+ (99)">
 </p>
 
@@ -67,7 +67,7 @@ For each CVE:
       └── No coverage data → INCONCLUSIVE
 ```
 
-ca9 is **conservative** — it only marks something unreachable when it can prove it.
+ca9 is **conservative** — it only marks something unreachable when it can prove it. Every verdict comes with an evidence trail and a confidence score so you can see exactly why ca9 reached its conclusion.
 
 ## Why ca9 over other tools
 
@@ -75,12 +75,13 @@ ca9 is **conservative** — it only marks something unreachable when it can prov
 |---|---|---|---|
 | **Reachability analysis** | Static + dynamic + transitive | No — flags everything in the dependency tree | Limited — no dynamic analysis |
 | **Submodule precision** | Identifies the exact vulnerable function/module | Package-level only | Varies |
+| **Confidence scoring** | 0-100 verdict-aware score with evidence trail | No | No |
 | **Works without SCA tool** | Yes — `ca9 scan` queries OSV.dev directly | Requires its own scanner | Requires GitHub |
 | **Dynamic analysis** | Yes — uses your existing coverage.py data | No | No |
-| **Runtime dependencies** | Zero (stdlib only) | Heavy | Hosted service |
+| **Runtime dependencies** | `packaging` only | Heavy | Hosted service |
 | **Setup time** | `pip install ca9[cli]` — one command | Account, config, integration | Repository setup |
-| **Output** | Actionable verdicts with reasoning traces | Alert list with no reachability context | Alert list |
-| **CI integration** | Pipe JSON output to any tool | Vendor-specific dashboards | GitHub-only |
+| **Output** | Actionable verdicts with evidence + confidence | Alert list with no reachability context | Alert list |
+| **CI integration** | JSON/SARIF output, stable fingerprints | Vendor-specific dashboards | GitHub-only |
 
 **ca9 doesn't replace your SCA tool. It makes it useful.** Snyk finds the CVEs. ca9 tells you which ones matter.
 
@@ -161,18 +162,47 @@ ca9 check pip-audit.json --repo .
 | `UNREACHABLE (dynamic)` | Package is imported but vulnerable code was never executed | Likely safe — monitor |
 | `INCONCLUSIVE` | Imported but no coverage data to prove execution | Add coverage or review manually |
 
+## Evidence and confidence
+
+Every verdict is backed by structured evidence. Use `--show-confidence` to see scores in table output, or inspect the `evidence` object in JSON/SARIF output.
+
+| Signal | What it checks |
+|--------|----------------|
+| `version_in_range` | Is the installed version within the affected range (PEP 440)? |
+| `package_imported` | Is the package imported anywhere in the repo? |
+| `submodule_imported` | Is the specific vulnerable submodule imported? |
+| `coverage_seen` | Was the vulnerable code executed during tests? |
+| `affected_component_source` | How was the vulnerable component identified (commit analysis, curated mapping, regex, class scan)? |
+
+Confidence scoring is **verdict-directional** — evidence that supports the verdict boosts the score, evidence that contradicts it lowers it. A high confidence UNREACHABLE is different from a high confidence REACHABLE.
+
+| Bucket | Score | Meaning |
+|--------|-------|---------|
+| High | 80-100 | Strong evidence supports the verdict |
+| Medium | 60-79 | Moderate evidence, reasonable certainty |
+| Low | 40-59 | Weak evidence, treat with caution |
+| Weak | 0-39 | Very little evidence, manual review recommended |
+
 ## CLI reference
 
 ```
 ca9 scan [OPTIONS]              Scan installed packages via OSV.dev
 ca9 check SCA_REPORT [OPTIONS]  Analyze a Snyk/Dependabot report
 
-Options:
+Common options:
   -r, --repo PATH                  Path to the project repository  [default: .]
   -c, --coverage PATH              Path to coverage.json for dynamic analysis
   -f, --format [table|json|sarif]  Output format  [default: table]
   -o, --output PATH                Write output to file instead of stdout
   -v, --verbose                    Show reasoning trace for each verdict
+  --no-auto-coverage               Disable automatic coverage discovery
+  --show-confidence                Show confidence score in table output
+  --show-evidence-source           Show evidence extraction source in table output
+
+Scan-only options:
+  --offline                        Use only cached OSV data, no network requests
+  --refresh-cache                  Clear OSV cache before fetching
+  --max-osv-workers N              Max concurrent OSV detail fetches  [default: 8]
 
 Exit codes:
   0  Clean — no reachable CVEs
@@ -193,6 +223,22 @@ verbose = true
 
 Config is auto-discovered from the current directory upward. CLI flags override config values.
 
+### Caching and offline mode
+
+ca9 caches OSV vulnerability details (`~/.cache/ca9/osv/`, 24h TTL) and GitHub commit file lists (`~/.cache/ca9/commits/`, 7-day TTL) to reduce API calls.
+
+```bash
+ca9 scan --repo . --offline           # use cached data only, no network
+ca9 scan --repo . --refresh-cache     # clear cache and re-fetch
+```
+
+Set `GITHUB_TOKEN` to avoid GitHub API rate limits when ca9 fetches commit data for affected component analysis:
+
+```bash
+export GITHUB_TOKEN=ghp_...
+ca9 check snyk.json --repo .
+```
+
 ## Library usage
 
 ```python
@@ -211,12 +257,15 @@ report = analyze(
 )
 
 for result in report.results:
-    print(f"{result.vulnerability.id}: {result.verdict.value} — {result.reason}")
+    print(f"{result.vulnerability.id}: {result.verdict.value} (confidence: {result.confidence_score})")
+    print(f"  reason: {result.reason}")
+    if result.evidence:
+        print(f"  source: {result.evidence.affected_component_source}")
 ```
 
-## Zero dependencies
+## Zero heavy dependencies
 
-ca9's core library uses only the Python standard library. The `click` package is optional — only needed if you use the CLI. This means you can embed ca9 in CI pipelines, security toolchains, or other Python tools without adding to your dependency tree.
+ca9's core library depends only on `packaging` (PEP 440 version parsing) and the Python standard library. The `click` package is optional — only needed if you use the CLI. This means you can embed ca9 in CI pipelines, security toolchains, or other Python tools without bloating your dependency tree.
 
 ## Limitations
 
