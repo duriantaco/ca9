@@ -1,10 +1,9 @@
-"""Tests for vuln_matcher — affected-component extraction."""
-
 from __future__ import annotations
 
 from unittest.mock import patch
 
 from ca9.analysis.vuln_matcher import (
+    CommitFetchResult,
     _file_paths_to_submodules,
     extract_affected_component,
 )
@@ -26,8 +25,6 @@ def _vuln(
 
 
 class TestCuratedMappings:
-    """Strategy 1: curated per-package patterns."""
-
     def test_django_sessions(self):
         v = _vuln("Django", title="Session fixation in Django")
         c = extract_affected_component(v)
@@ -89,8 +86,6 @@ class TestCuratedMappings:
 
 
 class TestFilePathsToSubmodules:
-    """Unit tests for _file_paths_to_submodules."""
-
     def test_basic_conversion(self):
         paths = ["src/jinja2/utils.py", "src/jinja2/filters.py"]
         result = _file_paths_to_submodules(paths, "jinja2")
@@ -129,15 +124,16 @@ class TestFilePathsToSubmodules:
 
 
 class TestCommitAnalysis:
-    """Strategy 0: commit-based component extraction."""
-
     @patch("ca9.analysis.vuln_matcher._fetch_commit_files")
     def test_commit_extracts_submodules(self, mock_fetch):
-        mock_fetch.return_value = [
-            "src/jinja2/utils.py",
-            "src/jinja2/filters.py",
-            "tests/test_utils.py",
-        ]
+        mock_fetch.return_value = CommitFetchResult(
+            status="ok",
+            files=[
+                "src/jinja2/utils.py",
+                "src/jinja2/filters.py",
+                "tests/test_utils.py",
+            ],
+        )
         v = _vuln(
             "Jinja2",
             title="XSS in jinja2",
@@ -151,8 +147,9 @@ class TestCommitAnalysis:
 
     @patch("ca9.analysis.vuln_matcher._fetch_commit_files")
     def test_commit_wins_over_curated(self, mock_fetch):
-        """Commit analysis (Strategy 0) takes precedence over curated (Strategy 1)."""
-        mock_fetch.return_value = ["src/jinja2/runtime.py"]
+        mock_fetch.return_value = CommitFetchResult(
+            status="ok", files=["src/jinja2/runtime.py"]
+        )
         v = _vuln(
             "Jinja2",
             title="Sandbox escape in Jinja2",
@@ -164,26 +161,27 @@ class TestCommitAnalysis:
 
     @patch("ca9.analysis.vuln_matcher._fetch_commit_files")
     def test_commit_no_python_files_falls_through(self, mock_fetch):
-        """If commit only has non-Python files, fall through to next strategy."""
-        mock_fetch.return_value = ["docs/changelog.md", "setup.cfg"]
+        mock_fetch.return_value = CommitFetchResult(
+            status="ok", files=["docs/changelog.md", "setup.cfg"]
+        )
         v = _vuln(
             "Jinja2",
             title="Sandbox escape in Jinja2",
             references=("https://github.com/pallets/jinja/commit/abc123def456",),
         )
         c = extract_affected_component(v)
-        # Should fall through to curated (sandbox pattern matches)
         assert c.extraction_source.startswith("curated:")
 
     def test_no_references_falls_through(self):
-        """No references at all → fall through to curated/regex/fallback."""
         v = _vuln("Jinja2", title="Sandbox escape in Jinja2")
         c = extract_affected_component(v)
         assert c.extraction_source.startswith("curated:")
 
     @patch("ca9.analysis.vuln_matcher._fetch_commit_files")
     def test_commit_includes_file_hints(self, mock_fetch):
-        mock_fetch.return_value = ["src/jinja2/sandbox.py"]
+        mock_fetch.return_value = CommitFetchResult(
+            status="ok", files=["src/jinja2/sandbox.py"]
+        )
         v = _vuln(
             "Jinja2",
             references=("https://github.com/pallets/jinja/commit/abc123def456a",),
@@ -191,10 +189,22 @@ class TestCommitAnalysis:
         c = extract_affected_component(v)
         assert "sandbox.py" in c.file_hints
 
+    @patch("ca9.analysis.vuln_matcher._fetch_commit_files")
+    def test_fetch_failure_degrades_to_fallback(self, mock_fetch):
+        mock_fetch.return_value = CommitFetchResult(
+            status="rate_limited",
+            warning="GitHub rate limited",
+        )
+        v = _vuln(
+            "Jinja2",
+            title="Sandbox escape in Jinja2",
+            references=("https://github.com/pallets/jinja/commit/abc123def456",),
+        )
+        c = extract_affected_component(v)
+        assert c.extraction_source.startswith("curated:")
+
 
 class TestRegexExtraction:
-    """Strategy 2: backtick-quoted dotted paths."""
-
     def test_dotted_path_in_backticks(self):
         v = _vuln(
             "Django",
@@ -212,7 +222,6 @@ class TestRegexExtraction:
             desc="Compare with `urllib3.util.retry`.",
         )
         c = extract_affected_component(v)
-        # urllib3.util.retry doesn't start with "requests." so should not match
         assert c.confidence == "low"
 
     def test_multiple_dotted_paths(self):
@@ -227,8 +236,6 @@ class TestRegexExtraction:
 
 
 class TestClassNameResolution:
-    """Strategy 2.5: bare class name resolution."""
-
     @patch("ca9.analysis.vuln_matcher._find_package_source_dir")
     @patch("ca9.analysis.vuln_matcher._scan_package_for_name")
     def test_resolves_class_name_to_submodule(self, mock_scan, mock_find):
@@ -263,14 +270,12 @@ class TestClassNameResolution:
 
     @patch("ca9.analysis.vuln_matcher._find_package_source_dir")
     def test_no_class_names_falls_through(self, mock_find):
-        """No CamelCase names → falls through to fallback."""
         mock_find.return_value = "/site-packages/urllib3"
         v = _vuln("urllib3", desc="a vulnerability in the library")
         c = extract_affected_component(v)
         assert c.confidence == "low"
 
     def test_generic_names_excluded(self):
-        """Common English CamelCase words should not trigger resolution."""
         v = _vuln("obscure-lib", desc="TypeError in JavaScript handling")
         c = extract_affected_component(v)
         assert c.confidence == "low"
@@ -287,8 +292,6 @@ class TestClassNameResolution:
 
 
 class TestFallback:
-    """Strategy 3: no submodule info available."""
-
     def test_unknown_package(self):
         v = _vuln("obscure-lib", title="Some vulnerability")
         c = extract_affected_component(v)
@@ -303,8 +306,6 @@ class TestFallback:
 
 
 class TestCuratedTakesPrecedence:
-    """Curated match should win over regex extraction."""
-
     def test_curated_wins_over_regex(self):
         v = _vuln(
             "Django",
@@ -312,6 +313,5 @@ class TestCuratedTakesPrecedence:
             desc="See `django.contrib.sessions.backends.base`.",
         )
         c = extract_affected_component(v)
-        # Curated match should fire first (confidence=high)
         assert c.confidence == "high"
         assert "django.contrib.sessions" in c.submodule_paths

@@ -1,11 +1,47 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from ca9.models import AffectedComponent, Vulnerability
+
+_GENERIC_SUBMODULE_NAMES = frozenset({
+    "utils", "base", "common", "helpers", "core", "misc", "compat", "exceptions",
+})
+
+
+@dataclass(frozen=True)
+class AffectedComponentInference:
+    candidates: tuple[str, ...]
+    source: str
+    confidence: int  # 0-100
+    notes: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    def to_affected_component(self, import_name: str) -> AffectedComponent:
+        if self.confidence >= 75:
+            conf_str = "high"
+        elif self.confidence >= 40:
+            conf_str = "medium"
+        else:
+            conf_str = "low"
+        file_hints: tuple[str, ...] = ()
+        if hasattr(self, "_file_hints"):
+            file_hints = self._file_hints
+        return AffectedComponent(
+            package_import_name=import_name,
+            submodule_paths=self.candidates,
+            file_hints=file_hints,
+            confidence=conf_str,
+            extraction_source=self.source,
+        )
+
 
 _CURATED: dict[str, list[tuple[re.Pattern[str], tuple[str, ...], tuple[str, ...]]]] = {
     "django": [
@@ -52,23 +88,79 @@ _CURATED: dict[str, list[tuple[re.Pattern[str], tuple[str, ...], tuple[str, ...]
 
 _GITHUB_COMMIT_RE = re.compile(r"https://github\.com/([^/]+/[^/]+)/commit/([0-9a-f]{7,40})")
 
+_COMMIT_CACHE_DIR = Path(
+    os.environ.get("CA9_CACHE_DIR", Path.home() / ".cache" / "ca9")
+) / "commits"
+_COMMIT_CACHE_TTL = 7 * 24 * 60 * 60  # 7 days (commits are immutable)
 
-def _fetch_commit_files(owner_repo: str, sha: str) -> list[str]:
+
+@dataclass
+class CommitFetchResult:
+    status: str  # "ok", "no_ref", "fetch_failed", "rate_limited"
+    files: list[str] = field(default_factory=list)
+    warning: str = ""
+
+
+def _read_commit_cache(owner_repo: str, sha: str) -> list[str] | None:
+    safe_key = f"{owner_repo.replace('/', '_')}_{sha[:12]}"
+    path = _COMMIT_CACHE_DIR / f"{safe_key}.json"
+    if not path.exists():
+        return None
+    try:
+        if time.time() - path.stat().st_mtime > _COMMIT_CACHE_TTL:
+            return None
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_commit_cache(owner_repo: str, sha: str, files: list[str]) -> None:
+    try:
+        _COMMIT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        safe_key = f"{owner_repo.replace('/', '_')}_{sha[:12]}"
+        (_COMMIT_CACHE_DIR / f"{safe_key}.json").write_text(json.dumps(files))
+    except OSError:
+        pass
+
+
+def _fetch_commit_files(owner_repo: str, sha: str) -> CommitFetchResult:
+    cached = _read_commit_cache(owner_repo, sha)
+    if cached is not None:
+        return CommitFetchResult(status="ok", files=cached)
+
     url = f"https://api.github.com/repos/{owner_repo}/commits/{sha}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "ca9-scanner",
-        },
-    )
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "ca9-scanner",
+    }
+
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
-        return []
+    except urllib.error.HTTPError as exc:
+        if exc.code == 403:
+            return CommitFetchResult(
+                status="rate_limited",
+                warning=f"GitHub rate limited fetching {owner_repo}/commit/{sha[:8]}",
+            )
+        return CommitFetchResult(
+            status="fetch_failed",
+            warning=f"HTTP {exc.code} fetching {owner_repo}/commit/{sha[:8]}",
+        )
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        return CommitFetchResult(
+            status="fetch_failed",
+            warning=f"Failed to fetch {owner_repo}/commit/{sha[:8]}: {exc}",
+        )
 
-    return [f["filename"] for f in data.get("files", []) if "filename" in f]
+    files = [f["filename"] for f in data.get("files", []) if "filename" in f]
+    _write_commit_cache(owner_repo, sha, files)
+    return CommitFetchResult(status="ok", files=files)
 
 
 def _file_paths_to_submodules(
@@ -108,6 +200,17 @@ def _file_paths_to_submodules(
     return sorted(submodules)
 
 
+def _penalize_generic_names(submodules: tuple[str, ...]) -> int:
+    if not submodules:
+        return 0
+    penalty = 0
+    for sub in submodules:
+        last_part = sub.rsplit(".", 1)[-1].lower()
+        if last_part in _GENERIC_SUBMODULE_NAMES:
+            penalty += 10
+    return min(penalty, 20)
+
+
 def _match_commits(
     vuln: Vulnerability,
 ) -> AffectedComponent | None:
@@ -120,6 +223,7 @@ def _match_commits(
 
     all_submodules: set[str] = set()
     file_hints: set[str] = set()
+    fetch_warnings: list[str] = []
 
     for ref in vuln.references:
         m = _GITHUB_COMMIT_RE.search(ref)
@@ -127,26 +231,40 @@ def _match_commits(
             continue
 
         owner_repo, sha = m.group(1), m.group(2)
-        changed_files = _fetch_commit_files(owner_repo, sha)
-        if not changed_files:
+        result = _fetch_commit_files(owner_repo, sha)
+
+        if result.status != "ok" or not result.files:
+            if result.warning:
+                fetch_warnings.append(result.warning)
             continue
 
-        submodules = _file_paths_to_submodules(changed_files, import_name)
+        submodules = _file_paths_to_submodules(result.files, import_name)
         all_submodules.update(submodules)
 
-        for fp in changed_files:
+        for fp in result.files:
             if fp.endswith(".py"):
                 basename = fp.rsplit("/", 1)[-1] if "/" in fp else fp
                 if not basename.startswith("test_") and basename != "conftest.py":
                     file_hints.add(basename)
 
     if all_submodules:
+        base_confidence = 90
+        if fetch_warnings:
+            base_confidence -= 10
+        penalty = _penalize_generic_names(tuple(sorted(all_submodules)))
+        confidence = max(base_confidence - penalty, 75)
+
+        if confidence >= 75:
+            conf_str = "high"
+        else:
+            conf_str = "medium"
         return AffectedComponent(
             package_import_name=import_name,
             submodule_paths=tuple(sorted(all_submodules)),
             file_hints=tuple(sorted(file_hints)),
-            confidence="high",
+            confidence=conf_str,
             extraction_source="commit_analysis",
+            warnings=tuple(fetch_warnings),
         )
 
     return None
@@ -170,11 +288,18 @@ def _match_curated(
 
     for regex, submodule_paths, file_hints in patterns:
         if regex.search(text):
+            base_confidence = 85
+            penalty = _penalize_generic_names(submodule_paths)
+            confidence = max(base_confidence - penalty, 75)
+            if confidence >= 75:
+                conf_str = "high"
+            else:
+                conf_str = "medium"
             return AffectedComponent(
                 package_import_name=import_name,
                 submodule_paths=submodule_paths,
                 file_hints=file_hints,
-                confidence="high",
+                confidence=conf_str,
                 extraction_source=f"curated:{key}:{regex.pattern}",
             )
 
@@ -198,10 +323,18 @@ def _extract_from_text(
             submodule_paths.append(match)
 
     if submodule_paths:
+        sorted_paths = tuple(sorted(set(submodule_paths)))
+        base_confidence = 55
+        penalty = _penalize_generic_names(sorted_paths)
+        confidence = max(base_confidence - penalty, 35)
+        if confidence >= 40:
+            conf_str = "medium"
+        else:
+            conf_str = "low"
         return AffectedComponent(
             package_import_name=import_name,
-            submodule_paths=tuple(sorted(set(submodule_paths))),
-            confidence="medium",
+            submodule_paths=sorted_paths,
+            confidence=conf_str,
             extraction_source="regex:dotted_path",
         )
 
@@ -332,10 +465,18 @@ def _resolve_class_names(
             submodule_paths.append(result)
 
     if submodule_paths:
+        sorted_paths = tuple(sorted(set(submodule_paths)))
+        base_confidence = 55
+        penalty = _penalize_generic_names(sorted_paths)
+        confidence = max(base_confidence - penalty, 40)
+        if confidence >= 40:
+            conf_str = "medium"
+        else:
+            conf_str = "low"
         return AffectedComponent(
             package_import_name=import_name,
-            submodule_paths=tuple(sorted(set(submodule_paths))),
-            confidence="medium",
+            submodule_paths=sorted_paths,
+            confidence=conf_str,
             extraction_source="class_name_resolution",
         )
 
