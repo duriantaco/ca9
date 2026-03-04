@@ -1,0 +1,177 @@
+schema_version: 1
+package: django
+ecosystem: PyPI
+
+rules:
+  - id: CA9-DJANGO-SESSIONS-001
+    advisory_ids: []
+    confidence_prior: 90
+    affected_modules:
+      - django.contrib.sessions
+    api_targets:
+      - fqname: django.contrib.sessions.backends.base.SessionBase
+        kind: class
+      - fqname: django.contrib.sessions.middleware.SessionMiddleware
+        kind: class
+    signals:
+      keywords:
+        - session
+        - SESSION
+        - fixation
+    notes:
+      - "Session-related vulnerabilities in Django"
+
+  - id: CA9-DJANGO-ADMIN-001
+    advisory_ids: []
+    confidence_prior: 90
+    affected_modules:
+      - django.contrib.admin
+    api_targets:
+      - fqname: django.contrib.admin.site
+        kind: attribute
+      - fqname: django.contrib.admin.ModelAdmin
+        kind: class
+    signals:
+      keywords:
+        - admin
+        - admindocs
+    notes:
+      - "Admin interface vulnerabilities"
+
+  - id: CA9-DJANGO-AUTH-001
+    advisory_ids: []
+    confidence_prior: 90
+    affected_modules:
+      - django.contrib.auth
+    api_targets:
+      - fqname: django.contrib.auth.authenticate
+        kind: function
+      - fqname: django.contrib.auth.models.User
+        kind: class
+      - fqname: django.contrib.auth.views.PasswordResetView
+        kind: class
+    signals:
+      keywords:
+        - authentication
+        - password
+        - login
+        - logout
+        - auth
+    notes:
+      - "Authentication and password-related vulnerabilities"
+
+  - id: CA9-DJANGO-QUERYSET-001
+    advisory_ids: []
+    confidence_prior: 90
+    affected_modules:
+      - django.db.models
+    api_targets:
+      - fqname: django.db.models.QuerySet.extra
+        kind: method
+      - fqname: django.db.models.QuerySet.raw
+        kind: method
+      - fqname: django.db.models.expressions.RawSQL
+        kind: class
+    signals:
+      keywords:
+        - QuerySet
+        - aggregat
+        - .db.models
+        - SQL injection
+    notes:
+      - "ORM/QuerySet SQL injection vulnerabilities"
+
+  - id: CA9-DJANGO-TEMPLATE-001
+    advisory_ids: []
+    confidence_prior: 85
+    affected_modules:
+      - django.template
+    api_targets:
+      - fqname: django.template.Template
+        kind: class
+      - fqname: django.template.Engine
+        kind: class
+    signals:
+      keywords:
+        - template
+        - Template
+    notes:
+      - "Template injection vulnerabilities"
+
+  - id: CA9-DJANGO-MULTIPART-001
+    advisory_ids: []
+    confidence_prior: 85
+    affected_modules:
+      - django.http.multipartparser
+    api_targets:
+      - fqname: django.http.multipartparser.MultiPartParser
+        kind: class
+    signals:
+      keywords:
+        - multipart
+        - MultiPartParser
+    notes:
+      - "Multipart parsing DoS vulnerabilities"
+
+  - id: CA9-DJANGO-CACHE-001
+    advisory_ids: []
+    confidence_prior: 80
+    affected_modules:
+      - django.core.cache
+    api_targets:
+      - fqname: django.core.cache.cache
+        kind: attribute
+    signals:
+      keywords:
+        - cache
+        - caching
+    notes:
+      - "Cache-related vulnerabilities"
+
+  - id: CA9-DJANGO-VALIDATORS-001
+    advisory_ids: []
+    confidence_prior: 85
+    affected_modules:
+      - django.core.validators
+    api_targets:
+      - fqname: django.core.validators.URLValidator
+        kind: class
+    signals:
+      keywords:
+        - URLValidator
+        - validators
+    notes:
+      - "URL validation bypass vulnerabilities"
+
+  - id: CA9-DJANGO-FILES-001
+    advisory_ids: []
+    confidence_prior: 85
+    affected_modules:
+      - django.core.files
+    api_targets:
+      - fqname: django.core.files.uploadedfile.InMemoryUploadedFile
+        kind: class
+      - fqname: django.core.files.uploadedfile.UploadedFile
+        kind: class
+    signals:
+      keywords:
+        - FileUpload
+        - UploadedFile
+        - InMemoryUploadedFile
+    notes:
+      - "File upload vulnerabilities"
+
+  - id: CA9-DJANGO-GIS-001
+    advisory_ids: []
+    confidence_prior: 80
+    affected_modules:
+      - django.contrib.gis
+    api_targets: []
+    signals:
+      keywords:
+        - GIS
+        - Geo
+        - GDAL
+        - GeoJSON
+    notes:
+      - "GIS-related vulnerabilities"

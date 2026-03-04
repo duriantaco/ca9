@@ -1,0 +1,55 @@
+schema_version: 1
+package: jinja2
+ecosystem: PyPI
+
+rules:
+  - id: CA9-JINJA2-SANDBOX-001
+    advisory_ids: []
+    confidence_prior: 90
+    affected_modules:
+      - jinja2.sandbox
+    api_targets:
+      - fqname: jinja2.sandbox.SandboxedEnvironment
+        kind: class
+      - fqname: jinja2.sandbox.ImmutableSandboxedEnvironment
+        kind: class
+    signals:
+      keywords:
+        - sandbox
+        - Sandbox
+        - escape
+    notes:
+      - "Sandbox escape vulnerabilities"
+
+  - id: CA9-JINJA2-ENV-001
+    advisory_ids: []
+    confidence_prior: 85
+    affected_modules:
+      - jinja2
+    api_targets:
+      - fqname: jinja2.Environment
+        kind: class
+      - fqname: jinja2.Template
+        kind: class
+    signals:
+      keywords:
+        - Environment
+        - template injection
+        - XSS
+    notes:
+      - "Template rendering vulnerabilities"
+
+  - id: CA9-JINJA2-FILTERS-001
+    advisory_ids: []
+    confidence_prior: 80
+    affected_modules:
+      - jinja2.filters
+    api_targets:
+      - fqname: jinja2.filters.do_xmlattr
+        kind: function
+    signals:
+      keywords:
+        - xmlattr
+        - filters
+    notes:
+      - "Filter-related vulnerabilities"

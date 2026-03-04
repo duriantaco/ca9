@@ -1,0 +1,41 @@
+schema_version: 1
+package: urllib3
+ecosystem: PyPI
+
+rules:
+  - id: CA9-URLLIB3-CRLF-001
+    advisory_ids: []
+    confidence_prior: 85
+    affected_modules:
+      - urllib3
+    api_targets:
+      - fqname: urllib3.request
+        kind: function
+      - fqname: urllib3.PoolManager.request
+        kind: method
+      - fqname: urllib3.HTTPConnectionPool.urlopen
+        kind: method
+    signals:
+      keywords:
+        - CRLF
+        - header inject
+    notes:
+      - "CRLF/header injection vulnerabilities"
+
+  - id: CA9-URLLIB3-PROXY-001
+    advisory_ids: []
+    confidence_prior: 85
+    affected_modules:
+      - urllib3
+    api_targets:
+      - fqname: urllib3.ProxyManager
+        kind: class
+      - fqname: urllib3.poolmanager.ProxyManager
+        kind: class
+    signals:
+      keywords:
+        - proxy
+        - CONNECT
+        - ProxyManager
+    notes:
+      - "Proxy-related vulnerabilities"

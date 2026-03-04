@@ -1,0 +1,60 @@
+schema_version: 1
+package: werkzeug
+ecosystem: PyPI
+
+rules:
+  - id: CA9-WERKZEUG-DEBUG-001
+    advisory_ids: []
+    confidence_prior: 95
+    affected_modules:
+      - werkzeug.debug
+    api_targets:
+      - fqname: werkzeug.debug.DebuggedApplication
+        kind: class
+      - fqname: werkzeug.serving.run_simple
+        kind: function
+        notes:
+          - "only vulnerable when use_debugger=True"
+    signals:
+      keywords:
+        - debug
+        - Debug
+        - debugger
+        - RCE
+    notes:
+      - "Remote code execution via debugger"
+
+  - id: CA9-WERKZEUG-FORMPARSER-001
+    advisory_ids: []
+    confidence_prior: 85
+    affected_modules:
+      - werkzeug.formparser
+    api_targets:
+      - fqname: werkzeug.formparser.FormDataParser
+        kind: class
+      - fqname: werkzeug.formparser.MultiPartParser
+        kind: class
+    signals:
+      keywords:
+        - formparser
+        - FormDataParser
+        - multipart
+    notes:
+      - "Form/multipart parsing vulnerabilities"
+
+  - id: CA9-WERKZEUG-UTILS-001
+    advisory_ids: []
+    confidence_prior: 80
+    affected_modules:
+      - werkzeug.utils
+    api_targets:
+      - fqname: werkzeug.utils.safe_join
+        kind: function
+      - fqname: werkzeug.utils.send_file
+        kind: function
+    signals:
+      keywords:
+        - safe_join
+        - path traversal
+    notes:
+      - "Path traversal vulnerabilities"

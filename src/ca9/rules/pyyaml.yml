@@ -1,0 +1,36 @@
+schema_version: 1
+package: pyyaml
+ecosystem: PyPI
+
+rules:
+  - id: CA9-PYYAML-LOAD-001
+    advisory_ids:
+      - CVE-2020-14343
+      - GHSA-8q59-q68h-6hv4
+    confidence_prior: 95
+    affected_modules:
+      - yaml
+    api_targets:
+      - fqname: yaml.load
+        kind: function
+        notes:
+          - "unsafe without explicit Loader argument"
+      - fqname: yaml.unsafe_load
+        kind: function
+      - fqname: yaml.full_load
+        kind: function
+      - fqname: yaml.FullLoader
+        kind: class
+      - fqname: yaml.UnsafeLoader
+        kind: class
+      - fqname: yaml.Loader
+        kind: class
+    signals:
+      keywords:
+        - yaml.load
+        - unsafe_load
+        - FullLoader
+        - UnsafeLoader
+        - deserialization
+    notes:
+      - "Arbitrary code execution via unsafe YAML deserialization"

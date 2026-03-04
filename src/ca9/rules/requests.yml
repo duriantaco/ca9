@@ -1,0 +1,50 @@
+schema_version: 1
+package: requests
+ecosystem: PyPI
+
+rules:
+  - id: CA9-REQUESTS-REDIRECT-001
+    advisory_ids:
+      - CVE-2023-32681
+      - GHSA-j8r2-6x86-q33q
+    confidence_prior: 85
+    affected_modules:
+      - requests.sessions
+      - requests.models
+    api_targets:
+      - fqname: requests.get
+        kind: function
+      - fqname: requests.post
+        kind: function
+      - fqname: requests.request
+        kind: function
+      - fqname: requests.Session.send
+        kind: method
+      - fqname: requests.Session.request
+        kind: method
+    signals:
+      keywords:
+        - redirect
+        - cookie
+        - header leak
+        - proxy
+    notes:
+      - "Information leak on redirect to different host"
+
+  - id: CA9-REQUESTS-AUTH-001
+    advisory_ids: []
+    confidence_prior: 80
+    affected_modules:
+      - requests.auth
+    api_targets:
+      - fqname: requests.auth.HTTPBasicAuth
+        kind: class
+      - fqname: requests.auth.HTTPDigestAuth
+        kind: class
+    signals:
+      keywords:
+        - authentication
+        - auth bypass
+        - credential
+    notes:
+      - "Authentication-related vulnerabilities"
