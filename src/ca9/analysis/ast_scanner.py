@@ -130,7 +130,9 @@ _REQ_NAME_RE = re.compile(r"^([A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?)")
 
 def _parse_requirement_name(req_str: str) -> str | None:
     m = _REQ_NAME_RE.match(req_str.strip())
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+    return None
 
 
 def _get_direct_deps(package_name: str) -> list[str]:

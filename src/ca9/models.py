@@ -79,7 +79,9 @@ class Evidence:
     api_usage_hits: tuple[ApiUsageHit, ...] = ()
     api_usage_seen: bool | None = None  # none = not checked
     api_usage_confidence: int | None = None
+    api_call_sites_covered: bool | None = None  # none = not checked / no coverage
     intel_rule_ids: tuple[str, ...] = ()
+    coverage_completeness_pct: float | None = None  # 0-100, from coverage.json totals
 
 
 @dataclass

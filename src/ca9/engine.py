@@ -11,6 +11,8 @@ from ca9.analysis.ast_scanner import (
     resolve_transitive_deps,
 )
 from ca9.analysis.coverage_reader import (
+    are_call_sites_covered,
+    get_coverage_completeness,
     get_covered_files,
     is_package_executed,
     is_submodule_executed,
@@ -40,6 +42,7 @@ def collect_evidence(
     component: AffectedComponent | None = None,
     intel: VulnIntelResolution | None = None,
     api_hits: list[ApiUsageHit] | None = None,
+    coverage_completeness: float | None = None,
 ) -> Evidence:
     warnings: list[str] = []
 
@@ -102,11 +105,11 @@ def collect_evidence(
     if component.warnings:
         warnings.extend(component.warnings)
 
-    # API-level reachability from intel rules
     api_targets_fqnames: tuple[str, ...] = ()
     api_usage_hits: tuple[ApiUsageHit, ...] = ()
     api_usage_seen: bool | None = None
     api_usage_confidence: int | None = None
+    api_call_sites_covered: bool | None = None
     intel_rule_ids: tuple[str, ...] = ()
 
     if intel and intel.matched_rules:
@@ -119,8 +122,14 @@ def collect_evidence(
             api_usage_seen = len(api_hits) > 0
             if api_hits:
                 api_usage_confidence = max(h.confidence for h in api_hits)
+
+                if covered_files is not None:
+                    call_sites = [(h.file_path, h.line) for h in api_hits]
+                    sites_covered, _cov_count, _total = are_call_sites_covered(
+                        call_sites, covered_files
+                    )
+                    api_call_sites_covered = sites_covered
         elif intel.api_targets:
-            # Had targets but no scan was run (e.g. package not imported)
             api_usage_seen = None
 
     return Evidence(
@@ -137,7 +146,9 @@ def collect_evidence(
         api_usage_hits=api_usage_hits,
         api_usage_seen=api_usage_seen,
         api_usage_confidence=api_usage_confidence,
+        api_call_sites_covered=api_call_sites_covered,
         intel_rule_ids=intel_rule_ids,
+        coverage_completeness_pct=coverage_completeness,
     )
 
 
@@ -236,9 +247,32 @@ def derive_verdict(
                 evidence=evidence,
             )
 
-    # API-level reachability can upgrade to REACHABLE even without coverage
     if evidence.api_usage_seen is True:
         api_detail = f"{len(evidence.api_usage_hits)} vulnerable API call(s) found"
+
+        if has_coverage and evidence.api_call_sites_covered is True:
+            return VerdictResult(
+                vulnerability=vuln,
+                verdict=Verdict.REACHABLE,
+                reason=f"{trace}, {api_detail}, and call sites executed in tests",
+                imported_as=import_name,
+                executed_files=list(evidence.coverage_files),
+                dependency_of=dep_of,
+                affected_component=component,
+                evidence=evidence,
+            )
+
+        if has_coverage and evidence.api_call_sites_covered is False:
+            return VerdictResult(
+                vulnerability=vuln,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=f"{trace}, {api_detail}, but call sites not executed in tests",
+                imported_as=import_name,
+                dependency_of=dep_of,
+                affected_component=component,
+                evidence=evidence,
+            )
+
         if has_coverage and evidence.coverage_seen:
             return VerdictResult(
                 vulnerability=vuln,
@@ -250,6 +284,7 @@ def derive_verdict(
                 affected_component=component,
                 evidence=evidence,
             )
+
         return VerdictResult(
             vulnerability=vuln,
             verdict=Verdict.REACHABLE,
@@ -303,11 +338,12 @@ def analyze(
     transitive_deps = resolve_transitive_deps(repo_imports)
 
     covered_files: dict[str, list[int]] | None = None
+    coverage_completeness: float | None = None
     if coverage_path:
         coverage_data = load_coverage(coverage_path)
         covered_files = get_covered_files(coverage_data)
+        coverage_completeness = get_coverage_completeness(coverage_data)
 
-    # Phase 1: Resolve intel rules for all vulns, collect all API targets
     vuln_intel: dict[str, VulnIntelResolution] = {}
     all_api_targets = []
     seen_fqnames: set[str] = set()
@@ -320,14 +356,12 @@ def analyze(
                 seen_fqnames.add(t.fqname)
                 all_api_targets.append(t)
 
-    # Phase 2: Run API usage scan once for all targets
     hits_by_target: dict[str, list[ApiUsageHit]] = {}
     if all_api_targets:
         all_hits = find_api_usage(repo_path, all_api_targets)
         for hit in all_hits:
             hits_by_target.setdefault(hit.matched_target, []).append(hit)
 
-    # Phase 3: Build evidence and verdicts per vuln
     results: list[VerdictResult] = []
 
     for vuln in vulnerabilities:
@@ -336,7 +370,6 @@ def analyze(
 
         intel = vuln_intel.get(vuln.id)
 
-        # Collect API hits for this vuln's targets
         vuln_api_hits: list[ApiUsageHit] | None = None
         if intel and intel.api_targets:
             vuln_api_hits = []
@@ -352,6 +385,7 @@ def analyze(
             component,
             intel=intel,
             api_hits=vuln_api_hits,
+            coverage_completeness=coverage_completeness,
         )
 
         if evidence.dependency_kind == "transitive":
