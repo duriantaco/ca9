@@ -84,24 +84,6 @@ class Evidence:
     coverage_completeness_pct: float | None = None  # 0-100, from coverage.json totals
 
 
-@dataclass(frozen=True)
-class PathStep:
-    file_path: str
-    function_name: str
-    line: int
-    col: int | None = None
-    code_snippet: str | None = None
-
-
-@dataclass(frozen=True)
-class ExploitPath:
-    entry_point: PathStep
-    steps: tuple[PathStep, ...]
-    vulnerable_call: PathStep
-    vulnerable_target: str
-    confidence: int = 80
-
-
 @dataclass
 class VerdictResult:
     vulnerability: Vulnerability
@@ -113,7 +95,6 @@ class VerdictResult:
     affected_component: AffectedComponent | None = None
     evidence: Evidence | None = None
     confidence_score: int = 0  # 0-100
-    exploit_paths: list[ExploitPath] = field(default_factory=list)
 
 
 def finding_key(vuln_id: str, package_name: str, package_version: str) -> tuple[str, str, str]:
