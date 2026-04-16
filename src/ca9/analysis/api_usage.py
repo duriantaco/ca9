@@ -4,6 +4,7 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ca9.analysis.ast_scanner import _is_runtime_python_file
 from ca9.models import ApiTarget, ApiUsageHit
 
 
@@ -241,8 +242,7 @@ def find_api_usage(
     all_hits: list[ApiUsageHit] = []
 
     for py_file in repo_root.rglob("*.py"):
-        rel = str(py_file.relative_to(repo_root))
-        if rel.startswith("."):
+        if not _is_runtime_python_file(py_file, repo_root):
             continue
 
         try:

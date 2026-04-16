@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
 from ca9.engine import analyze, derive_verdict
 from ca9.models import (
@@ -48,7 +49,8 @@ class TestAnalyze:
     def test_imported_with_coverage_not_executed(self, sample_repo, coverage_path):
         vulns = [_make_vuln("PyYAML")]
         report = analyze(vulns, sample_repo, coverage_path)
-        assert report.results[0].verdict == Verdict.UNREACHABLE_DYNAMIC
+        assert report.results[0].verdict == Verdict.INCONCLUSIVE
+        assert report.results[0].original_verdict == Verdict.UNREACHABLE_DYNAMIC
 
     def test_full_snyk_report(self, sample_repo, snyk_path):
         from ca9.parsers.snyk import SnykParser
@@ -72,15 +74,48 @@ class TestAnalyze:
         report = analyze(vulns, sample_repo, coverage_path)
         assert report.total == 3
         assert report.reachable_count == 1
-        assert report.unreachable_count == 2
-        assert report.inconclusive_count == 0
+        assert report.unreachable_count == 1
+        assert report.inconclusive_count == 1
+
+    def test_threat_intel_failure_surfaces_warning(self, sample_repo):
+        vulns = [_make_vuln("requests", vuln_id="CVE-2024-0001")]
+
+        with patch(
+            "ca9.threat_intel.fetch_threat_intel_batch", side_effect=RuntimeError("timeout")
+        ):
+            report = analyze(vulns, sample_repo, threat_intel=True)
+
+        assert any("threat intelligence enrichment unavailable" in w for w in report.warnings)
+        evidence = report.results[0].evidence
+        assert evidence is not None
+        assert any(
+            "threat intelligence enrichment unavailable" in w
+            for w in evidence.external_fetch_warnings
+        )
+
+    def test_otel_failure_surfaces_warning(self, sample_repo, tmp_path):
+        vulns = [_make_vuln("requests")]
+        otel_path = tmp_path / "traces.json"
+        otel_path.write_text("{}")
+
+        with patch(
+            "ca9.analysis.otel_reader.load_otel_traces", side_effect=RuntimeError("bad traces")
+        ):
+            report = analyze(vulns, sample_repo, otel_traces_path=otel_path)
+
+        assert any("production trace ingestion unavailable" in w for w in report.warnings)
+        evidence = report.results[0].evidence
+        assert evidence is not None
+        assert any(
+            "production trace ingestion unavailable" in w for w in evidence.external_fetch_warnings
+        )
 
     def test_empty_repo(self, tmp_path):
         empty_repo = tmp_path / "empty_repo"
         empty_repo.mkdir()
         vulns = [_make_vuln("requests")]
         report = analyze(vulns, empty_repo)
-        assert report.results[0].verdict == Verdict.UNREACHABLE_STATIC
+        assert report.results[0].verdict == Verdict.INCONCLUSIVE
 
     def test_verdict_result_fields(self, sample_repo, coverage_path):
         vulns = [_make_vuln("requests")]
@@ -89,6 +124,52 @@ class TestAnalyze:
         assert r.imported_as == "requests"
         assert len(r.executed_files) > 0
         assert r.reason
+
+    def test_direct_dependency_not_imported_stays_unreachable_static(self, sample_repo):
+        vulns = [_make_vuln("some-unused-package")]
+        report = analyze(vulns, sample_repo)
+        assert report.results[0].verdict == Verdict.UNREACHABLE_STATIC
+        assert "declared as a direct dependency" in report.results[0].reason
+
+    def test_transitive_without_dependency_graph_is_inconclusive(self, sample_repo):
+        vulns = [_make_vuln("urllib3")]
+        with patch("ca9.analysis.ast_scanner.importlib.metadata.distributions", return_value=[]):
+            report = analyze(vulns, sample_repo)
+        assert report.results[0].verdict == Verdict.INCONCLUSIVE
+        assert "dependency graph" in report.results[0].reason
+
+    def test_report_dependency_chain_marks_transitive_without_local_metadata(self, sample_repo):
+        vulns = [
+            Vulnerability(
+                id="V-urllib3",
+                package_name="urllib3",
+                package_version="1.26.18",
+                severity="high",
+                title="urllib3 issue",
+                report_dependency_kind="transitive",
+                report_dependency_chain=("requests", "urllib3"),
+            )
+        ]
+        with patch("ca9.analysis.ast_scanner.importlib.metadata.distributions", return_value=[]):
+            report = analyze(vulns, sample_repo)
+        assert report.results[0].verdict == Verdict.INCONCLUSIVE
+        assert "dependency of requests" in report.results[0].reason
+
+    def test_report_dependency_chain_requires_imported_root(self, sample_repo):
+        vulns = [
+            Vulnerability(
+                id="V-urllib3",
+                package_name="urllib3",
+                package_version="1.26.18",
+                severity="high",
+                title="urllib3 issue",
+                report_dependency_kind="transitive",
+                report_dependency_chain=("django", "urllib3"),
+            )
+        ]
+        with patch("ca9.analysis.ast_scanner.importlib.metadata.distributions", return_value=[]):
+            report = analyze(vulns, sample_repo)
+        assert report.results[0].verdict == Verdict.UNREACHABLE_STATIC
 
 
 class TestCoverageCompletenessPropagation:
@@ -166,7 +247,8 @@ class TestSubmoduleAnalysis:
                         "/site-packages/django/db/models/query.py": {
                             "executed_lines": [1, 2, 3],
                         },
-                    }
+                    },
+                    "totals": {"percent_covered": 95.0},
                 }
             )
         )
@@ -176,6 +258,11 @@ class TestSubmoduleAnalysis:
         r = report.results[0]
         assert r.verdict == Verdict.UNREACHABLE_DYNAMIC
         assert "django.contrib.admin" in r.reason
+
+    def test_balanced_mode_keeps_unreachable_dynamic(self, sample_repo, coverage_path):
+        vulns = [_make_vuln("PyYAML")]
+        report = analyze(vulns, sample_repo, coverage_path, proof_standard="balanced")
+        assert report.results[0].verdict == Verdict.UNREACHABLE_DYNAMIC
 
     def test_low_confidence_falls_back_to_package_level(self, sample_repo, coverage_path):
         vulns = [_make_vuln("requests", title="An unspecified vulnerability")]

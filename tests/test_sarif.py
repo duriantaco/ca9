@@ -247,6 +247,107 @@ class TestSARIF:
         assert r["evidence"]["version_in_range"] is True
         assert r["evidence"]["affected_component_source"] == "curated:django"
 
+    def test_json_includes_proof_standard_and_policy_adjustment(self):
+        report = Report(
+            results=[
+                VerdictResult(
+                    vulnerability=_vuln(),
+                    verdict=Verdict.INCONCLUSIVE,
+                    original_verdict=Verdict.UNREACHABLE_DYNAMIC,
+                    policy_adjustment="strict proof downgraded this suppression because coverage completeness is below 80%",
+                    reason="test",
+                ),
+            ],
+            repo_path=".",
+            proof_standard="strict",
+        )
+        data = json.loads(write_json(report))
+        assert data["proof_standard"] == "strict"
+        assert data["results"][0]["original_verdict"] == "unreachable_dynamic"
+        assert "coverage completeness" in data["results"][0]["policy_adjustment"]
+
+    def test_json_includes_report_warnings(self):
+        report = Report(
+            results=[
+                VerdictResult(
+                    vulnerability=_vuln(),
+                    verdict=Verdict.INCONCLUSIVE,
+                    reason="test",
+                ),
+            ],
+            repo_path=".",
+            warnings=["threat intelligence enrichment unavailable: timeout"],
+        )
+
+        data = json.loads(write_json(report))
+        assert data["warnings"] == ["threat intelligence enrichment unavailable: timeout"]
+
+    def test_sarif_includes_policy_adjustment(self):
+        report = Report(
+            results=[
+                VerdictResult(
+                    vulnerability=_vuln(),
+                    verdict=Verdict.INCONCLUSIVE,
+                    original_verdict=Verdict.UNREACHABLE_STATIC,
+                    policy_adjustment="strict proof downgraded this suppression because the dependency graph came from the ambient environment rather than the report",
+                    reason="test",
+                ),
+            ],
+            repo_path=".",
+            proof_standard="strict",
+        )
+        data = json.loads(write_sarif(report))
+        props = data["runs"][0]["results"][0]["properties"]
+        assert props["proof_standard"] == "strict"
+        assert props["original_verdict"] == "unreachable_static"
+        assert "ambient environment" in props["policy_adjustment"]
+
+    def test_sarif_includes_report_warnings(self):
+        report = Report(
+            results=[
+                VerdictResult(
+                    vulnerability=_vuln(),
+                    verdict=Verdict.INCONCLUSIVE,
+                    reason="test",
+                ),
+            ],
+            repo_path=".",
+            warnings=["production trace ingestion unavailable: bad traces"],
+        )
+
+        data = json.loads(write_sarif(report))
+        assert data["runs"][0]["properties"]["warnings"] == [
+            "production trace ingestion unavailable: bad traces"
+        ]
+
+    def test_sarif_blast_radius_in_properties(self):
+        from ca9.capabilities.models import BlastRadius, CapabilityHit
+
+        br = BlastRadius(
+            capabilities=("exec.shell", "network.egress"),
+            details=(
+                CapabilityHit(name="exec.shell", scope="*", source_file="t.py", asset_ref="a"),
+            ),
+            risk_level="high",
+            risk_reasons=("Attacker gains shell execution",),
+        )
+        report = Report(
+            results=[
+                VerdictResult(
+                    vulnerability=_vuln(),
+                    verdict=Verdict.REACHABLE,
+                    reason="test",
+                    blast_radius=br,
+                ),
+            ],
+            repo_path=".",
+        )
+        data = json.loads(write_sarif(report))
+        props = data["runs"][0]["results"][0]["properties"]
+        assert "blast_radius" in props
+        assert props["blast_radius"]["risk_level"] == "high"
+        assert "exec.shell" in props["blast_radius"]["capabilities"]
+
     def test_sarif_fingerprint_stable(self):
         report = Report(
             results=[
