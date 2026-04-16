@@ -85,6 +85,24 @@ class TestSnykParser:
         vulns = parser.parse(data)
         assert len(vulns) == 2
 
+    def test_extracts_dependency_chain_from_from(self):
+        data = {
+            "vulnerabilities": [
+                {
+                    "id": "V1",
+                    "packageName": "urllib3",
+                    "version": "1.26.18",
+                    "severity": "high",
+                    "title": "t",
+                    "from": ["my-project@1.0.0", "requests@2.31.0", "urllib3@1.26.18"],
+                }
+            ],
+            "projectName": "my-project",
+        }
+        vulns = SnykParser().parse(data)
+        assert vulns[0].report_dependency_kind == "transitive"
+        assert vulns[0].report_dependency_chain == ("requests", "urllib3")
+
 
 class TestDependabotParser:
     def test_can_parse_dependabot(self, dependabot_path):
@@ -105,6 +123,29 @@ class TestDependabotParser:
         assert vulns[0].id == "GHSA-1234-abcd-5678"
         assert vulns[0].package_name == "requests"
         assert vulns[1].severity == "critical"
+
+    def test_parses_dependency_relationship(self):
+        data = [
+            {
+                "number": 3,
+                "security_advisory": {
+                    "ghsa_id": "GHSA-9999-aaaa-bbbb",
+                    "summary": "t",
+                    "severity": "high",
+                },
+                "security_vulnerability": {
+                    "package": {"ecosystem": "pip", "name": "urllib3"},
+                    "vulnerable_version_range": "< 2.0",
+                },
+                "dependency": {
+                    "package": {"ecosystem": "pip", "name": "urllib3"},
+                    "relationship": "transitive",
+                },
+            }
+        ]
+        vulns = DependabotParser().parse(data)
+        assert vulns[0].report_dependency_kind == "transitive"
+        assert vulns[0].report_dependency_chain == ()
 
 
 class TestSnykEdgeCases:
@@ -202,6 +243,9 @@ class TestTrivyParser:
         assert "CVE-2023-32681" in ids
         assert "CVE-2022-42969" in ids
         assert "CVE-2023-37920" in ids
+        requests_vuln = next(v for v in vulns if v.package_name == "requests")
+        assert requests_vuln.report_dependency_kind == "direct"
+        assert requests_vuln.report_dependency_chain == ("requests",)
 
     def test_severity_lowercased(self, trivy_path):
         data = json.loads(trivy_path.read_text())
@@ -267,6 +311,28 @@ class TestTrivyParser:
         data = {"Results": []}
         vulns = TrivyParser().parse(data)
         assert vulns == []
+
+    def test_extracts_dependency_chain_from_trivy_path(self):
+        data = {
+            "Results": [
+                {
+                    "Target": "poetry.lock",
+                    "Vulnerabilities": [
+                        {
+                            "VulnerabilityID": "CVE-1",
+                            "PkgName": "urllib3",
+                            "InstalledVersion": "1.26.18",
+                            "Severity": "HIGH",
+                            "Title": "t",
+                            "DependencyPath": ["requests@2.31.0", "urllib3@1.26.18"],
+                        }
+                    ],
+                }
+            ]
+        }
+        vulns = TrivyParser().parse(data)
+        assert vulns[0].report_dependency_kind == "transitive"
+        assert vulns[0].report_dependency_chain == ("requests", "urllib3")
 
 
 class TestPipAuditParser:

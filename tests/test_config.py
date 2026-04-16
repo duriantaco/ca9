@@ -1,10 +1,4 @@
-"""Tests for .ca9.toml config file support."""
-
 from __future__ import annotations
-
-import sys
-
-import pytest
 
 from ca9.config import find_config, load_config
 
@@ -32,7 +26,6 @@ class TestFindConfig:
 
 
 class TestLoadConfig:
-    @pytest.mark.skipif(sys.version_info < (3, 11), reason="tomllib requires Python 3.11+")
     def test_loads_config(self, tmp_path):
         config_file = tmp_path / ".ca9.toml"
         config_file.write_text('repo = "src"\nformat = "json"\nverbose = true\n')
@@ -41,9 +34,15 @@ class TestLoadConfig:
         assert result["format"] == "json"
         assert result["verbose"] is True
 
-    @pytest.mark.skipif(sys.version_info < (3, 11), reason="tomllib requires Python 3.11+")
     def test_loads_empty_config(self, tmp_path):
         config_file = tmp_path / ".ca9.toml"
         config_file.write_text("")
         result = load_config(config_file)
         assert result == {}
+
+    def test_loads_namespaced_config_section(self, tmp_path):
+        config_file = tmp_path / ".ca9.toml"
+        config_file.write_text('[ca9]\nrepo = "src"\nformat = "json"\n')
+        result = load_config(config_file)
+        assert result["repo"] == "src"
+        assert result["format"] == "json"

@@ -7,8 +7,12 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
+from packaging.utils import canonicalize_name
+
+from ca9.analysis.ast_scanner import discover_declared_dependency_inventory
 from ca9.models import VersionRange, Vulnerability, finding_key
 
 OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
@@ -21,6 +25,17 @@ MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 0.5
 
 
+@dataclass(frozen=True)
+class ScanInventory:
+    packages: tuple[tuple[str, str], ...]
+    source: str
+    warnings: tuple[str, ...] = ()
+    declared_dependencies: int = 0
+    pinned_dependencies: int = 0
+    environment_fallbacks: int = 0
+    unresolved_dependencies: tuple[str, ...] = ()
+
+
 def get_installed_packages() -> list[tuple[str, str]]:
     packages: list[tuple[str, str]] = []
     for dist in importlib.metadata.distributions():
@@ -29,6 +44,80 @@ def get_installed_packages() -> list[tuple[str, str]]:
         if name and version:
             packages.append((name, version))
     return packages
+
+
+def resolve_scan_inventory(repo_path: Path) -> ScanInventory:
+    declared = discover_declared_dependency_inventory(repo_path)
+    installed_packages = get_installed_packages()
+
+    if not declared:
+        return ScanInventory(
+            packages=tuple(installed_packages),
+            source="environment",
+            warnings=(
+                "no declared dependencies were found in the target repo; fell back to installed environment packages",
+            ),
+        )
+
+    installed_by_name = {
+        canonicalize_name(name): (name, version)
+        for name, version in installed_packages
+        if name and version
+    }
+
+    packages: list[tuple[str, str]] = []
+    unresolved: list[str] = []
+    pinned = 0
+    env_fallbacks = 0
+
+    for key, (name, version) in sorted(declared.items()):
+        if version:
+            packages.append((name, version))
+            pinned += 1
+            continue
+
+        installed = installed_by_name.get(key)
+        if installed is not None:
+            packages.append((name, installed[1]))
+            env_fallbacks += 1
+            continue
+
+        unresolved.append(name)
+
+    warnings: list[str] = []
+    if env_fallbacks:
+        warnings.append(
+            "used installed environment versions for "
+            f"{env_fallbacks} declared package(s) without exact manifest pins"
+        )
+    if unresolved:
+        sample = ", ".join(sorted(unresolved)[:5])
+        suffix = " ..." if len(unresolved) > 5 else ""
+        warnings.append(
+            "skipped declared package(s) with no exact version and no matching installed distribution: "
+            f"{sample}{suffix}"
+        )
+
+    if packages:
+        return ScanInventory(
+            packages=tuple(packages),
+            source="repo",
+            warnings=tuple(warnings),
+            declared_dependencies=len(declared),
+            pinned_dependencies=pinned,
+            environment_fallbacks=env_fallbacks,
+            unresolved_dependencies=tuple(sorted(unresolved)),
+        )
+
+    return ScanInventory(
+        packages=tuple(installed_packages),
+        source="environment",
+        warnings=(
+            "declared dependencies were found, but none had resolvable versions; fell back to installed environment packages",
+        ),
+        declared_dependencies=len(declared),
+        unresolved_dependencies=tuple(sorted(unresolved)),
+    )
 
 
 def _extract_severity(osv_vuln: dict) -> str:
@@ -213,7 +302,7 @@ def _write_cache(vuln_id: str, data: dict) -> None:
 def _is_retryable(exc: Exception) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in (429, 500, 502, 503, 504)
-    return isinstance(exc, (urllib.error.URLError, OSError))
+    return isinstance(exc, urllib.error.URLError | OSError)
 
 
 def _fetch_vuln_details(vuln_id: str, offline: bool = False) -> dict:
@@ -436,3 +525,19 @@ def scan_installed(
     return query_osv_batch(
         packages, offline=offline, refresh_cache=refresh_cache, max_workers=max_workers
     )
+
+
+def scan_repository(
+    repo_path: Path,
+    offline: bool = False,
+    refresh_cache: bool = False,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+) -> tuple[list[Vulnerability], ScanInventory]:
+    inventory = resolve_scan_inventory(repo_path)
+    vulnerabilities = query_osv_batch(
+        list(inventory.packages),
+        offline=offline,
+        refresh_cache=refresh_cache,
+        max_workers=max_workers,
+    )
+    return vulnerabilities, inventory

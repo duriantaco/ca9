@@ -31,6 +31,16 @@ class DependabotParser:
             )
             pkg_name = pkg.get("name", "")
             pkg_version = sec_vuln.get("vulnerable_version_range", "")
+            relationship = dep.get("relationship")
+            if relationship == "indirect":
+                relationship = "transitive"
+            if relationship not in ("direct", "transitive"):
+                relationship = None
+
+            if relationship == "direct":
+                report_dependency_chain = (pkg_name,)
+            else:
+                report_dependency_chain = ()
 
             key = finding_key(vuln_id, pkg_name, pkg_version)
             if key in seen:
@@ -45,6 +55,8 @@ class DependabotParser:
                     severity=advisory.get("severity", "unknown"),
                     title=advisory.get("summary", ""),
                     description=advisory.get("description", ""),
+                    report_dependency_kind=relationship,
+                    report_dependency_chain=report_dependency_chain,
                 )
             )
 

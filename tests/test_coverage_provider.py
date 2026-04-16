@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -51,6 +52,7 @@ class TestGenerateCoverage:
         def fake_run(cmd, **kwargs):
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text('{"files": {}}')
+            return subprocess.CompletedProcess(cmd, 0, "", "")
 
         with (
             patch("ca9.coverage_provider.shutil.which", return_value="/usr/bin/pytest"),
@@ -66,7 +68,10 @@ class TestGenerateCoverage:
     def test_pytest_cov_missing(self, tmp_path, capsys):
         with (
             patch("ca9.coverage_provider.shutil.which", return_value="/usr/bin/pytest"),
-            patch("ca9.coverage_provider.subprocess.run"),
+            patch(
+                "ca9.coverage_provider.subprocess.run",
+                return_value=subprocess.CompletedProcess(["pytest"], 0, "", ""),
+            ),
         ):
             result = generate_coverage(tmp_path)
 
@@ -74,8 +79,6 @@ class TestGenerateCoverage:
         assert "pytest-cov installed" in capsys.readouterr().err
 
     def test_pytest_timeout(self, tmp_path, capsys):
-        import subprocess
-
         with (
             patch("ca9.coverage_provider.shutil.which", return_value="/usr/bin/pytest"),
             patch(
@@ -101,6 +104,41 @@ class TestGenerateCoverage:
         assert result is None
         assert "Failed to run pytest" in capsys.readouterr().err
 
+    def test_pytest_failure_does_not_use_stale_coverage_file(self, tmp_path, capsys):
+        output_path = tmp_path / ".ca9" / "coverage.json"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text('{"files": {"stale.py": {"executed_lines": [1]}}}')
+
+        with (
+            patch("ca9.coverage_provider.shutil.which", return_value="/usr/bin/pytest"),
+            patch(
+                "ca9.coverage_provider.subprocess.run",
+                return_value=subprocess.CompletedProcess(["pytest"], 1, "", "tests failed"),
+            ),
+        ):
+            result = generate_coverage(tmp_path)
+
+        assert result is None
+        assert not output_path.exists()
+        assert "pytest failed while generating coverage" in capsys.readouterr().err
+
+    def test_invalid_generated_json_is_rejected(self, tmp_path, capsys):
+        output_path = tmp_path / ".ca9" / "coverage.json"
+
+        def fake_run(cmd, **kwargs):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text("{not-json")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with (
+            patch("ca9.coverage_provider.shutil.which", return_value="/usr/bin/pytest"),
+            patch("ca9.coverage_provider.subprocess.run", side_effect=fake_run),
+        ):
+            result = generate_coverage(tmp_path)
+
+        assert result is None
+        assert "invalid coverage.json" in capsys.readouterr().err
+
 
 class TestResolveCoverage:
     def test_explicit_path_wins(self, tmp_path):
@@ -121,6 +159,7 @@ class TestResolveCoverage:
         def fake_run(cmd, **kwargs):
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text('{"files": {}}')
+            return subprocess.CompletedProcess(cmd, 0, "", "")
 
         with (
             patch("ca9.coverage_provider.shutil.which", return_value="/usr/bin/pytest"),
