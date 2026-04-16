@@ -1,0 +1,43 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "my-service"}}
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {"name": "opentelemetry.instrumentation.requests"},
+          "spans": [
+            {
+              "name": "GET",
+              "kind": 3,
+              "attributes": [
+                {"key": "code.namespace", "value": {"stringValue": "requests.api"}},
+                {"key": "code.function", "value": {"stringValue": "get"}},
+                {"key": "http.url", "value": {"stringValue": "http://example.com"}}
+              ]
+            },
+            {
+              "name": "POST",
+              "kind": 3,
+              "attributes": [
+                {"key": "code.namespace", "value": {"stringValue": "requests.api"}},
+                {"key": "code.function", "value": {"stringValue": "post"}}
+              ]
+            },
+            {
+              "name": "handler",
+              "kind": 1,
+              "attributes": [
+                {"key": "code.filepath", "value": {"stringValue": "app/services/fetch.py"}},
+                {"key": "code.function", "value": {"stringValue": "download_url"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

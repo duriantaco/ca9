@@ -38,6 +38,8 @@ class Vulnerability:
     description: str = ""
     affected_ranges: tuple[VersionRange, ...] = ()
     references: tuple[str, ...] = ()
+    report_dependency_kind: str | None = None
+    report_dependency_chain: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -57,7 +59,7 @@ class ApiUsageHit:
     file_path: str
     line: int
     col: int | None = None
-    match_type: str = "direct_call"  # direct_call, attribute_call, imported_symbol_call, class_instantiation, symbol_reference
+    match_type: str = "direct_call"
     matched_target: str = ""
     code_snippet: str | None = None
     confidence: int = 80
@@ -67,12 +69,16 @@ class ApiUsageHit:
 @dataclass(frozen=True)
 class Evidence:
     version_in_range: bool | None = None
-    dependency_kind: str | None = None  # direct, transitive, none
+    dependency_kind: str | None = None
+    dependency_graph_available: bool = False
+    dependency_graph_source: str = ""
+    declared_direct_dependency: bool = False
     package_imported: bool = False
-    submodule_imported: bool | None = None  # none = not checked
+    submodule_imported: bool | None = None
+    report_dependency_chain: tuple[str, ...] = ()
     affected_component_source: str = ""
-    affected_component_confidence: int = 0  # 0-100
-    coverage_seen: bool | None = None  # none = no coverage data
+    affected_component_confidence: int = 0
+    coverage_seen: bool | None = None
     coverage_files: tuple[str, ...] = ()
     external_fetch_warnings: tuple[str, ...] = ()
     api_targets: tuple[str, ...] = ()
@@ -82,6 +88,9 @@ class Evidence:
     api_call_sites_covered: bool | None = None  # none = not checked / no coverage
     intel_rule_ids: tuple[str, ...] = ()
     coverage_completeness_pct: float | None = None  # 0-100, from coverage.json totals
+    threat_intel: ThreatIntelData | None = None
+    production_observed: bool | None = None
+    production_trace_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -102,6 +111,14 @@ class ExploitPath:
     confidence: int = 80
 
 
+@dataclass(frozen=True)
+class ThreatIntelData:
+    epss_score: float | None = None  # 0.0-1.0
+    epss_percentile: float | None = None  # 0.0-1.0
+    in_kev: bool = False
+    kev_due_date: str | None = None
+
+
 @dataclass
 class VerdictResult:
     vulnerability: Vulnerability
@@ -113,7 +130,13 @@ class VerdictResult:
     affected_component: AffectedComponent | None = None
     evidence: Evidence | None = None
     confidence_score: int = 0  # 0-100
+    original_verdict: Verdict | None = None
+    policy_adjustment: str | None = None
+    blast_radius: object | None = None
+    runtime_mitigations: list[str] = field(default_factory=list)
+    runtime_adjusted_priority: str | None = None
     exploit_paths: list[ExploitPath] = field(default_factory=list)
+    threat_intel: ThreatIntelData | None = None
 
 
 def finding_key(vuln_id: str, package_name: str, package_version: str) -> tuple[str, str, str]:
@@ -125,6 +148,8 @@ class Report:
     results: list[VerdictResult]
     repo_path: str
     coverage_path: str | None = None
+    proof_standard: str = "strict"
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
