@@ -1,0 +1,34 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "test-sbom",
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-Package-requests",
+      "name": "requests",
+      "versionInfo": "2.31.0",
+      "downloadLocation": "https://pypi.org/project/requests/",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:pypi/requests@2.31.0"
+        }
+      ]
+    },
+    {
+      "SPDXID": "SPDXRef-Package-flask",
+      "name": "flask",
+      "versionInfo": "2.3.0",
+      "downloadLocation": "https://pypi.org/project/flask/",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:pypi/flask@2.3.0"
+        }
+      ]
+    }
+  ]
+}
