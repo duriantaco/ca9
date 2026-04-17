@@ -34,11 +34,11 @@ ca9 = "ca9.cli:main"
 ca9-mcp = "ca9_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ca9"]
+packages = ["src/ca9", "ca9_mcp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = [".", "src"]
 
 [tool.ruff]
 target-version = "py310"
@@ -54,4 +54,4 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["ca9"]
+known-first-party = ["ca9", "ca9_mcp"]
