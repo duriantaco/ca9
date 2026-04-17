@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ca9.models import Evidence, Verdict
+from ca9.models import Evidence, Verdict, VerdictResult
 
 
 def _coverage_trust(ev: Evidence) -> float:
@@ -35,6 +35,25 @@ def _api_usage_boost(ev: Evidence) -> int:
 def _intel_rule_boost(ev: Evidence) -> int:
     if ev.intel_rule_ids:
         return 3
+    return 0
+
+
+def _threat_intel_boost(ev: Evidence) -> int:
+    ti = ev.threat_intel
+    if ti is None:
+        return 0
+    boost = 0
+    has_high_epss = ti.epss_score is not None and ti.epss_score >= 0.5
+    if has_high_epss and ti.in_kev:
+        boost = 15
+    elif has_high_epss or ti.in_kev:
+        boost = 10
+    return boost
+
+
+def _production_boost(ev: Evidence) -> int:
+    if ev.production_observed is True:
+        return 20
     return 0
 
 
@@ -75,6 +94,8 @@ def _score_reachable(ev: Evidence) -> int:
 
     score += _api_usage_boost(ev)
     score += _intel_rule_boost(ev)
+    score += _threat_intel_boost(ev)
+    score += _production_boost(ev)
 
     if ev.external_fetch_warnings:
         score -= 3 * min(len(ev.external_fetch_warnings), 3)
@@ -189,7 +210,11 @@ def _score_inconclusive(ev: Evidence) -> int:
     return score
 
 
-def compute_confidence(evidence: Evidence, verdict: Verdict) -> int:
+def compute_confidence(
+    evidence: Evidence,
+    verdict: Verdict,
+    result: VerdictResult | None = None,
+) -> int:
     if verdict == Verdict.REACHABLE:
         raw = _score_reachable(evidence)
     elif verdict == Verdict.UNREACHABLE_STATIC:
@@ -198,6 +223,9 @@ def compute_confidence(evidence: Evidence, verdict: Verdict) -> int:
         raw = _score_unreachable_dynamic(evidence)
     else:
         raw = _score_inconclusive(evidence)
+
+    if result is not None and verdict == Verdict.REACHABLE and result.exploit_paths:
+        raw += 10
 
     return max(0, min(100, raw))
 

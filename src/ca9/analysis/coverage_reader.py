@@ -41,8 +41,11 @@ def is_package_executed(
         if (
             f"site-packages/{path_fragment}/" in normalized
             or f"site-packages/{path_fragment}.py" in normalized
-            or normalized.endswith(f"/{path_fragment}/__init__.py")
-            or normalized.endswith(f"/{path_fragment}.py")
+            or (
+                "site-packages/" in normalized
+                and normalized.endswith(f"/{path_fragment}/__init__.py")
+            )
+            or ("site-packages/" in normalized and normalized.endswith(f"/{path_fragment}.py"))
         ):
             matching_files.append(filepath)
 
@@ -66,10 +69,13 @@ def is_submodule_executed(
 
         for fragment in fragments:
             if (
-                f"/{fragment}/" in normalized
-                or f"/{fragment}.py" in normalized
-                or normalized.endswith(f"/{fragment}/__init__.py")
-                or normalized.endswith(f"/{fragment}.py")
+                f"site-packages/{fragment}/" in normalized
+                or f"site-packages/{fragment}.py" in normalized
+                or (
+                    "site-packages/" in normalized
+                    and normalized.endswith(f"/{fragment}/__init__.py")
+                )
+                or ("site-packages/" in normalized and normalized.endswith(f"/{fragment}.py"))
             ):
                 matching_files.append(filepath)
                 break

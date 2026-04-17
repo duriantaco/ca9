@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import sys
+
 from ca9.analysis.ast_scanner import (
     collect_imports_from_repo,
     collect_imports_from_source,
+    discover_declared_dependencies,
+    discover_declared_dependency_inventory,
     is_package_imported,
     is_submodule_imported,
     pypi_to_import_name,
@@ -76,6 +80,120 @@ class TestCollectImports:
         assert "requests" in imports
         assert "yaml" in imports
         assert "PIL" in imports
+
+    def test_collect_from_repo_skips_non_runtime_paths(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("import requests\n")
+        (repo / "tests").mkdir()
+        (repo / "tests" / "test_app.py").write_text("import django\n")
+        (repo / "demo").mkdir()
+        (repo / "demo" / "script.py").write_text("import flask\n")
+
+        imports = collect_imports_from_repo(repo)
+
+        assert "requests" in imports
+        assert "django" not in imports
+        assert "flask" not in imports
+
+
+class TestDeclaredDependencies:
+    def test_discovers_dependencies_from_requirements_and_pyproject(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("requests==2.31.0\n-r extras.txt\n")
+        (repo / "extras.txt").write_text("PyYAML>=6.0\n")
+        (repo / "pyproject.toml").write_text(
+            '[project]\ndependencies = ["Pillow>=10"]\n\n[tool.poetry.dependencies]\npython = "^3.12"\ndjango = "^5.0"\n'
+        )
+
+        deps = discover_declared_dependencies(repo)
+
+        assert "requests" in deps
+        assert "pyyaml" in deps
+        assert "pillow" in deps
+        assert "django" in deps
+
+    def test_discovers_dependency_inventory_with_exact_pins(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("requests==2.31.0\n-r extras.txt\n")
+        (repo / "extras.txt").write_text("PyYAML>=6.0\n")
+        (repo / "pyproject.toml").write_text(
+            '[project]\ndependencies = ["Pillow==10.4.0"]\n\n[tool.poetry.dependencies]\npython = "^3.12"\ndjango = "^5.0"\nflask = "3.0.2"\n'
+        )
+
+        deps = discover_declared_dependency_inventory(repo)
+
+        assert deps["requests"] == ("requests", "2.31.0")
+        assert deps["pyyaml"] == ("PyYAML", None)
+        assert deps["pillow"] == ("Pillow", "10.4.0")
+        assert deps["django"] == ("django", None)
+        assert deps["flask"] == ("flask", "3.0.2")
+
+    def test_discovers_dependency_inventory_from_uv_lock(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text(
+            '[project]\nname = "demo-app"\ndependencies = ["requests>=2.0", "networkx>=3.0"]\n'
+        )
+        (repo / "uv.lock").write_text(
+            """
+version = 1
+
+[[package]]
+name = "requests"
+version = "2.32.3"
+
+[[package]]
+name = "networkx"
+version = "3.4.2"
+
+[[package]]
+name = "networkx"
+version = "3.6.1"
+
+[[package]]
+name = "demo-app"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "requests" },
+    { name = "networkx", version = "3.4.2", marker = "python_full_version < '3.11'" },
+    { name = "networkx", version = "3.6.1", marker = "python_full_version >= '3.11'" },
+]
+""".strip()
+        )
+
+        deps = discover_declared_dependency_inventory(repo)
+
+        assert deps["requests"] == ("requests", "2.32.3")
+        expected_networkx = "3.6.1" if sys.version_info >= (3, 11) else "3.4.2"
+        assert deps["networkx"] == ("networkx", expected_networkx)
+
+    def test_discovers_dependency_inventory_from_poetry_lock(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text(
+            '[tool.poetry]\nname = "demo-app"\nversion = "0.1.0"\n'
+            '[tool.poetry.dependencies]\npython = "^3.11"\nrequests = "^2.0"\nPyYAML = "^6.0"\n'
+        )
+        (repo / "poetry.lock").write_text(
+            """
+[[package]]
+name = "requests"
+version = "2.32.3"
+
+[[package]]
+name = "PyYAML"
+version = "6.0.2"
+""".strip()
+        )
+
+        deps = discover_declared_dependency_inventory(repo)
+
+        assert deps["requests"] == ("requests", "2.32.3")
+        assert deps["pyyaml"] == ("PyYAML", "6.0.2")
 
 
 class TestIsPackageImported:

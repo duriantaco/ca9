@@ -6,12 +6,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ca9.scanner import (
+    ScanInventory,
     _cvss_to_level,
     _extract_severity,
     _parse_cvss_score,
     get_installed_packages,
     query_osv_batch,
+    resolve_scan_inventory,
     scan_installed,
+    scan_repository,
 )
 
 
@@ -361,3 +364,90 @@ class TestOfflineMode:
         vulns = query_osv_batch([("requests", "2.19.1")], offline=True)
         assert len(vulns) == 1
         assert vulns[0].id == "PYSEC-2023-OFFLINE"
+
+
+class TestResolveScanInventory:
+    @patch("ca9.scanner.get_installed_packages")
+    def test_prefers_repo_declared_packages(self, mock_get, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("requests==2.31.0\n")
+        (repo / "pyproject.toml").write_text('[tool.poetry.dependencies]\ndjango = "^5.0"\n')
+
+        mock_get.return_value = [("Django", "5.0.2"), ("unused", "1.0.0")]
+
+        inventory = resolve_scan_inventory(repo)
+
+        assert isinstance(inventory, ScanInventory)
+        assert inventory.source == "repo"
+        assert inventory.packages == (("django", "5.0.2"), ("requests", "2.31.0"))
+        assert inventory.pinned_dependencies == 1
+        assert inventory.environment_fallbacks == 1
+        assert any("used installed environment versions" in w for w in inventory.warnings)
+
+    @patch("ca9.scanner.get_installed_packages")
+    def test_falls_back_when_no_repo_inventory(self, mock_get, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        mock_get.return_value = [("requests", "2.31.0")]
+
+        inventory = resolve_scan_inventory(repo)
+
+        assert inventory.source == "environment"
+        assert inventory.packages == (("requests", "2.31.0"),)
+        assert any("fell back to installed environment packages" in w for w in inventory.warnings)
+
+    @patch("ca9.scanner.get_installed_packages")
+    def test_prefers_lockfile_versions_over_environment_fallback(self, mock_get, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text(
+            '[project]\nname = "demo-app"\ndependencies = ["requests>=2.0"]\n'
+        )
+        (repo / "uv.lock").write_text(
+            """
+version = 1
+
+[[package]]
+name = "requests"
+version = "2.32.3"
+
+[[package]]
+name = "demo-app"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "requests" },
+]
+""".strip()
+        )
+        mock_get.return_value = [("requests", "2.19.1")]
+
+        inventory = resolve_scan_inventory(repo)
+
+        assert inventory.source == "repo"
+        assert inventory.packages == (("requests", "2.32.3"),)
+        assert inventory.pinned_dependencies == 1
+        assert inventory.environment_fallbacks == 0
+
+
+class TestScanRepository:
+    @patch("ca9.scanner.query_osv_batch")
+    @patch("ca9.scanner.get_installed_packages")
+    def test_uses_repo_inventory_for_osv_query(self, mock_get, mock_query, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("requests==2.31.0\n")
+        mock_get.return_value = [("unused", "1.0.0")]
+        mock_query.return_value = []
+
+        vulns, inventory = scan_repository(repo)
+
+        assert vulns == []
+        assert inventory.source == "repo"
+        mock_query.assert_called_once_with(
+            [("requests", "2.31.0")],
+            offline=False,
+            refresh_cache=False,
+            max_workers=8,
+        )
