@@ -5,6 +5,34 @@ All notable changes to ca9 will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-04-26
+
+### Added
+
+- **GitHub Action** - reusable `duriantaco/ca9` composite action for `scan` and `check` workflows, SARIF upload, OpenVEX/action-plan artifacts, accepted risks, baselines, and optional fail-on-findings enforcement.
+- **Accepted-risk policy files** - TOML/JSON exceptions with optional version, owner, reason, and expiry fields.
+- **Baseline and new-only gating** - `--baseline` and `--new-only` options for gating only newly reachable or inconclusive findings.
+- **Markdown and HTML reports** - `--format markdown` and `--format html` for PR comments, build artifacts, and human review.
+- **Dependency inventory improvements** - Pipfile/Pipfile.lock support, requirements constraint pinning, and `pyproject.toml` optional dependency parsing.
+- **Reachability hints** - statically recoverable dynamic import detection plus Typer command and Celery task entry point detection.
+- **Release automation** - manual GitHub release workflow with SemVer validation, version bumping, changelog guard, package build, GitHub release creation, and PyPI trusted publishing.
+- **SEO and integration docs** - dedicated pages for OSV, Snyk, Dependabot, Trivy, pip-audit, SARIF, OpenVEX, SBOM, MCP, CI/CD, proof standards, and positioning.
+- **Structured docs metadata** - SoftwareApplication and SoftwareSourceCode JSON-LD for the documentation site.
+- **Benchmarks and release checklist scaffolding** - reproducible benchmark methodology and release/growth checklist pages.
+
+### Changed
+
+- Expanded PyPI metadata with project URLs and security/search keywords.
+- Updated public docs and README to reflect current parser support, CLI options, output formats, exit codes, and optional integrations.
+- Wired CLI, SARIF, OpenVEX, and docs structured data to the package version.
+- Documented that policy overlays produce filtered reports and summarize ignored findings in warnings.
+
+### Fixed
+
+- Corrected repository and documentation URLs to `duriantaco/ca9`.
+- Added warnings for `--new-only` without a usable baseline and for empty accepted-risk files.
+- Removed stale documentation claims about supported formats and dependency footprint.
+
 ## [0.1.4] - 2026-03-08
 
 ### Added
