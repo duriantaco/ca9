@@ -430,6 +430,29 @@ dependencies = [
         assert inventory.pinned_dependencies == 1
         assert inventory.environment_fallbacks == 0
 
+    @patch("ca9.scanner.get_installed_packages")
+    def test_uses_pipfile_lock_versions(self, mock_get, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "Pipfile.lock").write_text(
+            """
+{
+  "_meta": {"pipfile-spec": 6},
+  "default": {
+    "requests": {"version": "==2.32.3"}
+  }
+}
+""".strip()
+        )
+        mock_get.return_value = [("requests", "2.19.1")]
+
+        inventory = resolve_scan_inventory(repo)
+
+        assert inventory.source == "repo"
+        assert inventory.packages == (("requests", "2.32.3"),)
+        assert inventory.pinned_dependencies == 1
+        assert inventory.environment_fallbacks == 0
+
 
 class TestScanRepository:
     @patch("ca9.scanner.query_osv_batch")

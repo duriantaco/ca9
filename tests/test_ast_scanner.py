@@ -70,6 +70,22 @@ class TestCollectImports:
         assert "jinja2" in imports
         assert "jinja2.*" not in imports
 
+    def test_static_dynamic_imports_are_recorded(self):
+        source = """
+import importlib
+from importlib import import_module
+
+importlib.import_module("requests.sessions")
+import_module("django.contrib.admin")
+__import__("yaml")
+importlib.import_module(module_name)
+"""
+        imports = collect_imports_from_source(source)
+        assert "requests.sessions" in imports
+        assert "django.contrib.admin" in imports
+        assert "yaml" in imports
+        assert "module_name" not in imports
+
     def test_syntax_error_returns_empty(self):
         source = "def foo(:\n  pass"
         imports = collect_imports_from_source(source)
@@ -194,6 +210,65 @@ version = "6.0.2"
 
         assert deps["requests"] == ("requests", "2.32.3")
         assert deps["pyyaml"] == ("PyYAML", "6.0.2")
+
+    def test_discovers_optional_dependencies_from_pyproject(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text(
+            '[project]\nname = "demo-app"\ndependencies = ["requests>=2.0"]\n'
+            "[project.optional-dependencies]\n"
+            'web = ["uvicorn==0.30.1", "httpx>=0.27"]\n'
+            'yaml = ["PyYAML==6.0.2"]\n'
+        )
+
+        deps = discover_declared_dependency_inventory(repo)
+
+        assert deps["requests"] == ("requests", None)
+        assert deps["uvicorn"] == ("uvicorn", "0.30.1")
+        assert deps["httpx"] == ("httpx", None)
+        assert deps["pyyaml"] == ("PyYAML", "6.0.2")
+
+    def test_constraints_pin_declared_requirements_only(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("requests\n-r extras.txt\n-c constraints.txt\n")
+        (repo / "extras.txt").write_text("httpx\n")
+        (repo / "constraints.txt").write_text("requests==2.31.0\nhttpx==0.27.2\nurllib3==2.2.2\n")
+
+        deps = discover_declared_dependency_inventory(repo)
+
+        assert deps["requests"] == ("requests", "2.31.0")
+        assert deps["httpx"] == ("httpx", "0.27.2")
+        assert "urllib3" not in deps
+
+    def test_discovers_dependency_inventory_from_pipfile_and_lock(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "Pipfile").write_text(
+            '[packages]\nrequests = "*"\nflask = "==3.0.2"\n[dev-packages]\npytest = "*"\n'
+        )
+        (repo / "Pipfile.lock").write_text(
+            """
+{
+  "_meta": {"pipfile-spec": 6},
+  "default": {
+    "requests": {"version": "==2.32.3"},
+    "flask": {"version": "==3.0.2"},
+    "click": {"version": "==8.1.7"}
+  },
+  "develop": {
+    "pytest": {"version": "==8.0.0"}
+  }
+}
+""".strip()
+        )
+
+        deps = discover_declared_dependency_inventory(repo)
+
+        assert deps["requests"] == ("requests", "2.32.3")
+        assert deps["flask"] == ("flask", "3.0.2")
+        assert deps["click"] == ("click", "8.1.7")
+        assert "pytest" not in deps
 
 
 class TestIsPackageImported:
