@@ -87,3 +87,29 @@ Summary: 2 CVEs analyzed — 1 reachable, 1 unreachable (50% noise reduction)
 ```
 
 With `verbose=True`, each row also shows the reasoning trace.
+
+---
+
+## `write_sarif(report, output=None) -> str`
+
+Writes the report as SARIF 2.1.0 for GitHub code scanning and SARIF-compatible tooling.
+
+```python
+from ca9.report import write_sarif
+
+sarif_text = write_sarif(report)
+```
+
+SARIF results include stable fingerprints, severity mapping, confidence scores, evidence, policy adjustments, warnings, and optional blast-radius or threat-intel properties where available.
+
+---
+
+## `write_markdown(report, output=None) -> str`
+
+Writes a human-readable Markdown report for PR comments, build artifacts, or internal review.
+
+---
+
+## `write_html(report, output=None) -> str`
+
+Writes a standalone HTML report with escaped result content.

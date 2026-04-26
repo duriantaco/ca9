@@ -1,6 +1,23 @@
 # ca9.scanner
 
-OSV.dev integration for scanning installed packages.
+OSV.dev integration for scanning declared repository dependencies or installed packages.
+
+## `scan_repository()`
+
+```python
+def scan_repository(
+    repo_path: Path,
+    offline: bool = False,
+    refresh_cache: bool = False,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+) -> tuple[list[Vulnerability], ScanInventory]
+```
+
+Resolves dependency inventory for a repository, queries OSV.dev for known vulnerabilities, and returns both the vulnerabilities and inventory metadata.
+
+The inventory resolver prefers declared repository dependencies. If no resolvable dependency inventory is found, it falls back to installed packages in the current Python environment.
+
+Supported inventory sources include `requirements*.txt`, nested `-r` requirement files, constraints used to pin declared requirements, `pyproject.toml` dependencies and optional dependencies, Poetry metadata, `uv.lock`, `poetry.lock`, `Pipfile`, and `Pipfile.lock`.
 
 ## `scan_installed()`
 
@@ -31,6 +48,9 @@ Returns a list of `(name, version)` tuples for all packages installed in the cur
 ```python
 def query_osv_batch(
     packages: list[tuple[str, str]],
+    offline: bool = False,
+    refresh_cache: bool = False,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> list[Vulnerability]
 ```
 
@@ -41,6 +61,9 @@ Queries the [OSV.dev batch API](https://osv.dev/docs/) for vulnerabilities affec
 | Parameter | Type | Description |
 |---|---|---|
 | `packages` | `list[tuple[str, str]]` | List of `(name, version)` tuples |
+| `offline` | `bool` | Use cached OSV details only |
+| `refresh_cache` | `bool` | Clear cached OSV details before querying |
+| `max_workers` | `int` | Concurrent OSV detail fetches |
 
 **Returns:** List of `Vulnerability` objects with full details (severity, version ranges, references).
 
@@ -55,6 +78,10 @@ Queries the [OSV.dev batch API](https://osv.dev/docs/) for vulnerabilities affec
 ---
 
 ## Helper functions
+
+### `resolve_scan_inventory(repo_path) -> ScanInventory`
+
+Returns package inventory and warning metadata for the target repository.
 
 ### `_extract_severity(osv_vuln) -> str`
 

@@ -5,11 +5,26 @@ build-backend = "hatchling.build"
 [project]
 name = "ca9"
 version = "0.1.4"
-description = "Reduce false-positive CVE alerts by checking whether vulnerable dependency code is actually reachable"
+description = "Open source Python CVE reachability analysis for reducing false-positive SCA alerts"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MPL-2.0"
-keywords = ["security", "sca", "cve", "vulnerability", "reachability", "snyk", "dependabot"]
+keywords = [
+    "security",
+    "sca",
+    "cve",
+    "vulnerability",
+    "reachability",
+    "reachability-analysis",
+    "python-security",
+    "osv",
+    "openvex",
+    "sarif",
+    "snyk",
+    "dependabot",
+    "trivy",
+    "pip-audit",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -23,6 +38,12 @@ classifiers = [
     "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = ["packaging>=21.0"]
+
+[project.urls]
+Documentation = "https://duriantaco.github.io/ca9/"
+Source = "https://github.com/duriantaco/ca9"
+Issues = "https://github.com/duriantaco/ca9/issues"
+Changelog = "https://github.com/duriantaco/ca9/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 cli = ["click>=8.0"]
