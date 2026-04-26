@@ -1,0 +1,208 @@
+name: ca9
+description: Run ca9 Python CVE reachability analysis in GitHub Actions
+author: duriantaco
+
+branding:
+  icon: shield
+  color: purple
+
+inputs:
+  command:
+    description: ca9 command to run. Use scan or check.
+    required: false
+    default: scan
+  report:
+    description: SCA report path. Required when command is check.
+    required: false
+    default: ""
+  repo:
+    description: Repository path to analyze.
+    required: false
+    default: "."
+  coverage:
+    description: coverage.py JSON path for dynamic evidence.
+    required: false
+    default: ""
+  format:
+    description: "Output format: sarif, json, vex, remediation, action-plan, markdown, html, or table."
+    required: false
+    default: sarif
+  output:
+    description: Output file path.
+    required: false
+    default: ca9.sarif
+  proof-standard:
+    description: "Proof policy for suppressions: strict or balanced."
+    required: false
+    default: strict
+  capabilities:
+    description: Attach AI capability blast radius to reachable CVEs.
+    required: false
+    default: "false"
+  trace-paths:
+    description: Trace exploit paths from entry points to vulnerable call sites.
+    required: false
+    default: "false"
+  threat-intel:
+    description: Enrich with EPSS scores and CISA KEV data.
+    required: false
+    default: "false"
+  otel-traces:
+    description: OTLP JSON export for production runtime evidence.
+    required: false
+    default: ""
+  no-auto-coverage:
+    description: Disable automatic coverage discovery and generation.
+    required: false
+    default: "false"
+  accepted-risks:
+    description: Accepted-risk TOML/JSON file for findings that should not affect gates.
+    required: false
+    default: ""
+  baseline:
+    description: Previous ca9 JSON report for new-only gating.
+    required: false
+    default: ""
+  new-only:
+    description: Only gate on reachable or inconclusive findings not present in the baseline.
+    required: false
+    default: "false"
+  upload-sarif:
+    description: Upload SARIF output to GitHub code scanning when format is sarif.
+    required: false
+    default: "true"
+  fail-on-findings:
+    description: Fail the workflow when ca9 exits non-zero for reachable or inconclusive findings.
+    required: false
+    default: "false"
+  extra-args:
+    description: Additional ca9 CLI arguments split on shell whitespace.
+    required: false
+    default: ""
+
+outputs:
+  exit-code:
+    description: ca9 exit code.
+    value: ${{ steps.ca9.outputs.exit-code }}
+  output-path:
+    description: Path to the ca9 output file.
+    value: ${{ inputs.output }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install ca9
+      shell: bash
+      run: python -m pip install "${{ github.action_path }}[cli]"
+
+    - name: Run ca9
+      id: ca9
+      shell: bash
+      env:
+        CA9_COMMAND: ${{ inputs.command }}
+        CA9_REPORT: ${{ inputs.report }}
+        CA9_REPO: ${{ inputs.repo }}
+        CA9_COVERAGE: ${{ inputs.coverage }}
+        CA9_FORMAT: ${{ inputs.format }}
+        CA9_OUTPUT: ${{ inputs.output }}
+        CA9_PROOF_STANDARD: ${{ inputs.proof-standard }}
+        CA9_CAPABILITIES: ${{ inputs.capabilities }}
+        CA9_TRACE_PATHS: ${{ inputs.trace-paths }}
+        CA9_THREAT_INTEL: ${{ inputs.threat-intel }}
+        CA9_OTEL_TRACES: ${{ inputs.otel-traces }}
+        CA9_NO_AUTO_COVERAGE: ${{ inputs.no-auto-coverage }}
+        CA9_ACCEPTED_RISKS: ${{ inputs.accepted-risks }}
+        CA9_BASELINE: ${{ inputs.baseline }}
+        CA9_NEW_ONLY: ${{ inputs.new-only }}
+        CA9_EXTRA_ARGS: ${{ inputs.extra-args }}
+      run: |
+        set -u
+
+        if [[ "$CA9_COMMAND" != "scan" && "$CA9_COMMAND" != "check" ]]; then
+          echo "command must be 'scan' or 'check'" >&2
+          exit 64
+        fi
+
+        cmd=(ca9 "$CA9_COMMAND")
+        if [[ "$CA9_COMMAND" == "check" ]]; then
+          if [[ -z "$CA9_REPORT" ]]; then
+            echo "report is required when command is 'check'" >&2
+            exit 64
+          fi
+          cmd+=("$CA9_REPORT")
+        fi
+
+        cmd+=(--repo "$CA9_REPO")
+        cmd+=(--proof-standard "$CA9_PROOF_STANDARD")
+        cmd+=(-f "$CA9_FORMAT")
+        cmd+=(-o "$CA9_OUTPUT")
+
+        if [[ -n "$CA9_COVERAGE" ]]; then
+          cmd+=(--coverage "$CA9_COVERAGE")
+        fi
+        if [[ "$CA9_NO_AUTO_COVERAGE" == "true" ]]; then
+          cmd+=(--no-auto-coverage)
+        fi
+        if [[ -n "$CA9_ACCEPTED_RISKS" ]]; then
+          cmd+=(--accepted-risks "$CA9_ACCEPTED_RISKS")
+        fi
+        if [[ -n "$CA9_BASELINE" ]]; then
+          cmd+=(--baseline "$CA9_BASELINE")
+        fi
+        if [[ "$CA9_NEW_ONLY" == "true" ]]; then
+          cmd+=(--new-only)
+        fi
+        if [[ "$CA9_CAPABILITIES" == "true" ]]; then
+          cmd+=(--capabilities)
+        fi
+        if [[ "$CA9_TRACE_PATHS" == "true" ]]; then
+          cmd+=(--trace-paths)
+        fi
+        if [[ "$CA9_THREAT_INTEL" == "true" ]]; then
+          cmd+=(--threat-intel)
+        fi
+        if [[ -n "$CA9_OTEL_TRACES" ]]; then
+          cmd+=(--otel-traces "$CA9_OTEL_TRACES")
+        fi
+        if [[ -n "$CA9_EXTRA_ARGS" ]]; then
+          read -r -a extra_args <<< "$CA9_EXTRA_ARGS"
+          cmd+=("${extra_args[@]}")
+        fi
+
+        set +e
+        "${cmd[@]}"
+        status=$?
+        set -e
+
+        if [[ "$CA9_FORMAT" == "sarif" && ! -f "$CA9_OUTPUT" ]]; then
+          python - "$CA9_OUTPUT" <<'PY'
+        import json
+        import sys
+        from pathlib import Path
+
+        out = Path(sys.argv[1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {"driver": {"name": "ca9", "rules": []}},
+                "results": [],
+            }],
+        }, indent=2))
+        PY
+        fi
+
+        echo "exit-code=$status" >> "$GITHUB_OUTPUT"
+        exit 0
+
+    - name: Upload SARIF
+      if: inputs.upload-sarif == 'true' && inputs.format == 'sarif'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.output }}
+
+    - name: Enforce ca9 result
+      if: inputs.fail-on-findings == 'true' && steps.ca9.outputs.exit-code != '0'
+      shell: bash
+      run: exit "${{ steps.ca9.outputs.exit-code }}"
