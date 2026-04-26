@@ -19,7 +19,7 @@
         "name": "ca9",
         "applicationCategory": "SecurityApplication",
         "operatingSystem": "Python 3.10+",
-        "softwareVersion": "0.1.4",
+        "softwareVersion": "0.2.0",
         "description": "Open source Python CVE reachability analysis for reducing false-positive SCA alerts.",
         "url": "https://duriantaco.github.io/ca9/",
         "codeRepository": "https://github.com/duriantaco/ca9",
