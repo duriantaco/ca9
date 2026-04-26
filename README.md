@@ -238,7 +238,7 @@ new_only = true
 ```
 
 Config is auto-discovered from the current directory upward. CLI flags override config values.
-Accepted-risk and baseline options produce policy-filtered output; ignored findings are removed from the report and summarized in warnings.
+Accepted-risk and baseline options keep ignored findings visible in report output while excluding them from exit-code decisions.
 
 ### Caching and offline mode
 

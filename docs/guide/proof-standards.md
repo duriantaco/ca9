@@ -48,7 +48,7 @@ ca9 check report.json --repo . --coverage coverage.json --proof-standard balance
 ## Policy overlays
 
 Proof standards decide how ca9 classifies evidence. Accepted-risk and baseline options decide which findings affect a gate.
-Policy overlays are applied before output, so ignored accepted risks and baseline findings are removed from the generated report and summarized as warnings.
+Policy overlays are applied before output. Ignored accepted risks and baseline findings do not affect exit codes, but they remain visible in `ignored_results`, Markdown/HTML ignored-finding sections, and SARIF suppressed results.
 
 ```bash
 ca9 check report.json --repo . \

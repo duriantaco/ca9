@@ -120,7 +120,7 @@ Use `strict` for CI gates and security reviews. Use `balanced` when exploring no
 ## Accepted risks and baselines
 
 Accepted risks are useful for temporary exceptions that should not fail CI while a fix is tracked elsewhere.
-When these policy options are used, ca9 writes a policy-filtered report and records the ignored count in warnings.
+When these policy options are used, ca9 keeps ignored findings visible in `ignored_results` while excluding them from exit-code decisions.
 Create baseline reports without `--accepted-risks` or `--new-only` when you need a full inventory snapshot.
 
 ```toml

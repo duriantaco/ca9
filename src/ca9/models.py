@@ -139,6 +139,15 @@ class VerdictResult:
     threat_intel: ThreatIntelData | None = None
 
 
+@dataclass
+class PolicyIgnoredResult:
+    result: VerdictResult
+    policy: str
+    reason: str
+    owner: str = ""
+    expires: str | None = None
+
+
 def finding_key(vuln_id: str, package_name: str, package_version: str) -> tuple[str, str, str]:
     return (vuln_id, package_name.lower(), package_version)
 
@@ -150,10 +159,15 @@ class Report:
     coverage_path: str | None = None
     proof_standard: str = "strict"
     warnings: list[str] = field(default_factory=list)
+    ignored_results: list[PolicyIgnoredResult] = field(default_factory=list)
 
     @property
     def total(self) -> int:
         return len(self.results)
+
+    @property
+    def ignored_count(self) -> int:
+        return len(self.ignored_results)
 
     @property
     def reachable_count(self) -> int:

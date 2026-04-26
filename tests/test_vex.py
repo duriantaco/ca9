@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from ca9.capabilities.models import BlastRadius, CapabilityHit
-from ca9.models import Evidence, Report, Verdict, VerdictResult, Vulnerability
+from ca9.models import Evidence, PolicyIgnoredResult, Report, Verdict, VerdictResult, Vulnerability
 from ca9.vex import write_openvex
 
 
@@ -233,6 +233,36 @@ class TestVEXMetadata:
         ca9 = data["statements"][0]["ca9"]
         assert ca9["original_verdict"] == "unreachable_dynamic"
         assert "strict proof" in ca9["policy_adjustment"]
+
+    def test_ignored_policy_findings_are_preserved(self):
+        ignored_result = VerdictResult(
+            vulnerability=_vuln(),
+            verdict=Verdict.REACHABLE,
+            reason="imported and executed",
+            confidence_score=90,
+        )
+        report = Report(
+            results=[],
+            ignored_results=[
+                PolicyIgnoredResult(
+                    result=ignored_result,
+                    policy="accepted_risk",
+                    reason="tracked exception",
+                    owner="security",
+                    expires="2099-01-01",
+                )
+            ],
+            repo_path=".",
+        )
+
+        data = json.loads(write_openvex(report))
+        stmt = data["statements"][0]
+
+        assert stmt["status"] == "affected"
+        assert stmt["ca9"]["policy_ignored"] is True
+        assert stmt["ca9"]["policy"] == "accepted_risk"
+        assert stmt["ca9"]["policy_reason"] == "tracked exception"
+        assert stmt["ca9"]["policy_owner"] == "security"
 
     def test_evidence_summary_included(self):
         report = Report(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from ca9.models import Evidence, Report, Verdict, VerdictResult, Vulnerability
+from ca9.models import Evidence, PolicyIgnoredResult, Report, Verdict, VerdictResult, Vulnerability
 from ca9.report import write_html, write_json, write_markdown, write_sarif
 
 
@@ -60,6 +60,33 @@ class TestSARIF:
         assert "CVE-2023-0001" in text
         assert "imported \\| executed" in text
 
+    def test_markdown_report_includes_ignored_findings(self):
+        ignored_result = VerdictResult(
+            vulnerability=_vuln(),
+            verdict=Verdict.REACHABLE,
+            reason="imported and executed",
+            confidence_score=90,
+        )
+        report = Report(
+            results=[],
+            ignored_results=[
+                PolicyIgnoredResult(
+                    result=ignored_result,
+                    policy="accepted_risk",
+                    reason="tracked exception",
+                    owner="security",
+                    expires="2099-01-01",
+                )
+            ],
+            repo_path=".",
+        )
+
+        text = write_markdown(report)
+
+        assert "Ignored Findings" in text
+        assert "accepted_risk" in text
+        assert "tracked exception" in text
+
     def test_html_report_escapes_content(self):
         report = Report(
             results=[
@@ -76,6 +103,31 @@ class TestSARIF:
         assert "<!doctype html>" in text
         assert "&lt;pkg&gt;" in text
         assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
+
+    def test_html_report_includes_ignored_findings(self):
+        ignored_result = VerdictResult(
+            vulnerability=_vuln(vid="CVE-2023-0001", pkg="<pkg>"),
+            verdict=Verdict.REACHABLE,
+            reason="test",
+        )
+        report = Report(
+            results=[],
+            ignored_results=[
+                PolicyIgnoredResult(
+                    result=ignored_result,
+                    policy="accepted_risk",
+                    reason="<approved>",
+                    owner="security",
+                )
+            ],
+            repo_path=".",
+        )
+
+        text = write_html(report)
+
+        assert "Ignored Findings" in text
+        assert "&lt;pkg&gt;" in text
+        assert "&lt;approved&gt;" in text
 
     def test_sarif_reachable_is_error(self):
         report = Report(
@@ -282,6 +334,37 @@ class TestSARIF:
         assert r["evidence"]["version_in_range"] is True
         assert r["evidence"]["affected_component_source"] == "curated:django"
 
+    def test_json_includes_ignored_findings(self):
+        ignored_result = VerdictResult(
+            vulnerability=_vuln(),
+            verdict=Verdict.REACHABLE,
+            reason="imported and executed",
+            confidence_score=90,
+        )
+        report = Report(
+            results=[],
+            ignored_results=[
+                PolicyIgnoredResult(
+                    result=ignored_result,
+                    policy="accepted_risk",
+                    reason="tracked exception",
+                    owner="security",
+                    expires="2099-01-01",
+                )
+            ],
+            repo_path=".",
+        )
+
+        data = json.loads(write_json(report))
+
+        assert data["summary"]["total"] == 0
+        assert data["summary"]["ignored"] == 1
+        ignored = data["ignored_results"][0]
+        assert ignored["id"] == "CVE-2023-0001"
+        assert ignored["policy"] == "accepted_risk"
+        assert ignored["policy_reason"] == "tracked exception"
+        assert ignored["owner"] == "security"
+
     def test_json_includes_proof_standard_and_policy_adjustment(self):
         report = Report(
             results=[
@@ -354,6 +437,37 @@ class TestSARIF:
         assert data["runs"][0]["properties"]["warnings"] == [
             "production trace ingestion unavailable: bad traces"
         ]
+
+    def test_sarif_includes_ignored_findings_as_suppressed_results(self):
+        ignored_result = VerdictResult(
+            vulnerability=_vuln(),
+            verdict=Verdict.REACHABLE,
+            reason="imported and executed",
+            confidence_score=90,
+        )
+        report = Report(
+            results=[],
+            ignored_results=[
+                PolicyIgnoredResult(
+                    result=ignored_result,
+                    policy="accepted_risk",
+                    reason="tracked exception",
+                    owner="security",
+                    expires="2099-01-01",
+                )
+            ],
+            repo_path=".",
+        )
+
+        data = json.loads(write_sarif(report))
+        result = data["runs"][0]["results"][0]
+
+        assert result["suppressions"] == [
+            {"kind": "external", "justification": "tracked exception"}
+        ]
+        assert result["properties"]["policy_ignored"] is True
+        assert result["properties"]["policy"] == "accepted_risk"
+        assert result["properties"]["policy_owner"] == "security"
 
     def test_sarif_blast_radius_in_properties(self):
         from ca9.capabilities.models import BlastRadius, CapabilityHit

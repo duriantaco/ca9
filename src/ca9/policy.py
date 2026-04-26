@@ -6,7 +6,7 @@ from datetime import date
 from pathlib import Path
 
 from ca9.config import _load_toml
-from ca9.models import Report, Verdict, VerdictResult, finding_key
+from ca9.models import PolicyIgnoredResult, Report, Verdict, VerdictResult, finding_key
 
 
 @dataclass(frozen=True)
@@ -116,6 +116,7 @@ def apply_policy(
         warnings.append("policy: --new-only requested but the baseline has no usable findings")
 
     kept: list[VerdictResult] = []
+    ignored = list(report.ignored_results)
     accepted_count = 0
     baseline_count = 0
     expired_or_invalid: list[AcceptedRisk] = []
@@ -131,6 +132,16 @@ def apply_policy(
 
         if active_risk is not None:
             accepted_count += 1
+            reason = active_risk.reason or "accepted risk"
+            ignored.append(
+                PolicyIgnoredResult(
+                    result=result,
+                    policy="accepted_risk",
+                    reason=reason,
+                    owner=active_risk.owner,
+                    expires=active_risk.expires,
+                )
+            )
             continue
 
         vuln = result.vulnerability
@@ -142,6 +153,13 @@ def apply_policy(
             and result.verdict in (Verdict.REACHABLE, Verdict.INCONCLUSIVE)
         ):
             baseline_count += 1
+            ignored.append(
+                PolicyIgnoredResult(
+                    result=result,
+                    policy="baseline",
+                    reason="already present in baseline",
+                )
+            )
             continue
 
         kept.append(result)
@@ -168,4 +186,5 @@ def apply_policy(
         coverage_path=report.coverage_path,
         proof_standard=report.proof_standard,
         warnings=warnings,
+        ignored_results=ignored,
     )

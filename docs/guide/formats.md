@@ -97,7 +97,7 @@ ca9 check snyk-report.json --repo . --show-confidence --show-evidence-source
 
 ### JSON
 
-Machine-readable report with summary, verdicts, evidence, warnings, confidence scores, and optional enrichment data:
+Machine-readable report with summary, verdicts, evidence, warnings, confidence scores, optional enrichment data, and `ignored_results` for accepted-risk or baseline findings that did not affect the gate:
 
 ```bash
 ca9 check snyk-report.json --repo . -f json -o ca9-report.json
@@ -105,7 +105,7 @@ ca9 check snyk-report.json --repo . -f json -o ca9-report.json
 
 ### SARIF
 
-Use SARIF for GitHub code scanning or SARIF-compatible security tools:
+Use SARIF for GitHub code scanning or SARIF-compatible security tools. Accepted-risk and baseline findings are emitted as suppressed SARIF results so audit tools can still see them:
 
 ```bash
 ca9 check snyk-report.json --repo . -f sarif -o ca9.sarif
@@ -113,7 +113,7 @@ ca9 check snyk-report.json --repo . -f sarif -o ca9.sarif
 
 ### OpenVEX
 
-Generate OpenVEX exploitability statements:
+Generate OpenVEX exploitability statements. Policy-ignored findings remain in the VEX document with `ca9.policy_ignored` metadata:
 
 ```bash
 ca9 check snyk-report.json --repo . -f vex -o openvex.json

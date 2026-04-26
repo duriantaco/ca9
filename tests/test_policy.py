@@ -53,12 +53,19 @@ def test_load_accepted_risks_from_json(tmp_path):
 
 def test_active_accepted_risk_filters_result(tmp_path):
     accepted = tmp_path / "accepted.toml"
-    accepted.write_text('[[risk]]\nid = "CVE-1"\npackage = "requests"\nexpires = "2099-01-01"\n')
+    accepted.write_text(
+        '[[risk]]\nid = "CVE-1"\npackage = "requests"\nexpires = "2099-01-01"\n'
+        'reason = "tracked exception"\nowner = "security"\n'
+    )
     report = Report(results=[_result()], repo_path=".")
 
     filtered = apply_policy(report, accepted_risks_path=accepted, today=date(2026, 1, 1))
 
     assert filtered.results == []
+    assert len(filtered.ignored_results) == 1
+    assert filtered.ignored_results[0].policy == "accepted_risk"
+    assert filtered.ignored_results[0].reason == "tracked exception"
+    assert filtered.ignored_results[0].owner == "security"
     assert filtered.exit_code == 0
     assert any("accepted-risk" in warning for warning in filtered.warnings)
 
@@ -99,6 +106,8 @@ def test_new_only_filters_baselined_reachable_and_inconclusive(tmp_path):
     filtered = apply_policy(report, baseline_path=baseline, new_only=True)
 
     assert [r.vulnerability.id for r in filtered.results] == ["CVE-3"]
+    assert [r.result.vulnerability.id for r in filtered.ignored_results] == ["CVE-1", "CVE-2"]
+    assert {r.policy for r in filtered.ignored_results} == {"baseline"}
     assert any("baseline" in warning for warning in filtered.warnings)
 
 

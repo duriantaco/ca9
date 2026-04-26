@@ -20,6 +20,8 @@ Verdict mapping:
 | `UNREACHABLE (dynamic)` | `not_affected` |
 | `INCONCLUSIVE` | `under_investigation` |
 
+Accepted-risk and baseline findings are still emitted as OpenVEX statements with `ca9.policy_ignored` metadata, so downstream review can see the finding even though it did not affect ca9's exit code.
+
 ## Continuous VEX
 
 Compare previous and current OpenVEX output:
