@@ -5,6 +5,12 @@ All notable changes to ca9 will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Policy-ignored findings from accepted risks and baselines now remain visible in JSON `ignored_results`, Markdown/HTML ignored-finding sections, SARIF suppressed results, and OpenVEX `ca9.policy_ignored` metadata while staying excluded from exit-code decisions.
+
 ## [0.2.0] - 2026-04-26
 
 ### Added

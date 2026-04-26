@@ -22,7 +22,8 @@ Converts a `Report` object to a JSON-serializable dictionary.
     "total": 10,
     "reachable": 2,
     "unreachable": 7,
-    "inconclusive": 1
+    "inconclusive": 1,
+    "ignored": 1
   },
   "repo_path": ".",
   "coverage_path": "coverage.json",
@@ -37,6 +38,18 @@ Converts a `Report` object to a JSON-serializable dictionary.
       "imported_as": null,
       "executed_files": [],
       "dependency_of": null
+    }
+  ],
+  "ignored_results": [
+    {
+      "id": "CVE-2024-1234",
+      "package": "requests",
+      "version": "2.31.0",
+      "verdict": "reachable",
+      "policy": "accepted_risk",
+      "policy_reason": "temporary exception",
+      "owner": "security",
+      "expires": "2026-06-30"
     }
   ]
 }
@@ -100,16 +113,16 @@ from ca9.report import write_sarif
 sarif_text = write_sarif(report)
 ```
 
-SARIF results include stable fingerprints, severity mapping, confidence scores, evidence, policy adjustments, warnings, and optional blast-radius or threat-intel properties where available.
+SARIF results include stable fingerprints, severity mapping, confidence scores, evidence, policy adjustments, warnings, and optional blast-radius or threat-intel properties where available. Policy-ignored findings are emitted as suppressed SARIF results so they remain auditable without affecting ca9's exit code.
 
 ---
 
 ## `write_markdown(report, output=None) -> str`
 
-Writes a human-readable Markdown report for PR comments, build artifacts, or internal review.
+Writes a human-readable Markdown report for PR comments, build artifacts, or internal review. Policy-ignored findings appear in a separate ignored-finding section.
 
 ---
 
 ## `write_html(report, output=None) -> str`
 
-Writes a standalone HTML report with escaped result content.
+Writes a standalone HTML report with escaped result content and a separate ignored-finding section when policy overlays are used.

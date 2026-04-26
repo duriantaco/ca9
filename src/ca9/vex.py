@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TextIO
 
 from ca9 import __version__
-from ca9.models import Report, Verdict, VerdictResult
+from ca9.models import PolicyIgnoredResult, Report, Verdict, VerdictResult
 
 _VEX_STATUS = {
     Verdict.REACHABLE: "affected",
@@ -70,7 +70,9 @@ def _build_impact_statement(result: VerdictResult) -> str | None:
     return "\n".join(lines)
 
 
-def _build_statement(result: VerdictResult, now: str) -> dict:
+def _build_statement(
+    result: VerdictResult, now: str, ignored: PolicyIgnoredResult | None = None
+) -> dict:
     vuln = result.vulnerability
     status = _VEX_STATUS[result.verdict]
 
@@ -104,6 +106,14 @@ def _build_statement(result: VerdictResult, now: str) -> dict:
         ca9_meta["original_verdict"] = result.original_verdict.value
     if result.policy_adjustment:
         ca9_meta["policy_adjustment"] = result.policy_adjustment
+    if ignored is not None:
+        ca9_meta["policy_ignored"] = True
+        ca9_meta["policy"] = ignored.policy
+        ca9_meta["policy_reason"] = ignored.reason
+        if ignored.owner:
+            ca9_meta["policy_owner"] = ignored.owner
+        if ignored.expires:
+            ca9_meta["policy_expires"] = ignored.expires
 
     br = _get_blast_radius(result)
     if br and hasattr(br, "to_dict"):
@@ -153,6 +163,7 @@ def _build_statement(result: VerdictResult, now: str) -> dict:
 def write_openvex(report: Report, output: Path | TextIO | None = None) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     statements = [_build_statement(r, now) for r in report.results]
+    statements.extend(_build_statement(r.result, now, r) for r in report.ignored_results)
 
     doc = {
         "@context": "https://openvex.dev/ns/v0.2.0",

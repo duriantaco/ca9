@@ -524,4 +524,7 @@ class TestCLIConfig:
         assert result.exit_code == 0
         data = json.loads(output_path.read_text())
         assert data["summary"]["total"] == 0
+        assert data["summary"]["ignored"] == 1
+        assert data["ignored_results"][0]["id"] == "SNYK-PYTHON-REQUESTS-1"
+        assert data["ignored_results"][0]["policy"] == "accepted_risk"
         assert any("accepted-risk" in warning for warning in data["warnings"])

@@ -98,6 +98,77 @@ def _component_to_dict(component) -> dict | None:
     }
 
 
+def _result_to_dict(r) -> dict:
+    return {
+        "id": r.vulnerability.id,
+        "package": r.vulnerability.package_name,
+        "version": r.vulnerability.package_version,
+        "severity": r.vulnerability.severity,
+        "title": r.vulnerability.title,
+        "verdict": r.verdict.value,
+        "reason": r.reason,
+        "imported_as": r.imported_as,
+        "dependency_of": r.dependency_of,
+        "executed_files": r.executed_files,
+        "confidence_score": r.confidence_score,
+        "original_verdict": r.original_verdict.value if r.original_verdict else None,
+        "policy_adjustment": r.policy_adjustment,
+        "blast_radius": r.blast_radius.to_dict()
+        if r.blast_radius and hasattr(r.blast_radius, "to_dict")
+        else None,
+        "runtime_mitigations": r.runtime_mitigations,
+        "runtime_adjusted_priority": r.runtime_adjusted_priority,
+        "exploit_paths": [
+            {
+                "entry_point": {
+                    "file": p.entry_point.file_path,
+                    "function": p.entry_point.function_name,
+                    "line": p.entry_point.line,
+                },
+                "steps": [
+                    {
+                        "file": s.file_path,
+                        "function": s.function_name,
+                        "line": s.line,
+                    }
+                    for s in p.steps
+                ],
+                "vulnerable_call": {
+                    "file": p.vulnerable_call.file_path,
+                    "function": p.vulnerable_call.function_name,
+                    "line": p.vulnerable_call.line,
+                    "snippet": p.vulnerable_call.code_snippet,
+                },
+                "vulnerable_target": p.vulnerable_target,
+                "confidence": p.confidence,
+            }
+            for p in r.exploit_paths
+        ]
+        if r.exploit_paths
+        else [],
+        "threat_intel": {
+            "epss_score": r.threat_intel.epss_score,
+            "epss_percentile": r.threat_intel.epss_percentile,
+            "in_kev": r.threat_intel.in_kev,
+            "kev_due_date": r.threat_intel.kev_due_date,
+        }
+        if r.threat_intel
+        else None,
+        "affected_component": _component_to_dict(r.affected_component),
+        "evidence": _evidence_to_dict(r.evidence),
+    }
+
+
+def _ignored_result_to_dict(ignored) -> dict:
+    data = _result_to_dict(ignored.result)
+    data["ignored"] = True
+    data["policy"] = ignored.policy
+    data["policy_reason"] = ignored.reason
+    data["owner"] = ignored.owner or None
+    data["expires"] = ignored.expires
+    return data
+
+
 def report_to_dict(report: Report) -> dict:
     return {
         "repo_path": report.repo_path,
@@ -109,68 +180,10 @@ def report_to_dict(report: Report) -> dict:
             "reachable": report.reachable_count,
             "unreachable": report.unreachable_count,
             "inconclusive": report.inconclusive_count,
+            "ignored": report.ignored_count,
         },
-        "results": [
-            {
-                "id": r.vulnerability.id,
-                "package": r.vulnerability.package_name,
-                "version": r.vulnerability.package_version,
-                "severity": r.vulnerability.severity,
-                "title": r.vulnerability.title,
-                "verdict": r.verdict.value,
-                "reason": r.reason,
-                "imported_as": r.imported_as,
-                "dependency_of": r.dependency_of,
-                "executed_files": r.executed_files,
-                "confidence_score": r.confidence_score,
-                "original_verdict": r.original_verdict.value if r.original_verdict else None,
-                "policy_adjustment": r.policy_adjustment,
-                "blast_radius": r.blast_radius.to_dict()
-                if r.blast_radius and hasattr(r.blast_radius, "to_dict")
-                else None,
-                "runtime_mitigations": r.runtime_mitigations,
-                "runtime_adjusted_priority": r.runtime_adjusted_priority,
-                "exploit_paths": [
-                    {
-                        "entry_point": {
-                            "file": p.entry_point.file_path,
-                            "function": p.entry_point.function_name,
-                            "line": p.entry_point.line,
-                        },
-                        "steps": [
-                            {
-                                "file": s.file_path,
-                                "function": s.function_name,
-                                "line": s.line,
-                            }
-                            for s in p.steps
-                        ],
-                        "vulnerable_call": {
-                            "file": p.vulnerable_call.file_path,
-                            "function": p.vulnerable_call.function_name,
-                            "line": p.vulnerable_call.line,
-                            "snippet": p.vulnerable_call.code_snippet,
-                        },
-                        "vulnerable_target": p.vulnerable_target,
-                        "confidence": p.confidence,
-                    }
-                    for p in r.exploit_paths
-                ]
-                if r.exploit_paths
-                else [],
-                "threat_intel": {
-                    "epss_score": r.threat_intel.epss_score,
-                    "epss_percentile": r.threat_intel.epss_percentile,
-                    "in_kev": r.threat_intel.in_kev,
-                    "kev_due_date": r.threat_intel.kev_due_date,
-                }
-                if r.threat_intel
-                else None,
-                "affected_component": _component_to_dict(r.affected_component),
-                "evidence": _evidence_to_dict(r.evidence),
-            }
-            for r in report.results
-        ],
+        "results": [_result_to_dict(r) for r in report.results],
+        "ignored_results": [_ignored_result_to_dict(r) for r in report.ignored_results],
     }
 
 
@@ -209,6 +222,7 @@ def write_markdown(report: Report, output: Path | TextIO | None = None) -> str:
             f"- Summary: {report.total} total, {report.reachable_count} reachable, "
             f"{report.unreachable_count} unreachable, {report.inconclusive_count} inconclusive"
         ),
+        f"- Ignored by policy: {report.ignored_count}",
         "",
         "| CVE | Package | Version | Severity | Verdict | Confidence | Reason |",
         "|---|---|---|---|---|---:|---|",
@@ -231,6 +245,36 @@ def write_markdown(report: Report, output: Path | TextIO | None = None) -> str:
             )
             + " |"
         )
+
+    if report.ignored_results:
+        lines.extend(
+            [
+                "",
+                "## Ignored Findings",
+                "",
+                "| CVE | Package | Version | Verdict | Policy | Reason | Owner | Expires |",
+                "|---|---|---|---|---|---|---|---|",
+            ]
+        )
+        for ignored in report.ignored_results:
+            result = ignored.result
+            vuln = result.vulnerability
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _markdown_cell(vuln.id),
+                        _markdown_cell(vuln.package_name),
+                        _markdown_cell(vuln.package_version),
+                        _markdown_cell(_VERDICT_LABELS[result.verdict]),
+                        _markdown_cell(ignored.policy),
+                        _markdown_cell(ignored.reason),
+                        _markdown_cell(ignored.owner),
+                        _markdown_cell(ignored.expires),
+                    ]
+                )
+                + " |"
+            )
 
     if report.warnings:
         lines.extend(["", "## Warnings", ""])
@@ -258,6 +302,36 @@ def write_html(report: Report, output: Path | TextIO | None = None) -> str:
             "</tr>"
         )
 
+    ignored_html = ""
+    if report.ignored_results:
+        ignored_rows = []
+        for ignored in report.ignored_results:
+            result = ignored.result
+            vuln = result.vulnerability
+            ignored_rows.append(
+                "<tr>"
+                f"<td>{html.escape(vuln.id)}</td>"
+                f"<td>{html.escape(vuln.package_name)}</td>"
+                f"<td>{html.escape(vuln.package_version)}</td>"
+                f"<td>{html.escape(_VERDICT_LABELS[result.verdict])}</td>"
+                f"<td>{html.escape(ignored.policy)}</td>"
+                f"<td>{html.escape(ignored.reason)}</td>"
+                f"<td>{html.escape(ignored.owner)}</td>"
+                f"<td>{html.escape(ignored.expires or '')}</td>"
+                "</tr>"
+            )
+        ignored_html = f"""
+  <h2>Ignored Findings</h2>
+  <table>
+    <thead>
+      <tr><th>CVE</th><th>Package</th><th>Version</th><th>Verdict</th><th>Policy</th><th>Reason</th><th>Owner</th><th>Expires</th></tr>
+    </thead>
+    <tbody>
+      {"".join(ignored_rows)}
+    </tbody>
+  </table>
+"""
+
     warning_html = ""
     if report.warnings:
         warning_items = "\n".join(f"<li>{html.escape(w)}</li>" for w in report.warnings)
@@ -283,6 +357,7 @@ def write_html(report: Report, output: Path | TextIO | None = None) -> str:
   <p><strong>Coverage:</strong> {html.escape(report.coverage_path or "none")}</p>
   <p><strong>Proof standard:</strong> <code>{html.escape(report.proof_standard)}</code></p>
   <p><strong>Summary:</strong> {report.total} total, {report.reachable_count} reachable, {report.unreachable_count} unreachable, {report.inconclusive_count} inconclusive.</p>
+  <p><strong>Ignored by policy:</strong> {report.ignored_count}</p>
   <table>
     <thead>
       <tr><th>CVE</th><th>Package</th><th>Version</th><th>Severity</th><th>Verdict</th><th>Confidence</th><th>Reason</th></tr>
@@ -291,6 +366,7 @@ def write_html(report: Report, output: Path | TextIO | None = None) -> str:
       {"".join(rows)}
     </tbody>
   </table>
+  {ignored_html}
   {warning_html}
 </body>
 </html>
@@ -418,6 +494,15 @@ def write_table(
         f"Unreachable: {report.unreachable_count}  |  "
         f"Inconclusive: {report.inconclusive_count}"
     )
+    if report.ignored_count:
+        lines.append(f"Ignored by policy: {report.ignored_count}")
+        if verbose:
+            for ignored in report.ignored_results[:10]:
+                vuln = ignored.result.vulnerability
+                lines.append(
+                    f"  {vuln.id} {vuln.package_name}@{vuln.package_version} "
+                    f"ignored by {ignored.policy}: {ignored.reason}"
+                )
     lines.append(f"Proof: {report.proof_standard}")
     if report.warnings:
         lines.append("")
@@ -450,7 +535,11 @@ def write_sarif(report: Report, output: Path | TextIO | None = None) -> str:
     results = []
     seen_rule_ids: set[str] = set()
 
-    for r in report.results:
+    sarif_items = [(r, None) for r in report.results] + [
+        (ignored.result, ignored) for ignored in report.ignored_results
+    ]
+
+    for r, ignored in sarif_items:
         vuln = r.vulnerability
         rule_id = vuln.id
 
@@ -474,6 +563,8 @@ def write_sarif(report: Report, output: Path | TextIO | None = None) -> str:
             f"Verdict: {_VERDICT_LABELS[r.verdict]}",
             f"Reason: {r.reason}",
         ]
+        if ignored is not None:
+            message_parts.append(f"Ignored by policy: {ignored.policy} ({ignored.reason})")
 
         fingerprint = _stable_fingerprint(
             vuln.id, vuln.package_name, vuln.package_version, r.verdict.value
@@ -505,6 +596,21 @@ def write_sarif(report: Report, output: Path | TextIO | None = None) -> str:
                 "proof_standard": report.proof_standard,
             },
         }
+
+        if ignored is not None:
+            result["suppressions"] = [
+                {
+                    "kind": "external",
+                    "justification": ignored.reason,
+                }
+            ]
+            result["properties"]["policy_ignored"] = True
+            result["properties"]["policy"] = ignored.policy
+            result["properties"]["policy_reason"] = ignored.reason
+            if ignored.owner:
+                result["properties"]["policy_owner"] = ignored.owner
+            if ignored.expires:
+                result["properties"]["policy_expires"] = ignored.expires
 
         if r.evidence:
             result["properties"]["evidence"] = _evidence_to_dict(r.evidence)
