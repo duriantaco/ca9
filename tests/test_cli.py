@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from click.testing import CliRunner
 
+from ca9 import __version__
 from ca9.cli import main
 
 
@@ -14,7 +15,7 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
-        assert "ca9, version 0.1.4" in result.output
+        assert f"ca9, version {__version__}" in result.output
 
     def test_table_output(self, snyk_path, sample_repo):
         runner = CliRunner()
