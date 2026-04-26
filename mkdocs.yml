@@ -1,8 +1,9 @@
 site_name: ca9
-site_description: Static & dynamic reachability analysis to cut CVE noise
-site_url: https://oha.github.io/ca9
-repo_url: https://github.com/oha/ca9
-repo_name: oha/ca9
+site_description: Open source Python CVE reachability analysis for Snyk, Dependabot, Trivy, pip-audit, OSV, SARIF, and OpenVEX workflows
+site_url: https://duriantaco.github.io/ca9/
+site_author: duriantaco
+repo_url: https://github.com/duriantaco/ca9
+repo_name: duriantaco/ca9
 
 theme:
   name: material
@@ -56,6 +57,9 @@ markdown_extensions:
 plugins:
   - search
 
+extra_javascript:
+  - assets/structured-data.js
+
 nav:
   - Home: index.md
   - Getting Started:
@@ -65,6 +69,20 @@ nav:
       - CLI Reference: guide/cli.md
       - Supported Formats: guide/formats.md
       - Dynamic Analysis: guide/coverage.md
+      - Proof Standards: guide/proof-standards.md
+      - Positioning: guide/positioning.md
+  - Integrations:
+      - GitHub Action: integrations/github-action.md
+      - OSV Scan: integrations/osv.md
+      - Snyk: integrations/snyk.md
+      - Dependabot: integrations/dependabot.md
+      - Trivy: integrations/trivy.md
+      - pip-audit: integrations/pip-audit.md
+      - SARIF: integrations/sarif.md
+      - OpenVEX: integrations/openvex.md
+      - SBOM: integrations/sbom.md
+      - MCP Server: integrations/mcp.md
+      - CI/CD: integrations/ci-cd.md
   - Architecture:
       - Overview: architecture/overview.md
       - Verdict Engine: architecture/engine.md
@@ -77,9 +95,11 @@ nav:
       - Analysis: api/analysis.md
       - Parsers: api/parsers.md
       - Report: api/report.md
+  - Benchmarks: benchmarks.md
   - Demo: demo.md
+  - Release Checklist: release-checklist.md
 
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/oha/ca9
+      link: https://github.com/duriantaco/ca9

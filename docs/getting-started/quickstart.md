@@ -28,7 +28,7 @@ ca9 scan --coverage coverage.json
 
 ## Option B: Analyze an existing SCA report
 
-If you already have a Snyk or Dependabot report:
+If you already have a Snyk, Dependabot, Trivy, or pip-audit report:
 
 === "Snyk"
 
@@ -48,6 +48,20 @@ If you already have a Snyk or Dependabot report:
 
     # Analyze it
     ca9 check dependabot.json
+    ```
+
+=== "Trivy"
+
+    ```bash
+    trivy fs --format json --output trivy.json .
+    ca9 check trivy.json
+    ```
+
+=== "pip-audit"
+
+    ```bash
+    pip-audit --format json --output pip-audit.json
+    ca9 check pip-audit.json
     ```
 
 ## Understanding the output
@@ -73,14 +87,17 @@ Add `--verbose` for the reasoning trace behind each verdict:
 ca9 check snyk-report.json --verbose
 ```
 
-### Output as JSON
+### Output for automation
 
 ```bash
 ca9 check snyk-report.json --format json --output results.json
+ca9 check snyk-report.json --format sarif --output ca9.sarif
+ca9 check snyk-report.json --format vex --output openvex.json
 ```
 
 ## Next steps
 
 - [CLI Reference](../guide/cli.md) — all commands and options
 - [Dynamic Analysis Guide](../guide/coverage.md) — get the most out of coverage data
+- [Proof Standards](../guide/proof-standards.md) — strict gates, accepted risks, and baselines
 - [Architecture Overview](../architecture/overview.md) — understand how ca9 works under the hood

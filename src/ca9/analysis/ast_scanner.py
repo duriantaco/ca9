@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import importlib.metadata
+import json
 import re
 import sys
 from pathlib import Path
@@ -66,7 +67,40 @@ def collect_imports_from_source(source: str) -> set[str]:
             for alias in node.names:
                 if alias.name != "*":
                     imports.add(f"{node.module}.{alias.name}")
+        elif isinstance(node, ast.Call):
+            dynamic_import = _extract_dynamic_import_name(node)
+            if dynamic_import:
+                imports.add(dynamic_import)
     return imports
+
+
+def _extract_static_string(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _extract_dynamic_import_name(node: ast.Call) -> str | None:
+    if not node.args:
+        return None
+
+    func = node.func
+    is_dynamic_import = False
+
+    if isinstance(func, ast.Name) and func.id in ("__import__", "import_module"):
+        is_dynamic_import = True
+    elif isinstance(func, ast.Attribute) and func.attr == "import_module":
+        if isinstance(func.value, ast.Name) and func.value.id == "importlib":
+            is_dynamic_import = True
+
+    if not is_dynamic_import:
+        return None
+
+    module_name = _extract_static_string(node.args[0])
+    if not module_name:
+        return None
+
+    return module_name
 
 
 _EXCLUDED_DIRS = {
@@ -280,16 +314,23 @@ def _iter_requirement_inventory(
     except OSError:
         return declared
 
+    constraints: dict[str, tuple[str, str | None]] = {}
+
     for raw_line in lines:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
 
         include_target: Path | None = None
+        constraint_target: Path | None = None
         if line.startswith("-r "):
             include_target = path.parent / line[3:].strip()
         elif line.startswith("--requirement "):
             include_target = path.parent / line[len("--requirement ") :].strip()
+        elif line.startswith("-c "):
+            constraint_target = path.parent / line[3:].strip()
+        elif line.startswith("--constraint "):
+            constraint_target = path.parent / line[len("--constraint ") :].strip()
 
         if include_target is not None:
             nested = _iter_requirement_inventory(include_target, seen)
@@ -297,12 +338,72 @@ def _iter_requirement_inventory(
                 declared[nested_name] = nested_data
             continue
 
+        if constraint_target is not None:
+            constraints.update(_iter_constraint_inventory(constraint_target, seen))
+            continue
+
         name = _extract_req_name_from_line(line)
         if name:
             version = _extract_req_exact_version_from_line(line)
             _merge_declared_dependency(declared, name, version)
 
+    _apply_constraint_versions(declared, constraints)
     return declared
+
+
+def _iter_constraint_inventory(
+    path: Path,
+    seen: set[Path],
+) -> dict[str, tuple[str, str | None]]:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+
+    if resolved in seen or not path.is_file():
+        return {}
+    seen.add(resolved)
+
+    constraints: dict[str, tuple[str, str | None]] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return constraints
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if line.startswith("-c "):
+            constraints.update(_iter_constraint_inventory(path.parent / line[3:].strip(), seen))
+            continue
+        if line.startswith("--constraint "):
+            constraints.update(
+                _iter_constraint_inventory(path.parent / line[len("--constraint ") :].strip(), seen)
+            )
+            continue
+
+        name = _extract_req_name_from_line(line)
+        if not name:
+            continue
+        version = _extract_req_exact_version_from_line(line)
+        if version:
+            _merge_declared_dependency(constraints, name, version)
+
+    return constraints
+
+
+def _apply_constraint_versions(
+    declared: dict[str, tuple[str, str | None]],
+    constraints: dict[str, tuple[str, str | None]],
+) -> None:
+    for key, (_constraint_name, version) in constraints.items():
+        if version is None or key not in declared:
+            continue
+        name, existing_version = declared[key]
+        if existing_version is None:
+            declared[key] = (name, version)
 
 
 def _parse_dependency_requirement(req: str) -> tuple[str | None, str | None]:
@@ -338,6 +439,34 @@ def _extract_poetry_exact_version(value: object) -> str | None:
         return spec
 
     return None
+
+
+def _extract_pipfile_exact_version(value: object) -> str | None:
+    if isinstance(value, dict):
+        value = value.get("version")
+
+    if not isinstance(value, str):
+        return None
+
+    spec = value.strip()
+    if not spec or spec == "*":
+        return None
+
+    try:
+        parsed = Requirement(f"placeholder{spec}")
+    except InvalidRequirement:
+        if spec.startswith("==") and len(spec) > 2:
+            return spec[2:].strip()
+        return None
+
+    return _extract_exact_version(parsed.specifier)
+
+
+def _load_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def _discover_project_name(pyproject_data: dict) -> str | None:
@@ -495,6 +624,36 @@ def _merge_lockfile_versions(
                 declared[dep_key] = (name, version)
 
 
+def _merge_pipfile_inventory(
+    repo_path: Path,
+    declared: dict[str, tuple[str, str | None]],
+) -> None:
+    pipfile_path = repo_path / "Pipfile"
+    if pipfile_path.is_file():
+        pipfile_data = _load_toml(pipfile_path)
+        packages = pipfile_data.get("packages", {})
+        if isinstance(packages, dict):
+            for name, spec in packages.items():
+                _merge_declared_dependency(declared, name, _extract_pipfile_exact_version(spec))
+
+    lock_path = repo_path / "Pipfile.lock"
+    if not lock_path.is_file():
+        return
+
+    lock_data = _load_json(lock_path)
+    default = lock_data.get("default", {})
+    if not isinstance(default, dict):
+        return
+
+    for name, entry in default.items():
+        version: str | None = None
+        if isinstance(entry, dict):
+            version = _extract_pipfile_exact_version(entry.get("version"))
+        elif isinstance(entry, str):
+            version = _extract_pipfile_exact_version(entry)
+        _merge_declared_dependency(declared, name, version)
+
+
 def discover_declared_dependency_inventory(repo_path: Path) -> dict[str, tuple[str, str | None]]:
     declared: dict[str, tuple[str, str | None]] = {}
     pyproject_data: dict = {}
@@ -509,6 +668,16 @@ def discover_declared_dependency_inventory(repo_path: Path) -> dict[str, tuple[s
                     name, version = _parse_dependency_requirement(req)
                     if name:
                         _merge_declared_dependency(declared, name, version)
+            optional_deps = project.get("optional-dependencies", {})
+            if isinstance(optional_deps, dict):
+                for reqs in optional_deps.values():
+                    if not isinstance(reqs, list):
+                        continue
+                    for req in reqs:
+                        if isinstance(req, str):
+                            name, version = _parse_dependency_requirement(req)
+                            if name:
+                                _merge_declared_dependency(declared, name, version)
 
         tool = pyproject_data.get("tool", {})
         if isinstance(tool, dict):
@@ -530,6 +699,7 @@ def discover_declared_dependency_inventory(repo_path: Path) -> dict[str, tuple[s
         for name, data in inventory.items():
             declared[name] = data
 
+    _merge_pipfile_inventory(repo_path, declared)
     _merge_lockfile_versions(repo_path, declared, pyproject_data)
 
     return declared

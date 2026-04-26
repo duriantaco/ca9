@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from ca9.models import Evidence, Report, Verdict, VerdictResult, Vulnerability
-from ca9.report import write_json, write_sarif
+from ca9.report import write_html, write_json, write_markdown, write_sarif
 
 
 def _vuln(vid: str = "CVE-2023-0001", pkg: str = "requests", sev: str = "high") -> Vulnerability:
@@ -41,6 +41,41 @@ class TestSARIF:
         assert run["tool"]["driver"]["name"] == "ca9"
         assert len(run["tool"]["driver"]["rules"]) == 1
         assert len(run["results"]) == 1
+
+    def test_markdown_report(self):
+        report = Report(
+            results=[
+                VerdictResult(
+                    vulnerability=_vuln(),
+                    verdict=Verdict.REACHABLE,
+                    reason="imported | executed",
+                    imported_as="requests",
+                    confidence_score=88,
+                ),
+            ],
+            repo_path=".",
+        )
+        text = write_markdown(report)
+        assert "# ca9 Reachability Report" in text
+        assert "CVE-2023-0001" in text
+        assert "imported \\| executed" in text
+
+    def test_html_report_escapes_content(self):
+        report = Report(
+            results=[
+                VerdictResult(
+                    vulnerability=_vuln(vid="CVE-2023-0001", pkg="<pkg>"),
+                    verdict=Verdict.INCONCLUSIVE,
+                    reason="<script>alert(1)</script>",
+                    confidence_score=42,
+                ),
+            ],
+            repo_path=".",
+        )
+        text = write_html(report)
+        assert "<!doctype html>" in text
+        assert "&lt;pkg&gt;" in text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
 
     def test_sarif_reachable_is_error(self):
         report = Report(

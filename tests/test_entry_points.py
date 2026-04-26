@@ -100,6 +100,64 @@ def test_detect_click_commands(tmp_path):
     assert "cli.grp" in names
 
 
+def test_detect_typer_commands(tmp_path):
+    (tmp_path / "cli.py").write_text(
+        textwrap.dedent("""\
+        import typer
+
+        app = typer.Typer()
+
+        @app.command()
+        def run():
+            pass
+
+        @app.callback()
+        def main():
+            pass
+    """)
+    )
+
+    eps = detect_entry_points(tmp_path)
+    typer_eps = [ep for ep in eps if ep.kind == "typer_command"]
+    names = {ep.qualified_name for ep in typer_eps}
+    assert "cli.run" in names
+    assert "cli.main" in names
+
+
+def test_detect_celery_tasks(tmp_path):
+    (tmp_path / "tasks.py").write_text(
+        textwrap.dedent("""\
+        from celery import Celery, shared_task
+
+        app = Celery("demo")
+
+        @app.task
+        def sync_user():
+            pass
+
+        @app.task(name="demo.send_email")
+        def send_email():
+            pass
+
+        @shared_task
+        def cleanup():
+            pass
+
+        @shared_task()
+        def rebuild():
+            pass
+    """)
+    )
+
+    eps = detect_entry_points(tmp_path)
+    celery_eps = [ep for ep in eps if ep.kind == "celery_task"]
+    names = {ep.qualified_name for ep in celery_eps}
+    assert "tasks.sync_user" in names
+    assert "tasks.send_email" in names
+    assert "tasks.cleanup" in names
+    assert "tasks.rebuild" in names
+
+
 def test_detect_django_views(tmp_path):
     (tmp_path / "urls.py").write_text(
         textwrap.dedent("""\

@@ -10,6 +10,12 @@ from ca9.cli import main
 
 
 class TestCLI:
+    def test_version_option(self):
+        runner = CliRunner()
+        result = runner.invoke(main, ["--version"])
+        assert result.exit_code == 0
+        assert "ca9, version 0.1.4" in result.output
+
     def test_table_output(self, snyk_path, sample_repo):
         runner = CliRunner()
         result = runner.invoke(main, [str(snyk_path), "--repo", str(sample_repo)])
@@ -406,6 +412,24 @@ class TestCLINewCommands:
         data = json.loads(raw[json_start:json_end])
         assert "decision" in data
 
+    def test_check_markdown_format(self, snyk_path, sample_repo):
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [str(snyk_path), "--repo", str(sample_repo), "-f", "markdown", "--no-auto-coverage"],
+        )
+        assert result.exit_code in (0, 1, 2)
+        assert "# ca9 Reachability Report" in result.output
+
+    def test_check_html_format(self, snyk_path, sample_repo):
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [str(snyk_path), "--repo", str(sample_repo), "-f", "html", "--no-auto-coverage"],
+        )
+        assert result.exit_code in (0, 1, 2)
+        assert "<!doctype html>" in result.output
+
 
 class TestCLIConfig:
     def test_config_applies_repo_and_output_paths_relative_to_config(self, tmp_path, monkeypatch):
@@ -452,3 +476,51 @@ class TestCLIConfig:
         data = json.loads(output_path.read_text())
         assert data["proof_standard"] == "balanced"
         assert data["results"][0]["verdict"] == "inconclusive"
+
+    def test_accepted_risks_path_from_config_filters_result(self, tmp_path, monkeypatch):
+        project_root = tmp_path / "project"
+        repo_dir = project_root / "app"
+        subdir = project_root / "subdir"
+        output_path = project_root / "out" / "report.json"
+        project_root.mkdir()
+        repo_dir.mkdir()
+        subdir.mkdir()
+
+        (repo_dir / "app.py").write_text("import requests\n")
+        (project_root / "accepted.toml").write_text(
+            '[[risk]]\nid = "SNYK-PYTHON-REQUESTS-1"\npackage = "requests"\nexpires = "2099-01-01"\n'
+        )
+        (project_root / ".ca9.toml").write_text(
+            'repo = "app"\noutput = "out/report.json"\nformat = "json"\n'
+            'no_auto_coverage = true\naccepted_risks = "accepted.toml"\n'
+        )
+
+        report_path = project_root / "snyk.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "vulnerabilities": [
+                        {
+                            "id": "SNYK-PYTHON-REQUESTS-1",
+                            "packageName": "requests",
+                            "version": "2.19.1",
+                            "severity": "high",
+                            "title": "Requests issue",
+                            "description": "desc",
+                        }
+                    ],
+                    "projectName": "demo",
+                    "packageManager": "pip",
+                }
+            )
+        )
+
+        monkeypatch.chdir(subdir)
+
+        runner = CliRunner()
+        result = runner.invoke(main, [str(Path("..") / "snyk.json")])
+
+        assert result.exit_code == 0
+        data = json.loads(output_path.read_text())
+        assert data["summary"]["total"] == 0
+        assert any("accepted-risk" in warning for warning in data["warnings"])

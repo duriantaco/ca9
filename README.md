@@ -69,21 +69,21 @@ For each CVE:
 
 ca9 is **conservative** — it only marks something unreachable when it can prove it. Every verdict comes with an evidence trail and a confidence score so you can see exactly why ca9 reached its conclusion.
 
-## Why ca9 over other tools
+## Where ca9 fits
 
-| | ca9 | Traditional SCA (Snyk, Dependabot, Trivy) | GitHub code scanning |
+ca9 does not replace your SCA tool. It adds local, evidence-first reachability analysis to the vulnerability data you already have.
+
+| | ca9 | Alert-only SCA output | Hosted reachability platforms |
 |---|---|---|---|
-| **Reachability analysis** | Static + dynamic + transitive | No — flags everything in the dependency tree | Limited — no dynamic analysis |
-| **Submodule precision** | Identifies the exact vulnerable function/module | Package-level only | Varies |
-| **Confidence scoring** | 0-100 verdict-aware score with evidence trail | No | No |
-| **Works without SCA tool** | Yes — `ca9 scan` queries OSV.dev directly | Requires its own scanner | Requires GitHub |
-| **Dynamic analysis** | Yes — uses your existing coverage.py data | No | No |
-| **Runtime dependencies** | `packaging` only | Heavy | Hosted service |
-| **Setup time** | `pip install ca9[cli]` — one command | Account, config, integration | Repository setup |
-| **Output** | Actionable verdicts with evidence + confidence | Alert list with no reachability context | Alert list |
-| **CI integration** | JSON/SARIF output, stable fingerprints | Vendor-specific dashboards | GitHub-only |
+| **Local analysis** | Runs in your repo/CI | Varies | Often requires source upload or hosted project import |
+| **Direct OSV scan** | Yes — `ca9 scan` queries OSV.dev directly | Not always | Varies |
+| **SCA report ingestion** | Snyk, Dependabot, Trivy, pip-audit | Native to each tool | Platform-specific |
+| **Static + dynamic evidence** | Imports, dependency graph, coverage, API usage | Usually package-level alerts | Varies by vendor and integration |
+| **Open outputs** | JSON, SARIF, OpenVEX, Markdown, HTML, remediation, action plan | Vendor-specific | Platform-specific |
+| **Confidence/evidence trail** | Structured evidence per verdict | Limited | Varies |
+| **Runtime dependencies** | `packaging` core dependency; optional CLI/MCP extras | Varies | Hosted service |
 
-**ca9 doesn't replace your SCA tool. It makes it useful.** Snyk finds the CVEs. ca9 tells you which ones matter.
+**Use ca9 when you want an open, local Python reachability layer for CVE triage, CI gates, SARIF upload, OpenVEX generation, or SBOM enrichment.**
 
 ## Real-world results
 
@@ -189,17 +189,28 @@ Confidence scoring is **verdict-directional** — evidence that supports the ver
 
 ```
 ca9 scan [OPTIONS]              Scan installed packages via OSV.dev
-ca9 check SCA_REPORT [OPTIONS]  Analyze a Snyk/Dependabot report
+ca9 check SCA_REPORT [OPTIONS]  Analyze a Snyk/Dependabot/Trivy/pip-audit report
 
 Common options:
   -r, --repo PATH                  Path to the project repository  [default: .]
   -c, --coverage PATH              Path to coverage.json for dynamic analysis
-  -f, --format [table|json|sarif]  Output format  [default: table]
+  -f, --format [table|json|sarif|vex|remediation|action-plan|markdown|html]
+                                      Output format  [default: table]
   -o, --output PATH                Write output to file instead of stdout
   -v, --verbose                    Show reasoning trace for each verdict
   --no-auto-coverage               Disable automatic coverage discovery
   --show-confidence                Show confidence score in table output
   --show-evidence-source           Show evidence extraction source in table output
+  --proof-standard [strict|balanced]
+                                      Proof policy for suppressions
+  --capabilities                   Attach AI capability blast radius
+  --runtime-context PATH           Deployment-aware severity adjustment
+  --trace-paths                    Trace exploit paths
+  --threat-intel                   Enrich with EPSS and CISA KEV data
+  --otel-traces PATH               Production runtime evidence from OTLP JSON
+  --accepted-risks PATH            Accepted-risk TOML/JSON file
+  --baseline PATH                  Previous ca9 JSON report for new-only gating
+  --new-only                       Only gate on new reachable/inconclusive findings
 
 Scan-only options:
   --offline                        Use only cached OSV data, no network requests
@@ -221,9 +232,13 @@ repo = "src"
 coverage = "coverage.json"
 format = "json"
 verbose = true
+accepted_risks = "accepted-risks.toml"
+baseline = "ca9-baseline.json"
+new_only = true
 ```
 
 Config is auto-discovered from the current directory upward. CLI flags override config values.
+Accepted-risk and baseline options produce policy-filtered output; ignored findings are removed from the report and summarized in warnings.
 
 ### Caching and offline mode
 
@@ -269,6 +284,13 @@ Available tools:
 | `scan_dependencies` | Scan installed packages via OSV.dev |
 | `check_coverage_quality` | Assess how reliable your coverage data is |
 | `explain_verdict` | Deep-dive a specific CVE's verdict with full evidence |
+| `generate_vex` | Generate OpenVEX exploitability statements |
+| `generate_remediation_plan` | Generate prioritized remediation actions |
+| `scan_capabilities` | Scan AI capabilities and emit an AI-BOM |
+| `check_blast_radius` | Attach capability blast radius to reachable CVEs |
+| `trace_exploit_path` | Trace paths to vulnerable API call sites |
+| `lookup_threat_intel` | Look up EPSS and CISA KEV data |
+| `enrich_sbom` | Enrich CycloneDX or SPDX SBOM JSON |
 
 ## Library usage
 
@@ -296,7 +318,7 @@ for result in report.results:
 
 ## Zero heavy dependencies
 
-ca9's core library depends only on `packaging` (PEP 440 version parsing) and the Python standard library. The `click` package is optional — only needed if you use the CLI. This means you can embed ca9 in CI pipelines, security toolchains, or other Python tools without bloating your dependency tree.
+ca9's core library depends only on `packaging` (PEP 440 version parsing) and the Python standard library. The `click` package is optional — only needed if you use the CLI. This means you can embed ca9 in CI pipelines, security toolchains, or other Python tools without pulling in a large dependency tree.
 
 ## Limitations
 
@@ -308,7 +330,7 @@ ca9's core library depends only on `packaging` (PEP 440 version parsing) and the
 ## Development
 
 ```bash
-git clone https://github.com/your-org/ca9.git
+git clone https://github.com/duriantaco/ca9.git
 cd ca9
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"

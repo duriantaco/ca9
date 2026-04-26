@@ -92,6 +92,10 @@ def _detect_framework_apps(tree: ast.Module) -> dict[str, str]:
                 apps[var_name] = "flask"
             elif func_name in ("FastAPI", "APIRouter"):
                 apps[var_name] = "fastapi"
+            elif func_name == "Celery":
+                apps[var_name] = "celery"
+            elif func_name == "Typer":
+                apps[var_name] = "typer"
             elif func_name in ("Group", "group"):
                 apps[var_name] = "click"
 
@@ -261,6 +265,70 @@ def _detect_click_commands(
     return entries
 
 
+def _detect_typer_commands(
+    tree: ast.Module, apps: dict[str, str], module_name: str, file_path: str
+) -> list[EntryPoint]:
+    entries: list[EntryPoint] = []
+    typer_vars = {k for k, v in apps.items() if v == "typer"}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        for dec in node.decorator_list:
+            target = dec.func if isinstance(dec, ast.Call) else dec
+            if not isinstance(target, ast.Attribute):
+                continue
+            if target.attr not in ("command", "callback"):
+                continue
+            if isinstance(target.value, ast.Name) and target.value.id in typer_vars:
+                qname = f"{module_name}.{node.name}"
+                entries.append(
+                    EntryPoint(
+                        qualified_name=qname,
+                        file_path=file_path,
+                        line=node.lineno,
+                        kind="typer_command",
+                    )
+                )
+
+    return entries
+
+
+def _detect_celery_tasks(
+    tree: ast.Module, apps: dict[str, str], module_name: str, file_path: str
+) -> list[EntryPoint]:
+    entries: list[EntryPoint] = []
+    celery_vars = {k for k, v in apps.items() if v == "celery"}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        for dec in node.decorator_list:
+            target = dec.func if isinstance(dec, ast.Call) else dec
+
+            is_task = False
+            if isinstance(target, ast.Name) and target.id == "shared_task":
+                is_task = True
+            elif isinstance(target, ast.Attribute) and target.attr == "task":
+                if isinstance(target.value, ast.Name) and target.value.id in celery_vars:
+                    is_task = True
+
+            if is_task:
+                qname = f"{module_name}.{node.name}"
+                entries.append(
+                    EntryPoint(
+                        qualified_name=qname,
+                        file_path=file_path,
+                        line=node.lineno,
+                        kind="celery_task",
+                    )
+                )
+
+    return entries
+
+
 def _detect_main_blocks(tree: ast.Module, module_name: str, file_path: str) -> list[EntryPoint]:
     entries: list[EntryPoint] = []
 
@@ -316,6 +384,8 @@ def detect_entry_points(repo_path: Path) -> list[EntryPoint]:
         entries.extend(_detect_fastapi_routes(tree, apps, module_name, file_str))
         entries.extend(_detect_django_views(tree, index, module_name, file_str))
         entries.extend(_detect_click_commands(tree, apps, module_name, file_str))
+        entries.extend(_detect_typer_commands(tree, apps, module_name, file_str))
+        entries.extend(_detect_celery_tasks(tree, apps, module_name, file_str))
         entries.extend(_detect_main_blocks(tree, module_name, file_str))
 
     return entries

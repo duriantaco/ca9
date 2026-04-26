@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import sys
 from pathlib import Path
 from typing import TextIO
 
+from ca9 import __version__
 from ca9.models import Report, Verdict
 
 _VERDICT_LABELS = {
@@ -181,6 +183,119 @@ def write_json(report: Report, output: Path | TextIO | None = None) -> str:
     elif output is not None:
         output.write(text)
 
+    return text
+
+
+def _write_output(text: str, output: Path | TextIO | None) -> None:
+    if isinstance(output, Path):
+        output.write_text(text)
+    elif output is not None:
+        output.write(text)
+
+
+def _markdown_cell(value: object) -> str:
+    text = "" if value is None else str(value)
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
+
+
+def write_markdown(report: Report, output: Path | TextIO | None = None) -> str:
+    lines = [
+        "# ca9 Reachability Report",
+        "",
+        f"- Repository: `{report.repo_path}`",
+        f"- Coverage: `{report.coverage_path}`" if report.coverage_path else "- Coverage: none",
+        f"- Proof standard: `{report.proof_standard}`",
+        (
+            f"- Summary: {report.total} total, {report.reachable_count} reachable, "
+            f"{report.unreachable_count} unreachable, {report.inconclusive_count} inconclusive"
+        ),
+        "",
+        "| CVE | Package | Version | Severity | Verdict | Confidence | Reason |",
+        "|---|---|---|---|---|---:|---|",
+    ]
+
+    for result in report.results:
+        vuln = result.vulnerability
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    _markdown_cell(vuln.id),
+                    _markdown_cell(vuln.package_name),
+                    _markdown_cell(vuln.package_version),
+                    _markdown_cell(vuln.severity),
+                    _markdown_cell(_VERDICT_LABELS[result.verdict]),
+                    str(result.confidence_score),
+                    _markdown_cell(result.reason),
+                ]
+            )
+            + " |"
+        )
+
+    if report.warnings:
+        lines.extend(["", "## Warnings", ""])
+        for warning in report.warnings:
+            lines.append(f"- {_markdown_cell(warning)}")
+
+    text = "\n".join(lines) + "\n"
+    _write_output(text, output)
+    return text
+
+
+def write_html(report: Report, output: Path | TextIO | None = None) -> str:
+    rows = []
+    for result in report.results:
+        vuln = result.vulnerability
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(vuln.id)}</td>"
+            f"<td>{html.escape(vuln.package_name)}</td>"
+            f"<td>{html.escape(vuln.package_version)}</td>"
+            f"<td>{html.escape(vuln.severity)}</td>"
+            f"<td>{html.escape(_VERDICT_LABELS[result.verdict])}</td>"
+            f"<td>{result.confidence_score}</td>"
+            f"<td>{html.escape(result.reason)}</td>"
+            "</tr>"
+        )
+
+    warning_html = ""
+    if report.warnings:
+        warning_items = "\n".join(f"<li>{html.escape(w)}</li>" for w in report.warnings)
+        warning_html = f"<h2>Warnings</h2>\n<ul>\n{warning_items}\n</ul>"
+
+    text = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ca9 Reachability Report</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17202a; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #d8dee4; padding: 0.5rem; text-align: left; vertical-align: top; }}
+    th {{ background: #f6f8fa; }}
+    code {{ background: #f6f8fa; padding: 0.1rem 0.25rem; border-radius: 4px; }}
+  </style>
+</head>
+<body>
+  <h1>ca9 Reachability Report</h1>
+  <p><strong>Repository:</strong> <code>{html.escape(report.repo_path)}</code></p>
+  <p><strong>Coverage:</strong> {html.escape(report.coverage_path or "none")}</p>
+  <p><strong>Proof standard:</strong> <code>{html.escape(report.proof_standard)}</code></p>
+  <p><strong>Summary:</strong> {report.total} total, {report.reachable_count} reachable, {report.unreachable_count} unreachable, {report.inconclusive_count} inconclusive.</p>
+  <table>
+    <thead>
+      <tr><th>CVE</th><th>Package</th><th>Version</th><th>Severity</th><th>Verdict</th><th>Confidence</th><th>Reason</th></tr>
+    </thead>
+    <tbody>
+      {"".join(rows)}
+    </tbody>
+  </table>
+  {warning_html}
+</body>
+</html>
+"""
+    _write_output(text, output)
     return text
 
 
@@ -416,8 +531,8 @@ def write_sarif(report: Report, output: Path | TextIO | None = None) -> str:
         "tool": {
             "driver": {
                 "name": "ca9",
-                "informationUri": "https://github.com/oha/ca9",
-                "version": "0.3.0",
+                "informationUri": "https://github.com/duriantaco/ca9",
+                "version": __version__,
                 "rules": rules,
             },
         },

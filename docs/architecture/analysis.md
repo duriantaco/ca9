@@ -1,6 +1,6 @@
 # Analysis Pipeline
 
-ca9 uses three analysis modules that feed into the verdict engine.
+ca9 uses several analysis modules that feed into the verdict engine. Static imports, dependency relationships, coverage data, affected component extraction, API usage rules, OpenTelemetry traces, and exploit path tracing are all normalized into structured evidence.
 
 ## Static Analysis — AST Scanner
 
@@ -18,6 +18,19 @@ imports: set[str] = collect_imports_from_repo(Path("."))
 ```
 
 Scans all `.py` files recursively, skipping common non-project directories (venvs, `__pycache__`, `site-packages`, etc.).
+
+ca9 also records statically recoverable dynamic imports:
+
+```python
+import importlib
+from importlib import import_module
+
+importlib.import_module("requests.sessions")
+import_module("django.contrib.admin")
+__import__("yaml")
+```
+
+Dynamic import expressions that depend on runtime variables are not treated as proof.
 
 ### Package import checking
 
@@ -146,3 +159,23 @@ Description: "Flaw in SandboxedEnvironment allows..."
 ### Fallback (low confidence)
 
 If no strategy produces a match, returns an empty component with `confidence="low"`. The verdict engine falls back to package-level analysis.
+
+---
+
+## Vulnerable API Usage
+
+**Module:** `ca9.analysis.api_usage`
+
+Curated intelligence rules can identify vulnerable functions, classes, methods, or modules for specific CVEs. ca9 scans first-party code for those targets and records call-site evidence.
+
+When coverage data is available, ca9 also checks whether the vulnerable API call sites executed during tests.
+
+---
+
+## Runtime And Path Evidence
+
+Additional optional analyzers can enrich verdicts:
+
+- `ca9.analysis.otel_reader` reads OTLP JSON exports to identify package modules observed in production traces.
+- `ca9.analysis.entry_points`, `call_graph`, and `exploit_path` support path tracing from application entry points to vulnerable API call sites.
+- Entry point detection supports Flask routes, FastAPI routes and routers, Django URL views, Click commands, Typer commands, Celery tasks, and `if __name__ == "__main__"` blocks.

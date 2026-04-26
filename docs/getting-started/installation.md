@@ -7,12 +7,12 @@
 ## Install from source
 
 ```bash
-git clone https://github.com/oha/ca9.git
+git clone https://github.com/duriantaco/ca9.git
 cd ca9
 pip install .
 ```
 
-This installs the core library with zero runtime dependencies.
+This installs the core library. The only required runtime dependency is `packaging`, which ca9 uses for PEP 440 version comparison.
 
 ## Install with CLI support
 
@@ -48,13 +48,13 @@ You should see:
 ```
 Usage: ca9 [OPTIONS] COMMAND [ARGS]...
 
-  ca9 – reachability-aware CVE triage.
-
 Options:
   --version  Show the version and exit.
   --help     Show this message and exit.
 
 Commands:
-  check  Analyse an SCA report for reachability.
-  scan   Scan installed packages via OSV.dev (zero setup).
+  action-plan   Generate a machine-readable action plan for CI/CD...
+  capabilities  Scan repository for AI capabilities...
+  check         Analyze an SCA report for reachability.
+  scan          Scan declared or installed packages via OSV.dev.
 ```
