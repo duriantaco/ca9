@@ -11,11 +11,13 @@ except ImportError:
     print("ca9 CLI requires 'click'. Install with: pip install ca9[cli]", file=sys.stderr)
     sys.exit(1)
 
+from ca9 import __version__
 from ca9.config import find_config, load_config
 from ca9.coverage_provider import resolve_coverage
 from ca9.engine import analyze
 from ca9.parsers import detect_parser
-from ca9.report import write_json, write_sarif, write_table
+from ca9.policy import apply_policy
+from ca9.report import write_html, write_json, write_markdown, write_sarif, write_table
 from ca9.vex import write_openvex
 
 
@@ -32,6 +34,18 @@ def _output_report(
 
     if output_format == "json":
         text = write_json(report)
+        if output_path:
+            output_path.write_text(text)
+        else:
+            click.echo(text)
+    elif output_format == "markdown":
+        text = write_markdown(report)
+        if output_path:
+            output_path.write_text(text)
+        else:
+            click.echo(text)
+    elif output_format == "html":
+        text = write_html(report)
         if output_path:
             output_path.write_text(text)
         else:
@@ -106,18 +120,22 @@ def _load_cli_config() -> dict:
         "verbose": "verbose",
         "no_auto_coverage": "no_auto_coverage",
         "proof_standard": "proof_standard",
+        "accepted_risks": "accepted_risks_path",
+        "baseline": "baseline_path",
+        "new_only": "new_only",
     }
     result = {}
     for toml_key, param_name in mapping.items():
         if toml_key in raw:
             val = raw[toml_key]
-            if toml_key in ("repo", "coverage", "output"):
+            if toml_key in ("repo", "coverage", "output", "accepted_risks", "baseline"):
                 val = (config_path.parent / val).resolve()
             result[param_name] = val
     return result
 
 
 @click.group(cls=DefaultGroup)
+@click.version_option(__version__, prog_name="ca9")
 @click.pass_context
 def main(ctx):
     ctx.ensure_object(dict)
@@ -160,7 +178,9 @@ def _resolve_option(ctx: click.Context, option_name: str, current_value):
     "-f",
     "--format",
     "output_format",
-    type=click.Choice(["table", "json", "sarif", "vex", "remediation", "action-plan"]),
+    type=click.Choice(
+        ["table", "json", "sarif", "vex", "remediation", "action-plan", "markdown", "html"]
+    ),
     default="table",
     help="Output format.",
 )
@@ -232,6 +252,26 @@ def _resolve_option(ctx: click.Context, option_name: str, current_value):
     default=None,
     help="OTLP JSON export for production runtime evidence.",
 )
+@click.option(
+    "--accepted-risks",
+    "accepted_risks_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Accepted-risk TOML/JSON file for findings that should not affect gates.",
+)
+@click.option(
+    "--baseline",
+    "baseline_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Previous ca9 JSON report for new-only gating.",
+)
+@click.option(
+    "--new-only",
+    is_flag=True,
+    default=False,
+    help="Only gate on reachable or inconclusive findings not present in --baseline.",
+)
 @click.pass_context
 def check(
     ctx: click.Context,
@@ -250,7 +290,11 @@ def check(
     trace_paths: bool,
     threat_intel: bool,
     otel_traces_path: Path | None,
+    accepted_risks_path: Path | None,
+    baseline_path: Path | None,
+    new_only: bool,
 ) -> None:
+    """Analyze an SCA report for reachability."""
     repo_path = _resolve_option(ctx, "repo_path", repo_path)
     coverage_path = _resolve_option(ctx, "coverage_path", coverage_path)
     output_format = _resolve_option(ctx, "output_format", output_format)
@@ -258,6 +302,9 @@ def check(
     verbose = _resolve_option(ctx, "verbose", verbose)
     no_auto_coverage = _resolve_option(ctx, "no_auto_coverage", no_auto_coverage)
     proof_standard = _resolve_option(ctx, "proof_standard", proof_standard)
+    accepted_risks_path = _resolve_option(ctx, "accepted_risks_path", accepted_risks_path)
+    baseline_path = _resolve_option(ctx, "baseline_path", baseline_path)
+    new_only = _resolve_option(ctx, "new_only", new_only)
 
     coverage_path = resolve_coverage(coverage_path, repo_path, auto_generate=not no_auto_coverage)
 
@@ -296,6 +343,13 @@ def check(
         runtime_ctx = load_runtime_context(runtime_ctx_path)
         report = apply_runtime_context(report, runtime_ctx)
 
+    report = apply_policy(
+        report,
+        accepted_risks_path=accepted_risks_path,
+        baseline_path=baseline_path,
+        new_only=new_only,
+    )
+
     _output_report(
         report,
         output_format,
@@ -328,7 +382,9 @@ def check(
     "-f",
     "--format",
     "output_format",
-    type=click.Choice(["table", "json", "sarif", "vex", "remediation", "action-plan"]),
+    type=click.Choice(
+        ["table", "json", "sarif", "vex", "remediation", "action-plan", "markdown", "html"]
+    ),
     default="table",
     help="Output format.",
 )
@@ -418,6 +474,26 @@ def check(
     default=None,
     help="OTLP JSON export for production runtime evidence.",
 )
+@click.option(
+    "--accepted-risks",
+    "accepted_risks_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Accepted-risk TOML/JSON file for findings that should not affect gates.",
+)
+@click.option(
+    "--baseline",
+    "baseline_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Previous ca9 JSON report for new-only gating.",
+)
+@click.option(
+    "--new-only",
+    is_flag=True,
+    default=False,
+    help="Only gate on reachable or inconclusive findings not present in --baseline.",
+)
 @click.pass_context
 def scan(
     ctx: click.Context,
@@ -438,7 +514,11 @@ def scan(
     trace_paths: bool,
     threat_intel: bool,
     otel_traces_path: Path | None,
+    accepted_risks_path: Path | None,
+    baseline_path: Path | None,
+    new_only: bool,
 ) -> None:
+    """Scan declared or installed packages via OSV.dev."""
     from ca9.scanner import query_osv_batch, resolve_scan_inventory
 
     repo_path = _resolve_option(ctx, "repo_path", repo_path)
@@ -448,6 +528,9 @@ def scan(
     verbose = _resolve_option(ctx, "verbose", verbose)
     no_auto_coverage = _resolve_option(ctx, "no_auto_coverage", no_auto_coverage)
     proof_standard = _resolve_option(ctx, "proof_standard", proof_standard)
+    accepted_risks_path = _resolve_option(ctx, "accepted_risks_path", accepted_risks_path)
+    baseline_path = _resolve_option(ctx, "baseline_path", baseline_path)
+    new_only = _resolve_option(ctx, "new_only", new_only)
 
     coverage_path = resolve_coverage(coverage_path, repo_path, auto_generate=not no_auto_coverage)
 
@@ -504,6 +587,13 @@ def scan(
 
         runtime_ctx = load_runtime_context(runtime_ctx_path)
         report = apply_runtime_context(report, runtime_ctx)
+
+    report = apply_policy(
+        report,
+        accepted_risks_path=accepted_risks_path,
+        baseline_path=baseline_path,
+        new_only=new_only,
+    )
 
     _output_report(
         report,
@@ -794,6 +884,26 @@ def vex_diff_cmd(base_path: Path, head_path: Path, output_path: Path | None) -> 
     default=None,
     help="Write action plan to file.",
 )
+@click.option(
+    "--accepted-risks",
+    "accepted_risks_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Accepted-risk TOML/JSON file for findings that should not affect gates.",
+)
+@click.option(
+    "--baseline",
+    "baseline_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Previous ca9 JSON report for new-only gating.",
+)
+@click.option(
+    "--new-only",
+    is_flag=True,
+    default=False,
+    help="Only gate on reachable or inconclusive findings not present in --baseline.",
+)
 def action_plan_cmd(
     sca_report: Path,
     repo_path: Path,
@@ -802,6 +912,9 @@ def action_plan_cmd(
     capabilities: bool,
     runtime_ctx_path: Path | None,
     output_path: Path | None,
+    accepted_risks_path: Path | None,
+    baseline_path: Path | None,
+    new_only: bool,
 ) -> None:
     """Generate a machine-readable action plan for CI/CD (block, PR, revoke, notify)."""
     from ca9.action_plan import generate_action_plan, write_action_plan
@@ -836,6 +949,13 @@ def action_plan_cmd(
 
         runtime_ctx = load_runtime_context(runtime_ctx_path)
         report = apply_runtime_context(report, runtime_ctx)
+
+    report = apply_policy(
+        report,
+        accepted_risks_path=accepted_risks_path,
+        baseline_path=baseline_path,
+        new_only=new_only,
+    )
 
     plan = generate_action_plan(report)
     text = write_action_plan(plan)

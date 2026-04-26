@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from ca9 import __version__
 from ca9.models import ThreatIntelData
 
 EPSS_API_URL = "https://api.first.org/data/v1/epss"
@@ -58,7 +59,9 @@ def _write_cache(name: str, data: dict) -> None:
 
 def _http_get(url: str, timeout: int = 15) -> bytes | None:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "ca9-security-tool/0.3.0"})
+        req = urllib.request.Request(
+            url, headers={"User-Agent": f"ca9-security-tool/{__version__}"}
+        )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read()
     except (urllib.error.URLError, OSError, TimeoutError):

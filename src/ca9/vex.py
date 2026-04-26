@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
+from ca9 import __version__
 from ca9.models import Report, Verdict, VerdictResult
 
 _VEX_STATUS = {
@@ -162,7 +163,7 @@ def write_openvex(report: Report, output: Path | TextIO | None = None) -> str:
         "version": 1,
         "tooling": {
             "name": "ca9",
-            "version": "0.3.0",
+            "version": __version__,
             "proof_standard": report.proof_standard,
         },
         "statements": statements,
