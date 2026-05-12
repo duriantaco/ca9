@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/duriantaco/ca9/main/assets/ca9.png" alt="ca9 — CVE reachability analysis for Python" width="400">
+  <img src="https://raw.githubusercontent.com/duriantaco/ca9/main/assets/ca9.png" alt="ca9 - evidence-backed Python CVE reachability triage" width="400">
 </p>
 
 <h1 align="center">ca9</h1>
 
-<p align="center"><strong>Stop fixing CVEs that don't affect you.</strong></p>
+<p align="center"><strong>Evidence-backed CVE triage for Python SCA alerts.</strong></p>
 
 <p align="center">
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
@@ -18,7 +18,7 @@
 
 ## The problem
 
-Your SCA tool (Snyk, Dependabot, Trivy, Grype) flags every CVE in your dependency tree. You get 60 alerts. Your team scrambles. But most of those CVEs are in code your application **never imports, never calls, and never executes**.
+Your SCA tool (Snyk, Dependabot, Trivy, pip-audit, OSV, or another scanner) flags every CVE in your dependency tree. You get 60 alerts. Your team scrambles. But many of those CVEs are in code your application **never imports, never calls, and never executes**.
 
 You're patching vulnerabilities in functions you don't use, in packages you didn't know you had, in code paths your app will never reach.
 
@@ -26,7 +26,9 @@ That's wasted engineering time. That's alert fatigue. That's how real vulnerabil
 
 ## What ca9 does
 
-ca9 takes your CVE list and answers one question per vulnerability: **is this code actually reachable from your application?**
+ca9 turns CVE alerts into evidence-backed fix, suppress, or investigate decisions.
+
+It takes your CVE list and answers one question per vulnerability: **is this code actually reachable from your application?**
 
 ```bash
 pip install ca9[cli]
@@ -49,13 +51,15 @@ Total: 61  |  Reachable: 25  |  Unreachable: 36  |  Inconclusive: 0
 
 ## How it works
 
-ca9 combines three techniques to prove whether vulnerable code is reachable:
+ca9 combines repository evidence with advisory metadata to prove whether vulnerable code is reachable:
 
 **1. Static analysis (AST import tracing)** — Parses every Python file in your repo and traces `import` statements. If a vulnerable package is never imported, it's unreachable.
 
-**2. Transitive dependency resolution** — Uses `importlib.metadata` to walk the dependency tree. If `urllib3` is only installed because `requests` pulled it in, and `requests` is never imported, both are unreachable.
+**2. Dependency inventory** — Uses declared dependencies, report metadata, and local package metadata to separate direct, transitive, imported, and unused packages.
 
 **3. Dynamic analysis (coverage.py)** — Checks whether vulnerable code was actually *executed* during your test suite. A package might be imported but the specific vulnerable function might never be called.
+
+**4. Advisory normalization** — Preserves source, aliases, CWE/CPE IDs, timestamps, and cache freshness where input data provides them, so evidence can be traced back to the alert.
 
 ```
 For each CVE:
@@ -77,7 +81,7 @@ ca9 does not replace your SCA tool. It adds local, evidence-first reachability a
 |---|---|---|---|
 | **Local analysis** | Runs in your repo/CI | Varies | Often requires source upload or hosted project import |
 | **Direct OSV scan** | Yes — `ca9 scan` queries OSV.dev directly | Not always | Varies |
-| **SCA report ingestion** | Snyk, Dependabot, Trivy, pip-audit | Native to each tool | Platform-specific |
+| **SCA report parsing** | Snyk, Dependabot, Trivy, pip-audit | Native to each tool | Platform-specific |
 | **Static + dynamic evidence** | Imports, dependency graph, coverage, API usage | Usually package-level alerts | Varies by vendor and integration |
 | **Open outputs** | JSON, SARIF, OpenVEX, Markdown, HTML, remediation, action plan | Vendor-specific | Platform-specific |
 | **Confidence/evidence trail** | Structured evidence per verdict | Limited | Varies |
@@ -168,6 +172,7 @@ Every verdict is backed by structured evidence. Use `--show-confidence` to see s
 
 | Signal | What it checks |
 |--------|----------------|
+| `advisory` | Advisory source, ecosystem, aliases, CWE/CPE IDs, and cache freshness metadata when available. |
 | `version_in_range` | Is the installed version within the affected range (PEP 440)? |
 | `package_imported` | Is the package imported anywhere in the repo? |
 | `submodule_imported` | Is the specific vulnerable submodule imported? |

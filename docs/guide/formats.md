@@ -37,7 +37,7 @@ gh api repos/{owner}/{repo}/dependabot/alerts > dependabot.json
 ca9 check dependabot.json --repo .
 ```
 
-ca9 extracts advisory IDs, package names, vulnerable ranges, severities, titles, and dependency relationship data where present.
+ca9 extracts advisory IDs, aliases, CWE IDs, package names, vulnerable ranges, severities, titles, source URLs, timestamps, and dependency relationship data where present.
 
 ### Trivy
 
@@ -60,6 +60,7 @@ ca9 check pip-audit.json --repo .
 ```
 
 ca9 maps pip-audit vulnerability entries into its common `Vulnerability` model for reachability analysis.
+pip-audit aliases are preserved so PYSEC findings can still match CVE-oriented reachability rules.
 
 ## Input: Direct OSV scanning
 
@@ -70,6 +71,7 @@ ca9 scan --repo .
 ```
 
 The scanner prefers dependency inventory from the repository. If no resolvable dependency inventory is available, it falls back to installed packages in the current Python environment.
+OSV vulnerability details populate advisory aliases, CWE/CPE IDs, source URLs, published/modified timestamps, and cache freshness metadata in JSON, SARIF, and OpenVEX outputs.
 
 Useful scan options:
 
@@ -101,6 +103,23 @@ Machine-readable report with summary, verdicts, evidence, warnings, confidence s
 
 ```bash
 ca9 check snyk-report.json --repo . -f json -o ca9-report.json
+```
+
+Each result also includes an `advisory` object with normalized identity metadata:
+
+```json
+{
+  "ecosystem": "pypi",
+  "aliases": ["CVE-2024-12345"],
+  "cwes": ["CWE-79"],
+  "cpes": [],
+  "source": "osv.dev",
+  "url": "https://osv.dev/vulnerability/GHSA-...",
+  "published_at": "2024-01-01T00:00:00Z",
+  "modified_at": "2024-01-02T00:00:00Z",
+  "fetched_at": "2024-01-03T00:00:00Z",
+  "cache_stale": false
+}
 ```
 
 ### SARIF

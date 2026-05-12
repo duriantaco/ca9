@@ -98,6 +98,21 @@ def _component_to_dict(component) -> dict | None:
     }
 
 
+def _advisory_to_dict(vuln) -> dict:
+    return {
+        "ecosystem": vuln.ecosystem,
+        "aliases": list(vuln.aliases),
+        "cwes": list(vuln.cwes),
+        "cpes": list(vuln.cpes),
+        "source": vuln.advisory_source,
+        "url": vuln.advisory_url,
+        "published_at": vuln.published_at,
+        "modified_at": vuln.modified_at,
+        "fetched_at": vuln.fetched_at,
+        "cache_stale": vuln.cache_stale,
+    }
+
+
 def _result_to_dict(r) -> dict:
     return {
         "id": r.vulnerability.id,
@@ -105,6 +120,7 @@ def _result_to_dict(r) -> dict:
         "version": r.vulnerability.package_version,
         "severity": r.vulnerability.severity,
         "title": r.vulnerability.title,
+        "advisory": _advisory_to_dict(r.vulnerability),
         "verdict": r.verdict.value,
         "reason": r.reason,
         "imported_as": r.imported_as,
@@ -548,12 +564,19 @@ def write_sarif(report: Report, output: Path | TextIO | None = None) -> str:
             rule = {
                 "id": rule_id,
                 "shortDescription": {"text": vuln.title or rule_id},
-                "helpUri": f"https://osv.dev/vulnerability/{rule_id}",
+                "helpUri": vuln.advisory_url or f"https://osv.dev/vulnerability/{rule_id}",
                 "properties": {
                     "security-severity": _SEVERITY_RANKS.get(vuln.severity.lower(), "0.0"),
                     "tags": ["security", "vulnerability"],
+                    "ecosystem": vuln.ecosystem,
                 },
             }
+            if vuln.aliases:
+                rule["properties"]["aliases"] = list(vuln.aliases)
+            if vuln.cwes:
+                rule["properties"]["cwes"] = list(vuln.cwes)
+            if vuln.cpes:
+                rule["properties"]["cpes"] = list(vuln.cpes)
             if vuln.description:
                 rule["fullDescription"] = {"text": vuln.description}
             rules.append(rule)
@@ -592,6 +615,16 @@ def write_sarif(report: Report, output: Path | TextIO | None = None) -> str:
                 "package": vuln.package_name,
                 "version": vuln.package_version,
                 "severity": vuln.severity,
+                "ecosystem": vuln.ecosystem,
+                "aliases": list(vuln.aliases),
+                "cwes": list(vuln.cwes),
+                "cpes": list(vuln.cpes),
+                "advisory_source": vuln.advisory_source,
+                "advisory_url": vuln.advisory_url,
+                "published_at": vuln.published_at,
+                "modified_at": vuln.modified_at,
+                "fetched_at": vuln.fetched_at,
+                "cache_stale": vuln.cache_stale,
                 "confidence_score": r.confidence_score,
                 "proof_standard": report.proof_standard,
             },

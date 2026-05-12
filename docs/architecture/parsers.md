@@ -1,6 +1,6 @@
 # Parser Architecture
 
-ca9 uses a protocol-based parser system for SCA report ingestion. Each parser converts a vendor-specific JSON shape into ca9's shared `Vulnerability` model.
+ca9 uses a protocol-based parser system for SCA report parsing. Each parser converts a vendor-specific JSON shape into ca9's shared `Vulnerability` model.
 
 ## Design
 

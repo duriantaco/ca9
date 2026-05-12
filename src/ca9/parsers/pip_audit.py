@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ca9.advisory import extract_cwes, normalize_advisory_aliases
 from ca9.models import Vulnerability, finding_key
 
 
@@ -50,6 +51,10 @@ class PipAuditParser:
                         severity="unknown",
                         title=title,
                         description=description,
+                        ecosystem="pypi",
+                        aliases=normalize_advisory_aliases(vuln_id, v.get("aliases", [])),
+                        cwes=extract_cwes(v),
+                        advisory_source="pip-audit",
                     )
                 )
 

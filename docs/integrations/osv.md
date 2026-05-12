@@ -32,3 +32,5 @@ ca9 scan --repo . --refresh-cache
 ```
 
 Use `--offline` for repeatable local checks when OSV data was already cached.
+
+OSV detail records are cached locally and each finding carries freshness metadata in JSON, SARIF, and OpenVEX outputs. ca9 records when advisory data was fetched, whether the cache entry was stale at read time, and the OSV published/modified timestamps when OSV provides them.

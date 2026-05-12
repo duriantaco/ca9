@@ -94,14 +94,38 @@ class TestSnykParser:
                     "version": "1.26.18",
                     "severity": "high",
                     "title": "t",
+                    "identifiers": {"CVE": ["CVE-2024-1111"], "CWE": ["CWE-918"]},
+                    "url": "https://security.snyk.io/vuln/V1",
                     "from": ["my-project@1.0.0", "requests@2.31.0", "urllib3@1.26.18"],
+                }
+            ],
+            "projectName": "my-project",
+            "packageManager": "pip",
+        }
+        vulns = SnykParser().parse(data)
+        assert vulns[0].report_dependency_kind == "transitive"
+        assert vulns[0].report_dependency_chain == ("requests", "urllib3")
+        assert vulns[0].ecosystem == "pypi"
+        assert vulns[0].aliases == ("CVE-2024-1111",)
+        assert vulns[0].cwes == ("CWE-918",)
+        assert vulns[0].advisory_source == "snyk"
+        assert vulns[0].advisory_url == "https://security.snyk.io/vuln/V1"
+
+    def test_missing_package_manager_does_not_default_to_pypi(self):
+        data = {
+            "vulnerabilities": [
+                {
+                    "id": "V1",
+                    "packageName": "@scope/pkg",
+                    "version": "1.0.0",
+                    "severity": "high",
+                    "title": "t",
                 }
             ],
             "projectName": "my-project",
         }
         vulns = SnykParser().parse(data)
-        assert vulns[0].report_dependency_kind == "transitive"
-        assert vulns[0].report_dependency_chain == ("requests", "urllib3")
+        assert vulns[0].ecosystem == ""
 
 
 class TestDependabotParser:
@@ -130,8 +154,13 @@ class TestDependabotParser:
                 "number": 3,
                 "security_advisory": {
                     "ghsa_id": "GHSA-9999-aaaa-bbbb",
+                    "cve_id": "CVE-2024-1234",
                     "summary": "t",
                     "severity": "high",
+                    "cwes": [{"cwe_id": "CWE-79"}],
+                    "html_url": "https://github.com/advisories/GHSA-9999-aaaa-bbbb",
+                    "published_at": "2024-01-01T00:00:00Z",
+                    "updated_at": "2024-01-02T00:00:00Z",
                 },
                 "security_vulnerability": {
                     "package": {"ecosystem": "pip", "name": "urllib3"},
@@ -146,6 +175,31 @@ class TestDependabotParser:
         vulns = DependabotParser().parse(data)
         assert vulns[0].report_dependency_kind == "transitive"
         assert vulns[0].report_dependency_chain == ()
+        assert vulns[0].ecosystem == "pypi"
+        assert vulns[0].aliases == ("CVE-2024-1234",)
+        assert vulns[0].cwes == ("CWE-79",)
+        assert vulns[0].advisory_source == "github_advisory"
+        assert vulns[0].advisory_url == "https://github.com/advisories/GHSA-9999-aaaa-bbbb"
+        assert vulns[0].published_at == "2024-01-01T00:00:00Z"
+        assert vulns[0].modified_at == "2024-01-02T00:00:00Z"
+
+    def test_missing_ecosystem_does_not_default_to_pypi(self):
+        data = [
+            {
+                "number": 3,
+                "security_advisory": {
+                    "ghsa_id": "GHSA-9999-aaaa-bbbb",
+                    "summary": "t",
+                    "severity": "high",
+                },
+                "security_vulnerability": {
+                    "package": {"name": "left-pad"},
+                    "vulnerable_version_range": "< 2.0",
+                },
+            }
+        ]
+        vulns = DependabotParser().parse(data)
+        assert vulns[0].ecosystem == ""
 
 
 class TestSnykEdgeCases:
@@ -312,11 +366,32 @@ class TestTrivyParser:
         vulns = TrivyParser().parse(data)
         assert vulns == []
 
+    def test_missing_type_does_not_default_to_pypi(self):
+        data = {
+            "Results": [
+                {
+                    "Target": "package-lock.json",
+                    "Vulnerabilities": [
+                        {
+                            "VulnerabilityID": "CVE-1",
+                            "PkgName": "left-pad",
+                            "InstalledVersion": "1.0.0",
+                            "Severity": "HIGH",
+                            "Title": "t",
+                        }
+                    ],
+                }
+            ]
+        }
+        vulns = TrivyParser().parse(data)
+        assert vulns[0].ecosystem == ""
+
     def test_extracts_dependency_chain_from_trivy_path(self):
         data = {
             "Results": [
                 {
                     "Target": "poetry.lock",
+                    "Type": "python-pkg",
                     "Vulnerabilities": [
                         {
                             "VulnerabilityID": "CVE-1",
@@ -325,6 +400,8 @@ class TestTrivyParser:
                             "Severity": "HIGH",
                             "Title": "t",
                             "DependencyPath": ["requests@2.31.0", "urllib3@1.26.18"],
+                            "CweIDs": ["CWE-918"],
+                            "PrimaryURL": "https://avd.aquasec.com/nvd/cve-1",
                         }
                     ],
                 }
@@ -333,6 +410,10 @@ class TestTrivyParser:
         vulns = TrivyParser().parse(data)
         assert vulns[0].report_dependency_kind == "transitive"
         assert vulns[0].report_dependency_chain == ("requests", "urllib3")
+        assert vulns[0].ecosystem == "pypi"
+        assert vulns[0].cwes == ("CWE-918",)
+        assert vulns[0].advisory_source == "trivy"
+        assert vulns[0].advisory_url == "https://avd.aquasec.com/nvd/cve-1"
 
 
 class TestPipAuditParser:
@@ -355,6 +436,10 @@ class TestPipAuditParser:
         assert "PYSEC-2023-74" in ids
         assert "PYSEC-2023-135" in ids
         assert "PYSEC-2022-249" in ids
+        requests_vuln = next(v for v in vulns if v.id == "PYSEC-2023-74")
+        assert requests_vuln.aliases == ("CVE-2023-32681",)
+        assert requests_vuln.ecosystem == "pypi"
+        assert requests_vuln.advisory_source == "pip-audit"
 
     def test_skips_deps_without_vulns(self, pip_audit_path):
         data = json.loads(pip_audit_path.read_text())

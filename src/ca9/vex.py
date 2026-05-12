@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TextIO
 
 from ca9 import __version__
+from ca9.advisory import package_purl
 from ca9.models import PolicyIgnoredResult, Report, Verdict, VerdictResult
 
 _VEX_STATUS = {
@@ -76,12 +77,12 @@ def _build_statement(
     vuln = result.vulnerability
     status = _VEX_STATUS[result.verdict]
 
-    purl = f"pkg:pypi/{vuln.package_name.lower()}@{vuln.package_version}"
+    purl = package_purl(vuln.package_name, vuln.package_version, vuln.ecosystem)
 
     statement: dict = {
         "vulnerability": {
             "name": vuln.id,
-            "@id": f"https://osv.dev/vulnerability/{vuln.id}",
+            "@id": vuln.advisory_url or f"https://osv.dev/vulnerability/{vuln.id}",
         },
         "products": [{"@id": purl, "identifiers": {"purl": purl}}],
         "status": status,
@@ -100,6 +101,18 @@ def _build_statement(
         "verdict": result.verdict.value,
         "confidence_score": result.confidence_score,
         "reason": result.reason,
+        "advisory": {
+            "ecosystem": vuln.ecosystem,
+            "aliases": list(vuln.aliases),
+            "cwes": list(vuln.cwes),
+            "cpes": list(vuln.cpes),
+            "source": vuln.advisory_source,
+            "url": vuln.advisory_url,
+            "published_at": vuln.published_at,
+            "modified_at": vuln.modified_at,
+            "fetched_at": vuln.fetched_at,
+            "cache_stale": vuln.cache_stale,
+        },
     }
 
     if result.original_verdict:

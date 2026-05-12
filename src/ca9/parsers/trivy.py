@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ca9.advisory import extract_cpes, extract_cwes, normalize_ecosystem
 from ca9.models import Vulnerability, finding_key
 from ca9.parsers.base import normalize_dependency_chain, parse_package_ref
 
@@ -62,6 +63,7 @@ class TrivyParser:
             if not isinstance(result, dict):
                 continue
             target = result.get("Target", "")
+            ecosystem = normalize_ecosystem(result.get("Type", ""))
             for v in result.get("Vulnerabilities", []):
                 if not isinstance(v, dict):
                     continue
@@ -95,6 +97,16 @@ class TrivyParser:
                         severity=v.get("Severity", "unknown").lower(),
                         title=v.get("Title", ""),
                         description=v.get("Description", ""),
+                        ecosystem=ecosystem,
+                        cwes=extract_cwes(v),
+                        cpes=extract_cpes(v),
+                        advisory_source="trivy",
+                        advisory_url=v.get("PrimaryURL", ""),
+                        published_at=v.get("PublishedDate"),
+                        modified_at=v.get("LastModifiedDate"),
+                        references=tuple(
+                            ref for ref in v.get("References", []) if isinstance(ref, str)
+                        ),
                         report_dependency_kind=report_dependency_kind,
                         report_dependency_chain=report_dependency_chain,
                     )
