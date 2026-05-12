@@ -142,6 +142,19 @@ class TestResolveVulnIntel:
         assert any(t.fqname == "requests.get" for t in result.api_targets)
         assert result.source == "rulepack"
 
+    def test_match_by_advisory_alias(self):
+        vuln = Vulnerability(
+            id="GHSA-9wx4-h78v-vm56",
+            aliases=("CVE-2023-32681",),
+            package_name="requests",
+            package_version="2.25.0",
+            severity="medium",
+            title="Something unrelated to keywords",
+        )
+        result = resolve_vuln_intel(vuln)
+        assert len(result.matched_rules) >= 1
+        assert any(t.fqname == "requests.get" for t in result.api_targets)
+
     def test_match_by_keyword(self):
         vuln = Vulnerability(
             id="UNKNOWN-001",

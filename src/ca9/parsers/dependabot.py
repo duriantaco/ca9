@@ -2,7 +2,22 @@ from __future__ import annotations
 
 from typing import Any
 
+from ca9.advisory import extract_cwes, normalize_advisory_aliases, normalize_ecosystem
 from ca9.models import Vulnerability, finding_key
+
+
+def _github_identifier_values(advisory: dict) -> list[str]:
+    values: list[str] = []
+    for item in advisory.get("identifiers", []):
+        if isinstance(item, dict):
+            value = item.get("value")
+            if isinstance(value, str) and value:
+                values.append(value)
+    for key in ("ghsa_id", "cve_id"):
+        value = advisory.get(key)
+        if isinstance(value, str) and value:
+            values.append(value)
+    return values
 
 
 class DependabotParser:
@@ -31,6 +46,7 @@ class DependabotParser:
             )
             pkg_name = pkg.get("name", "")
             pkg_version = sec_vuln.get("vulnerable_version_range", "")
+            ecosystem = normalize_ecosystem(pkg.get("ecosystem", ""))
             relationship = dep.get("relationship")
             if relationship == "indirect":
                 relationship = "transitive"
@@ -55,6 +71,15 @@ class DependabotParser:
                     severity=advisory.get("severity", "unknown"),
                     title=advisory.get("summary", ""),
                     description=advisory.get("description", ""),
+                    ecosystem=ecosystem,
+                    aliases=normalize_advisory_aliases(
+                        vuln_id, _github_identifier_values(advisory)
+                    ),
+                    cwes=extract_cwes(advisory),
+                    advisory_source="github_advisory",
+                    advisory_url=advisory.get("html_url", "") or advisory.get("url", ""),
+                    published_at=advisory.get("published_at"),
+                    modified_at=advisory.get("updated_at"),
                     report_dependency_kind=relationship,
                     report_dependency_chain=report_dependency_chain,
                 )

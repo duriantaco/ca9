@@ -1,11 +1,11 @@
 ---
-title: Open Source Python CVE Reachability Analysis
-description: ca9 is an open source Python CVE reachability analysis tool for reducing false-positive SCA alerts from Snyk, Dependabot, Trivy, pip-audit, and OSV.
+title: Evidence-Backed Python CVE Triage
+description: ca9 is an open source Python CVE reachability and evidence layer for triaging SCA alerts from Snyk, Dependabot, Trivy, pip-audit, and OSV.
 ---
 
 # ca9
 
-**Open source Python CVE reachability analysis to cut SCA noise.**
+**Evidence-backed Python CVE triage to cut SCA noise.**
 
 <p align="center">
   <img src="assets/ca9.png" alt="ca9 - Python CVE reachability analysis" width="400">
@@ -18,7 +18,7 @@ description: ca9 is an open source Python CVE reachability analysis tool for red
   <img src="https://img.shields.io/badge/Skylos-A%2B%20%2899%29-brightgreen" alt="Skylos A+ (99)">
 </p>
 
-SCA tools such as Snyk, Dependabot, Trivy, and pip-audit report vulnerable packages in your dependency tree. **ca9** adds local reachability evidence so Python teams can separate reachable CVEs from dependency noise before deciding what to patch, suppress, or review.
+SCA tools such as Snyk, Dependabot, Trivy, pip-audit, and OSV report vulnerable packages in your dependency tree. **ca9** adds local reachability evidence and advisory metadata so Python teams can decide what to fix, suppress, or investigate.
 
 ## What ca9 checks
 
@@ -28,12 +28,13 @@ ca9 combines conservative static and runtime signals for each vulnerability:
 2. **Dependency inventory** - scans declared dependencies, installed packages, and transitive relationships.
 3. **Coverage evidence** - reads `coverage.py` JSON to see whether vulnerable package code or known API call sites executed in tests.
 4. **Affected component extraction** - maps CVE metadata, advisories, commits, and curated rules to specific modules where possible.
-5. **Context enrichment** - can add confidence scores, OpenTelemetry production traces, EPSS/KEV threat intelligence, AI capability blast radius, and exploit path traces.
+5. **Advisory metadata** - preserves aliases, CWE/CPE IDs, source URLs, timestamps, and cache freshness where inputs provide them.
+6. **Context enrichment** - can add confidence scores, OpenTelemetry production traces, EPSS/KEV threat intelligence, AI capability blast radius, and exploit path traces.
 
 ## Key features
 
 - **Direct OSV scanning** with `ca9 scan`, so you can analyze installed or declared Python packages without a separate SCA report.
-- **SCA report ingestion** for Snyk, Dependabot, Trivy, and pip-audit JSON.
+- **SCA report parsing** for Snyk, Dependabot, Trivy, and pip-audit JSON.
 - **CI-friendly outputs** including table, JSON, SARIF, OpenVEX, Markdown, HTML, remediation plans, and machine-readable action plans.
 - **SBOM enrichment** for CycloneDX and SPDX documents.
 - **MCP server** for running reachability checks from LLM-powered tools.

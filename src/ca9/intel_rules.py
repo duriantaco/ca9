@@ -5,6 +5,7 @@ from pathlib import Path
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 
+from ca9.advisory import advisory_ids_for_matching, normalize_advisory_id
 from ca9.models import ApiTarget, Vulnerability
 
 
@@ -88,7 +89,11 @@ def load_rule_from_dict(data: dict) -> list[VulnIntelRule]:
         if not rule_id:
             continue
 
-        advisory_ids = frozenset(raw.get("advisory_ids", []))
+        advisory_ids = frozenset(
+            value
+            for value in (normalize_advisory_id(v) for v in raw.get("advisory_ids", []))
+            if value
+        )
         applies_to = raw.get("applies_to", {})
         version_ranges = applies_to.get("version_ranges", [])
         version_specifiers = _parse_version_specifiers(version_ranges)
@@ -174,9 +179,10 @@ def resolve_vuln_intel(vuln: Vulnerability) -> VulnIntelResolution:
         return VulnIntelResolution()
 
     matched: list[VulnIntelRule] = []
+    vuln_advisory_ids = advisory_ids_for_matching(vuln)
 
     for rule in candidates:
-        if rule.advisory_ids and vuln.id in rule.advisory_ids:
+        if rule.advisory_ids and vuln_advisory_ids.intersection(rule.advisory_ids):
             matched.append(rule)
             continue
 

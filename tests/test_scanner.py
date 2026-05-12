@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -52,8 +54,11 @@ _VULN_DETAILS = {
     "PYSEC-2023-001": {
         "id": "PYSEC-2023-001",
         "summary": "Remote code execution in example-pkg",
+        "aliases": ["CVE-2023-0001"],
         "severity": [{"type": "CVSS_V3", "score": "9.8"}],
-        "database_specific": {"severity": "CRITICAL"},
+        "database_specific": {"severity": "CRITICAL", "cwe_ids": ["CWE-94"]},
+        "published": "2023-01-01T00:00:00Z",
+        "modified": "2023-01-02T00:00:00Z",
     },
     "PYSEC-2023-002": {
         "id": "PYSEC-2023-002",
@@ -85,6 +90,14 @@ class TestQueryOsvBatch:
         assert vulns[0].package_version == "1.0.0"
         assert vulns[0].severity == "critical"
         assert "Remote code execution" in vulns[0].title
+        assert vulns[0].aliases == ("CVE-2023-0001",)
+        assert vulns[0].cwes == ("CWE-94",)
+        assert vulns[0].advisory_source == "osv.dev"
+        assert vulns[0].advisory_url == "https://osv.dev/vulnerability/PYSEC-2023-001"
+        assert vulns[0].published_at == "2023-01-01T00:00:00Z"
+        assert vulns[0].modified_at == "2023-01-02T00:00:00Z"
+        assert vulns[0].fetched_at is not None
+        assert vulns[0].cache_stale is False
 
     @patch("ca9.scanner._fetch_vuln_details")
     @patch("ca9.scanner.urllib.request.urlopen")
@@ -280,6 +293,7 @@ class TestOfflineMode:
 
         vuln_data = {
             "id": "PYSEC-2023-TEST",
+            "aliases": ["CVE-2023-9999"],
             "summary": "Test vuln in requests",
             "details": "A test vulnerability",
             "affected": [
@@ -306,6 +320,36 @@ class TestOfflineMode:
         assert vulns[0].package_name == "requests"
         assert vulns[0].package_version == "2.19.1"
         assert vulns[0].severity == "high"
+        assert vulns[0].aliases == ("CVE-2023-9999",)
+        assert vulns[0].fetched_at is not None
+        assert vulns[0].cache_stale is False
+
+    def test_offline_returns_stale_cached_vulns_with_freshness_flag(self, tmp_path, monkeypatch):
+        from ca9 import scanner
+
+        cache_dir = tmp_path / "osv_cache"
+        cache_dir.mkdir()
+        monkeypatch.setattr(scanner, "CACHE_DIR", cache_dir)
+
+        vuln_data = {
+            "id": "PYSEC-2023-STALE",
+            "summary": "Stale cached vuln in requests",
+            "affected": [
+                {"package": {"ecosystem": "PyPI", "name": "requests"}},
+            ],
+        }
+        cache_file = cache_dir / "PYSEC-2023-STALE.json"
+        cache_file.write_text(json.dumps(vuln_data))
+        old_time = time.time() - scanner.CACHE_TTL_SECONDS - 60
+
+        os.utime(cache_file, (old_time, old_time))
+
+        vulns = scanner._query_from_cache_only([("requests", "2.19.1")])
+
+        assert len(vulns) == 1
+        assert vulns[0].id == "PYSEC-2023-STALE"
+        assert vulns[0].cache_stale is True
+        assert vulns[0].fetched_at is not None
 
     def test_offline_skips_unrelated_packages(self, tmp_path, monkeypatch):
         from ca9 import scanner

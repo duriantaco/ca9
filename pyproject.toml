@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ca9"
 version = "0.2.0"
-description = "Open source Python CVE reachability analysis for reducing false-positive SCA alerts"
+description = "Open source Python CVE reachability and evidence-backed SCA triage"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MPL-2.0"

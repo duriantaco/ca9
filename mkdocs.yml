@@ -1,5 +1,5 @@
 site_name: ca9
-site_description: Open source Python CVE reachability analysis for Snyk, Dependabot, Trivy, pip-audit, OSV, SARIF, and OpenVEX workflows
+site_description: Open source Python CVE reachability and evidence-backed SCA triage for Snyk, Dependabot, Trivy, pip-audit, OSV, SARIF, and OpenVEX workflows
 site_url: https://duriantaco.github.io/ca9/
 site_author: duriantaco
 repo_url: https://github.com/duriantaco/ca9

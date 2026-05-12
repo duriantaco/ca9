@@ -12,6 +12,7 @@ from pathlib import Path
 
 from packaging.utils import canonicalize_name
 
+from ca9.advisory import attach_cache_freshness, metadata_from_osv, normalize_ecosystem
 from ca9.analysis.ast_scanner import discover_declared_dependency_inventory
 from ca9.models import VersionRange, Vulnerability, finding_key
 
@@ -278,15 +279,22 @@ def _cache_path(vuln_id: str) -> Path:
     return CACHE_DIR / f"{safe_id}.json"
 
 
-def _read_cache(vuln_id: str) -> dict | None:
+def _read_cache(vuln_id: str, *, allow_stale: bool = False) -> dict | None:
     path = _cache_path(vuln_id)
     if not path.exists():
         return None
     try:
         stat = path.stat()
-        if time.time() - stat.st_mtime > CACHE_TTL_SECONDS:
+        is_stale = time.time() - stat.st_mtime > CACHE_TTL_SECONDS
+        if is_stale and not allow_stale:
             return None
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
+        return attach_cache_freshness(
+            data,
+            source="osv.dev",
+            ttl_seconds=CACHE_TTL_SECONDS,
+            path=path,
+        )
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -311,7 +319,7 @@ def _fetch_vuln_details(vuln_id: str, offline: bool = False) -> dict:
         return cached
 
     if offline:
-        return {}
+        return _read_cache(vuln_id, allow_stale=True) or {}
 
     url = f"{OSV_VULN_URL}/{vuln_id}"
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
@@ -321,12 +329,16 @@ def _fetch_vuln_details(vuln_id: str, offline: bool = False) -> dict:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
             _write_cache(vuln_id, data)
-            return data
+            return attach_cache_freshness(
+                data,
+                source="osv.dev",
+                ttl_seconds=CACHE_TTL_SECONDS,
+            )
         except Exception as exc:
             if attempt < MAX_RETRIES - 1 and _is_retryable(exc):
                 time.sleep(RETRY_BACKOFF_BASE * (2**attempt))
                 continue
-            return {}
+            return _read_cache(vuln_id, allow_stale=True) or {}
 
     return {}
 
@@ -417,29 +429,26 @@ def query_osv_batch(
     vulns: list[Vulnerability] = []
     for vuln_id, pkg_name, pkg_version in vuln_refs:
         details = details_map.get(vuln_id, {})
+        if details and "_ca9_cache" not in details:
+            details = attach_cache_freshness(
+                details,
+                source="osv.dev",
+                ttl_seconds=CACHE_TTL_SECONDS,
+            )
         if details:
             severity = _extract_severity(details)
+            title = details.get("summary", "") or details.get("details", "No description")[:120]
+            description = details.get("details", "")
+            affected_ranges = _extract_version_ranges(details, pkg_name)
+            references = _extract_references(details)
+            metadata = metadata_from_osv(details, vuln_id)
         else:
             severity = "unknown"
-        if details:
-            title = details.get("summary", "") or details.get("details", "No description")[:120]
-        else:
             title = vuln_id
-
-        if details:
-            description = details.get("details", "")
-        else:
             description = ""
-
-        if details:
-            affected_ranges = _extract_version_ranges(details, pkg_name)
-        else:
             affected_ranges = ()
-
-        if details:
-            references = _extract_references(details)
-        else:
             references = ()
+            metadata = metadata_from_osv({}, vuln_id)
 
         vulns.append(
             Vulnerability(
@@ -449,6 +458,16 @@ def query_osv_batch(
                 severity=severity,
                 title=title,
                 description=description,
+                ecosystem="pypi",
+                aliases=metadata.aliases,
+                cwes=metadata.cwes,
+                cpes=metadata.cpes,
+                advisory_source=metadata.source,
+                advisory_url=metadata.source_url,
+                published_at=metadata.published_at,
+                modified_at=metadata.modified_at,
+                fetched_at=metadata.fetched_at,
+                cache_stale=metadata.cache_stale,
                 affected_ranges=affected_ranges,
                 references=references,
             )
@@ -466,10 +485,13 @@ def _query_from_cache_only(packages: list[tuple[str, str]]) -> list[Vulnerabilit
         for path in CACHE_DIR.iterdir():
             if path.suffix != ".json":
                 continue
-            if time.time() - path.stat().st_mtime > CACHE_TTL_SECONDS:
-                continue
             try:
-                data = json.loads(path.read_text())
+                data = attach_cache_freshness(
+                    json.loads(path.read_text()),
+                    source="osv.dev",
+                    ttl_seconds=CACHE_TTL_SECONDS,
+                    path=path,
+                )
                 vuln_id = data.get("id", "")
                 if vuln_id:
                     cached_vulns[vuln_id] = data
@@ -499,6 +521,7 @@ def _query_from_cache_only(packages: list[tuple[str, str]]) -> list[Vulnerabilit
             if key in seen_keys:
                 continue
             seen_keys.add(key)
+            metadata = metadata_from_osv(details, vuln_id)
 
             vulns.append(
                 Vulnerability(
@@ -508,6 +531,16 @@ def _query_from_cache_only(packages: list[tuple[str, str]]) -> list[Vulnerabilit
                     severity=_extract_severity(details),
                     title=details.get("summary", "") or vuln_id,
                     description=details.get("details", ""),
+                    ecosystem=normalize_ecosystem("pypi"),
+                    aliases=metadata.aliases,
+                    cwes=metadata.cwes,
+                    cpes=metadata.cpes,
+                    advisory_source=metadata.source,
+                    advisory_url=metadata.source_url,
+                    published_at=metadata.published_at,
+                    modified_at=metadata.modified_at,
+                    fetched_at=metadata.fetched_at,
+                    cache_stale=metadata.cache_stale,
                     affected_ranges=_extract_version_ranges(details, pkg_name),
                     references=_extract_references(details),
                 )

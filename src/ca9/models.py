@@ -40,6 +40,16 @@ class Vulnerability:
     references: tuple[str, ...] = ()
     report_dependency_kind: str | None = None
     report_dependency_chain: tuple[str, ...] = ()
+    ecosystem: str = "pypi"
+    aliases: tuple[str, ...] = ()
+    cwes: tuple[str, ...] = ()
+    cpes: tuple[str, ...] = ()
+    advisory_source: str = ""
+    advisory_url: str = ""
+    published_at: str | None = None
+    modified_at: str | None = None
+    fetched_at: str | None = None
+    cache_stale: bool | None = None
 
 
 @dataclass(frozen=True)

@@ -1,7 +1,6 @@
 """Tests for the Acme weather dashboard."""
 
-import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from app import app

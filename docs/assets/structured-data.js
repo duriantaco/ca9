@@ -11,7 +11,7 @@
         "@id": "https://duriantaco.github.io/ca9/#website",
         "name": "ca9",
         "url": "https://duriantaco.github.io/ca9/",
-        "description": "Open source Python CVE reachability analysis documentation."
+        "description": "Open source Python CVE reachability and evidence-backed SCA triage documentation."
       },
       {
         "@type": "SoftwareApplication",
@@ -20,7 +20,7 @@
         "applicationCategory": "SecurityApplication",
         "operatingSystem": "Python 3.10+",
         "softwareVersion": "0.2.0",
-        "description": "Open source Python CVE reachability analysis for reducing false-positive SCA alerts.",
+        "description": "Open source Python CVE reachability and evidence-backed SCA triage for reducing vulnerability noise.",
         "url": "https://duriantaco.github.io/ca9/",
         "codeRepository": "https://github.com/duriantaco/ca9",
         "license": "https://mozilla.org/MPL/2.0/",

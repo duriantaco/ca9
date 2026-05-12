@@ -25,6 +25,7 @@ graph LR
 
 ```
 src/ca9/
+├── advisory.py               # Advisory aliases, CWE/CPE extraction, purl helpers, cache freshness
 ├── models.py                 # Dataclasses: Vulnerability, Evidence, Verdict, Report
 ├── engine.py                 # Verdict engine and evidence orchestration
 ├── scanner.py                # OSV.dev API client and dependency inventory resolution
@@ -83,7 +84,7 @@ Parsers implement the `SCAParser` protocol. New SCA formats can be added without
 ## Data flow
 
 1. **Input** - An SCA report, OSV scan inventory, or SBOM.
-2. **Normalization** - Parsers convert tool-specific findings into `Vulnerability` objects.
+2. **Normalization** - Parsers convert tool-specific findings into `Vulnerability` objects and preserve advisory identity metadata such as ecosystem, aliases, CWE/CPE IDs, source URLs, published/modified timestamps, and cache freshness when available.
 3. **Analysis preparation**:
    - AST scanner collects imports from the repository.
    - Dependency inventory maps declared and transitive packages.

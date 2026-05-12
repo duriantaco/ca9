@@ -1,7 +1,7 @@
-from flask import Flask, jsonify, request
+import colorama
 import requests
 import yaml
-import colorama
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
