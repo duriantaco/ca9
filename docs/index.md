@@ -1,6 +1,6 @@
 ---
-title: Evidence-Backed Python CVE Triage
-description: ca9 is an open source Python CVE reachability and evidence layer for triaging SCA alerts from Snyk, Dependabot, Trivy, pip-audit, and OSV.
+title: ca9 | Python CVE Reachability Analysis for SCA Triage
+description: Open source Python CVE reachability analysis for evidence-backed SCA triage. Parse Snyk, Dependabot, Trivy, and pip-audit reports or query OSV; emit JSON, SARIF, and OpenVEX evidence.
 ---
 
 # ca9
