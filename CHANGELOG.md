@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Advisory metadata normalization now preserves aliases, CWE/CPE IDs, advisory source URLs, published/modified timestamps, OSV cache freshness, and package URLs across JSON, SARIF, and OpenVEX outputs where input data provides them.
+- GitHub Pages documentation deployment workflow with generated sitemap and crawler metadata.
+
 ### Changed
 
 - Policy-ignored findings from accepted risks and baselines now remain visible in JSON `ignored_results`, Markdown/HTML ignored-finding sections, SARIF suppressed results, and OpenVEX `ca9.policy_ignored` metadata while staying excluded from exit-code decisions.
+- README and docs now describe the current repo-first dependency inventory behavior, current model dataclasses, and API reachability verdict semantics.
 
 ## [0.2.0] - 2026-04-26
 
