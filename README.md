@@ -51,7 +51,7 @@ Total: 61  |  Reachable: 25  |  Unreachable: 36  |  Inconclusive: 0
 
 ## How it works
 
-ca9 combines repository evidence with advisory metadata to prove whether vulnerable code is reachable:
+ca9 combines repository evidence with advisory metadata to determine whether vulnerable code is reachable:
 
 **1. Static analysis (AST import tracing)** — Parses every Python file in your repo and traces `import` statements. If a vulnerable package is never imported, it's unreachable.
 
@@ -63,12 +63,13 @@ ca9 combines repository evidence with advisory metadata to prove whether vulnera
 
 ```
 For each CVE:
-  Is the package imported?
+  Is the affected version installed or declared?
   ├── NO  → UNREACHABLE (static)
-  └── YES → Was vulnerable code executed in tests?
-      ├── NO  → UNREACHABLE (dynamic)
-      ├── YES → REACHABLE
-      └── No coverage data → INCONCLUSIVE
+  └── YES → Is the package, affected submodule, or known vulnerable API used?
+      ├── NO, with enough graph/import evidence → UNREACHABLE (static)
+      ├── YES, and runtime/coverage confirms execution → REACHABLE
+      ├── YES, but coverage shows no affected execution → UNREACHABLE (dynamic)
+      └── Not enough evidence → INCONCLUSIVE
 ```
 
 ca9 is **conservative** — it only marks something unreachable when it can prove it. Every verdict comes with an evidence trail and a confidence score so you can see exactly why ca9 reached its conclusion.
@@ -124,14 +125,14 @@ Django alone brought 21 CVEs that were pure noise.
 
 ## Quick start
 
-### Scan installed packages (no SCA tool needed)
+### Scan declared or installed packages (no SCA tool needed)
 
 ```bash
 pip install ca9[cli]
 ca9 scan --repo .
 ```
 
-This queries [OSV.dev](https://osv.dev) for vulnerabilities in your installed packages. Works with **any** Python project. No Snyk, no Dependabot, no config files.
+This resolves dependency inventory from the target repository, queries [OSV.dev](https://osv.dev), and falls back to the current Python environment when no resolvable manifest is available. No Snyk, no Dependabot, no config files.
 
 ### Add dynamic analysis for better results
 
@@ -161,7 +162,7 @@ ca9 check pip-audit.json --repo .
 
 | Verdict | What it means | What to do |
 |---------|---------------|------------|
-| `REACHABLE` | Vulnerable code is imported and was executed in tests | **Fix this** |
+| `REACHABLE` | Evidence shows the vulnerable package, component, or known API is reachable | **Fix this** |
 | `UNREACHABLE (static)` | Package is never imported — not even transitively | Suppress with confidence |
 | `UNREACHABLE (dynamic)` | Package is imported but vulnerable code was never executed | Likely safe — monitor |
 | `INCONCLUSIVE` | Imported but no coverage data to prove execution | Add coverage or review manually |
@@ -193,7 +194,7 @@ Confidence scoring is **verdict-directional** — evidence that supports the ver
 ## CLI reference
 
 ```
-ca9 scan [OPTIONS]              Scan installed packages via OSV.dev
+ca9 scan [OPTIONS]              Scan declared or installed packages via OSV.dev
 ca9 check SCA_REPORT [OPTIONS]  Analyze a Snyk/Dependabot/Trivy/pip-audit report
 
 Common options:
@@ -286,7 +287,7 @@ Available tools:
 | Tool | What it does |
 |------|-------------|
 | `check_reachability` | Analyze an SCA report (Snyk, Dependabot, Trivy, pip-audit) |
-| `scan_dependencies` | Scan installed packages via OSV.dev |
+| `scan_dependencies` | Scan declared or installed packages via OSV.dev |
 | `check_coverage_quality` | Assess how reliable your coverage data is |
 | `explain_verdict` | Deep-dive a specific CVE's verdict with full evidence |
 | `generate_vex` | Generate OpenVEX exploitability statements |

@@ -2,7 +2,7 @@
 
 This guide walks you through your first ca9 analysis in under 5 minutes.
 
-## Option A: Scan installed packages (zero setup)
+## Option A: Scan repository dependencies (zero setup)
 
 The fastest way to try ca9 — no SCA report needed:
 
@@ -10,7 +10,7 @@ The fastest way to try ca9 — no SCA report needed:
 ca9 scan
 ```
 
-This queries [OSV.dev](https://osv.dev) for known vulnerabilities in your currently installed packages and checks reachability via static analysis.
+This resolves dependency inventory from the current repository, queries [OSV.dev](https://osv.dev) for known vulnerabilities, and checks reachability via static analysis. If ca9 cannot resolve versions from repository manifests, it falls back to packages installed in the current Python environment.
 
 ### Add dynamic analysis
 
