@@ -25,7 +25,7 @@ Supported inventory sources include `requirements*.txt`, nested `-r` requirement
 def scan_installed() -> list[Vulnerability]
 ```
 
-Scans all installed packages for known vulnerabilities via OSV.dev.
+Scans all packages installed in the current Python environment for known vulnerabilities via OSV.dev.
 
 Combines `get_installed_packages()` and `query_osv_batch()` into a single call.
 
@@ -65,7 +65,7 @@ Queries the [OSV.dev batch API](https://osv.dev/docs/) for vulnerabilities affec
 | `refresh_cache` | `bool` | Clear cached OSV details before querying |
 | `max_workers` | `int` | Concurrent OSV detail fetches |
 
-**Returns:** List of `Vulnerability` objects with full details (severity, version ranges, references).
+**Returns:** List of `Vulnerability` objects with severity, version ranges, references, advisory aliases, CWE/CPE metadata where OSV provides it, published/modified timestamps, and cache freshness metadata.
 
 **Behavior:**
 
@@ -87,9 +87,10 @@ Returns package inventory and warning metadata for the target repository.
 
 Extracts severity from OSV vulnerability data. Priority:
 
-1. `database_specific.github_reviewed_at` → uses `database_specific.severity`
+1. `database_specific.severity`
 2. CVSS v3.x vector in `severity` array → computes score
-3. Falls back to `"unknown"`
+3. `ecosystem_specific.severity` from affected entries
+4. Falls back to `"unknown"`
 
 ### `_compute_cvss3_base_score(vector) -> float | None`
 

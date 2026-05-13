@@ -32,7 +32,7 @@ flowchart TD
 
 | Verdict | Meaning | Action |
 |---|---|---|
-| **REACHABLE** | Vulnerable code is imported and was executed in tests | Fix this CVE |
+| **REACHABLE** | Evidence shows the vulnerable package, affected component, or known vulnerable API is reachable | Fix this CVE |
 | **UNREACHABLE (static)** | Vulnerable code is never imported | Safe to ignore |
 | **UNREACHABLE (dynamic)** | Code is imported but never executed in tests | Likely safe; monitor |
 | **INCONCLUSIVE** | Cannot determine without more data | Provide coverage data |
@@ -49,6 +49,8 @@ report: Report = analyze(
     coverage_path=Path("coverage.json"),  # optional
 )
 ```
+
+The diagram shows the base package/submodule flow. Curated vulnerable API rules can also mark a finding reachable when first-party code calls a known affected API, and proof standards can downgrade weak suppressions to `INCONCLUSIVE`.
 
 The `analyze()` function:
 

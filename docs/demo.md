@@ -35,13 +35,13 @@ Or run manually:
 # Activate the demo venv
 source .venv/bin/activate
 
-# Scan installed packages with coverage
+# Scan the demo dependency inventory with coverage
 ca9 scan --repo . --coverage coverage.json --verbose
 ```
 
 ## Expected results
 
-The demo typically finds ~61 CVEs across all installed packages:
+The demo typically finds ~61 CVEs across the pinned demo dependency inventory:
 
 - **~36 unreachable** (59%) — packages not imported or code not executed
 - **~25 reachable** — vulnerable code paths that are actually used
