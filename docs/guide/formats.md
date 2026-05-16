@@ -9,6 +9,7 @@ ca9 supports two kinds of input:
 
 - Existing SCA reports from tools such as Snyk, Dependabot, Trivy, and pip-audit.
 - Repository or environment dependency inventory scanned directly against OSV.dev with `ca9 scan`.
+- Package inventory from manifests and `fyn.lock` with `ca9 inventory` and `ca9 vet`.
 
 It can also emit multiple output formats for humans, CI systems, code scanning, VEX workflows, and SBOM enrichment.
 
@@ -81,6 +82,19 @@ ca9 scan --repo . --refresh-cache
 ca9 scan --repo . --max-osv-workers 16
 ```
 
+## Input: Package inventory and fyn.lock
+
+`ca9 inventory` and `ca9 vet` use the normalized inventory model. When `fyn.lock` is
+present, ca9 reads it natively and extracts resolved packages, dependency edges, artifact
+URLs, artifact hashes, source registries, groups, and markers.
+
+```bash
+ca9 inventory --repo . -f json
+ca9 vet --repo . -f json
+```
+
+Without `fyn.lock`, ca9 falls back to native manifest readers.
+
 ## Output formats
 
 ### Table
@@ -104,6 +118,10 @@ Machine-readable report with summary, verdicts, evidence, warnings, confidence s
 ```bash
 ca9 check snyk-report.json --repo . -f json -o ca9-report.json
 ```
+
+`ca9 inventory -f json` emits `ca9.inventory.v1`. `ca9 vet -f json` emits
+`ca9.vet.v1`, including inventory summary, supply-chain findings, policy decisions,
+warnings, and artifact scan counts.
 
 Each result also includes an `advisory` object with normalized identity metadata:
 

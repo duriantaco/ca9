@@ -1,5 +1,5 @@
 site_name: ca9
-site_description: Open source Python CVE reachability analysis for evidence-backed SCA triage. Parse Snyk, Dependabot, Trivy, and pip-audit reports or query OSV; emit JSON, SARIF, and OpenVEX evidence.
+site_description: Open source Python package security and evidence-backed SCA triage. Analyze reachable CVEs, package inventory, supply-chain risk, malicious package behavior, and dependency policy in local CI.
 site_url: https://duriantaco.github.io/ca9/
 site_author: duriantaco
 repo_url: https://github.com/duriantaco/ca9
@@ -67,6 +67,7 @@ nav:
       - Quick Start: getting-started/quickstart.md
   - User Guide:
       - CLI Reference: guide/cli.md
+      - Supply-Chain Vetting: guide/supply-chain.md
       - Supported Formats: guide/formats.md
       - Dynamic Analysis: guide/coverage.md
       - Proof Standards: guide/proof-standards.md

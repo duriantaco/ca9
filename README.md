@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/duriantaco/ca9/main/assets/ca9.png" alt="ca9 - evidence-backed Python CVE reachability triage" width="400">
+  <img src="https://raw.githubusercontent.com/duriantaco/ca9/main/assets/ca9.png" alt="ca9 - evidence-backed Python package security" width="400">
 </p>
 
 <h1 align="center">ca9</h1>
 
-<p align="center"><strong>Evidence-backed CVE triage for Python SCA alerts.</strong></p>
+<p align="center"><strong>Local, evidence-backed security for Python packages and SCA alerts.</strong></p>
 
 <p align="center">
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
@@ -26,13 +26,25 @@ That's wasted engineering time. That's alert fatigue. That's how real vulnerabil
 
 ## What ca9 does
 
-ca9 turns CVE alerts into evidence-backed fix, suppress, or investigate decisions.
+ca9 is a local-first security layer for Python packages and open-source dependency risk.
+Today, its strongest path turns CVE alerts into evidence-backed fix, suppress, or
+investigate decisions. The newer inventory path normalizes packages, artifacts, lockfile
+evidence, and dependency edges so ca9 can grow beyond CVE-only reachability without
+making any resolver or package manager a required dependency.
 
 It takes your CVE list and answers one question per vulnerability: **is this code actually reachable from your application?**
 
 ```bash
 pip install ca9[cli]
 ca9 scan --repo . --coverage coverage.json
+```
+
+For package inventory and supply-chain evidence, ca9 can read project manifests natively
+and uses `fyn.lock` when present:
+
+```bash
+ca9 inventory --repo . -f json
+ca9 vet --repo . -f json
 ```
 
 ```
@@ -55,7 +67,7 @@ ca9 combines repository evidence with advisory metadata to determine whether vul
 
 **1. Static analysis (AST import tracing)** — Parses every Python file in your repo and traces `import` statements. If a vulnerable package is never imported, it's unreachable.
 
-**2. Dependency inventory** — Uses declared dependencies, report metadata, and local package metadata to separate direct, transitive, imported, and unused packages.
+**2. Dependency inventory** — Uses declared dependencies, report metadata, local package metadata, and `fyn.lock` when available to separate direct, transitive, imported, and unused packages.
 
 **3. Dynamic analysis (coverage.py)** — Checks whether vulnerable code was actually *executed* during your test suite. A package might be imported but the specific vulnerable function might never be called.
 
@@ -83,6 +95,7 @@ ca9 does not replace your SCA tool. It adds local, evidence-first reachability a
 | **Local analysis** | Runs in your repo/CI | Varies | Often requires source upload or hosted project import |
 | **Direct OSV scan** | Yes — `ca9 scan` queries OSV.dev directly | Not always | Varies |
 | **SCA report parsing** | Snyk, Dependabot, Trivy, pip-audit | Native to each tool | Platform-specific |
+| **Package inventory** | Native manifests plus optional `fyn.lock` artifacts and dependency edges | Varies | Varies |
 | **Static + dynamic evidence** | Imports, dependency graph, coverage, API usage | Usually package-level alerts | Varies by vendor and integration |
 | **Open outputs** | JSON, SARIF, OpenVEX, Markdown, HTML, remediation, action plan | Vendor-specific | Platform-specific |
 | **Confidence/evidence trail** | Structured evidence per verdict | Limited | Varies |
@@ -133,6 +146,74 @@ ca9 scan --repo .
 ```
 
 This resolves dependency inventory from the target repository, queries [OSV.dev](https://osv.dev), and falls back to the current Python environment when no resolvable manifest is available. No Snyk, no Dependabot, no config files.
+
+### Inspect package inventory and lockfile evidence
+
+```bash
+ca9 inventory --repo . -f json
+```
+
+When `fyn.lock` is present, ca9 reads it directly and includes package versions,
+direct/transitive dependency edges, dependency groups, markers, artifact URLs, hashes,
+upload times, and source evidence. If there is no `fyn.lock`, ca9 falls back to native
+manifest readers for `pyproject.toml`, `requirements*.txt`, `Pipfile`, `uv.lock`, and
+`poetry.lock`.
+
+### Run supply-chain risk checks
+
+```bash
+ca9 vet --repo .
+ca9 vet --repo . --malware-query
+ca9 vet --repo . --scan-artifacts
+ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.acme.internal/simple
+ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
+```
+
+`ca9 vet` evaluates the normalized package inventory for local supply-chain risk signals:
+untrusted package indexes, missing artifact hashes, missing artifact metadata, source-only
+install risk, and mutable package sources. With `--malware-query`, ca9 also queries OSV
+for known malicious-package advisories such as `MAL-*` records. Direct dependencies from
+untrusted indexes and known malicious packages are blocking findings; weaker local signals
+are warnings by default.
+
+With `--scan-artifacts`, ca9 downloads only lockfile artifacts with hashes by default,
+verifies the hash, safely unpacks wheels/sdists without executing code, and runs
+GuardDog-style static heuristics for suspicious `.pth` startup execution, install-time
+`setup.py` execution, startup customization hooks, credential/network exfiltration,
+import-time risky behavior, silent process execution, and encoded payload execution.
+
+For dependency-confusion controls, use `--internal-package` with one or more private
+package name patterns and `--private-index` for the indexes those packages are allowed to
+resolve from. For license policy, use `--deny-license`; ca9 reads wheel/sdist metadata and
+blocks denied direct dependencies while warning or investigating weaker cases.
+
+### Screenshot-ready supply-chain demo
+
+Use the local demo fixture when you need a report screenshot or a JSON artifact without
+depending on a live suspicious repository:
+
+```bash
+bash demo/supply_chain/run_demo.sh
+```
+
+The fixture generates a `fyn.lock` with local, hash-pinned wheel artifacts and then runs
+`ca9 vet` with artifact scanning, dependency-confusion policy, and denied-license policy.
+The underlying gate exits `1` because the findings are intentionally blocking; the wrapper
+still writes `demo/supply_chain/ca9-vet.json` for screenshots and CI artifact examples.
+
+```
+ca9 supply-chain report for .../demo/supply_chain/repo
+Packages: 4 | Edges: 3 | Findings: 3 | Block: 3 | Warn: 0
+Artifact scans: 3 | Skipped artifacts: 0
+
+Findings:
+  [BLOCK] dependency_confusion critical acme-internal@1.0.0
+    Possible dependency confusion for acme-internal
+  [BLOCK] python-startup-pth-exec critical startup-hook@1.0.0
+    Python startup file executes suspicious code in startup-hook
+  [BLOCK] denied_license high license-risk@1.0.0
+    Denied license for license-risk
+```
 
 ### Add dynamic analysis for better results
 
@@ -196,6 +277,8 @@ Confidence scoring is **verdict-directional** — evidence that supports the ver
 ```
 ca9 scan [OPTIONS]              Scan declared or installed packages via OSV.dev
 ca9 check SCA_REPORT [OPTIONS]  Analyze a Snyk/Dependabot/Trivy/pip-audit report
+ca9 inventory [PATH] [OPTIONS]  Show normalized package inventory
+ca9 vet [PATH] [OPTIONS]        Run package supply-chain risk checks
 
 Common options:
   -r, --repo PATH                  Path to the project repository  [default: .]
@@ -222,6 +305,21 @@ Scan-only options:
   --offline                        Use only cached OSV data, no network requests
   --refresh-cache                  Clear OSV cache before fetching
   --max-osv-workers N              Max concurrent OSV detail fetches  [default: 8]
+
+Inventory-only options:
+  -f, --format [table|json]         Output format  [default: table]
+
+Vet-only options:
+  --trusted-index URL               Trusted Python package index; repeatable
+  --private-index URL               Private index allowed for internal packages
+  --internal-package PATTERN        Internal package glob, e.g. acme-*; repeatable
+  --malware-query                   Query OSV for known malicious packages
+  --scan-artifacts                  Hash-verify, unpack, and statically inspect artifacts
+  --allow-unhashed-downloads        Allow artifact downloads without lockfile hashes
+  --max-artifact-mb N               Max artifact download size  [default: 100]
+  --deny-license ID                 Denied license identifier; repeatable
+  --require-known-license           Warn when artifact metadata has no known license
+  --offline                         Use cached OSV data only for malware query
 
 Exit codes:
   0  Clean — no reachable CVEs
@@ -261,6 +359,26 @@ Set `GITHUB_TOKEN` to avoid GitHub API rate limits when ca9 fetches commit data 
 export GITHUB_TOKEN=ghp_...
 ca9 check snyk.json --repo .
 ```
+
+### fyn integration
+
+ca9 does not require fyn. If a repository has `fyn.lock`, `ca9 inventory` parses it
+natively and treats it as high-fidelity package evidence. This gives ca9 exact resolved
+versions, direct/transitive edges, groups, markers, artifact hashes, artifact URLs, and
+source registries without shelling out to `fyn`.
+
+`ca9 vet` builds on that evidence for local supply-chain checks. For example, a direct
+dependency resolved from a non-trusted index is treated as risky, and an internal package
+matching `--internal-package` is blocked if it resolves outside the configured
+`--private-index` values.
+
+When `--scan-artifacts` is enabled, fyn's artifact URLs and hashes let ca9 verify and
+inspect resolved wheels/sdists before applying malicious-package heuristics. This path
+does not install packages or execute package code. The same artifact metadata powers
+license checks through `--deny-license` and `--require-known-license`.
+
+Future ca9 commands can use fyn as an optional provider for dependency-path and lock-diff
+context, but absence of fyn should not break scans or CI gates.
 
 ## MCP server
 
@@ -324,13 +442,18 @@ for result in report.results:
 
 ## Zero heavy dependencies
 
-ca9's core library depends only on `packaging` (PEP 440 version parsing) and the Python standard library. The `click` package is optional — only needed if you use the CLI. This means you can embed ca9 in CI pipelines, security toolchains, or other Python tools without pulling in a large dependency tree.
+ca9's core library depends on `packaging` for PEP 440/version normalization and uses the
+Python standard library for TOML parsing on Python 3.11+. On Python 3.10, `tomli` is used
+for lockfile parsing. The `click` package is optional — only needed if you use the CLI.
+This means you can embed ca9 in CI pipelines, security toolchains, or other Python tools
+without pulling in a large dependency tree.
 
 ## Limitations
 
 - Static analysis traces `import` statements and `importlib.metadata` dependency trees. Dynamic imports (`importlib.import_module`, `__import__`) are not detected.
 - Coverage quality directly impacts dynamic analysis. If your tests don't exercise a code path, ca9 can't detect it dynamically.
 - Transitive dependency resolution requires packages to be installed. Without installed deps, ca9 falls back to direct-import-only checking.
+- `fyn.lock` support currently powers inventory, the first `ca9 vet` local supply-chain checks, and optional artifact static analysis. Full attack detection still needs richer external intelligence for maintainer changes, release-age anomalies, typosquatting, provenance, and active malware analysis.
 - Python only (for now).
 
 ## Development
