@@ -82,18 +82,22 @@ ca9 scan --repo . --refresh-cache
 ca9 scan --repo . --max-osv-workers 16
 ```
 
-## Input: Package inventory and fyn.lock
+## Input: Package inventory and lockfiles
 
 `ca9 inventory` and `ca9 vet` use the normalized inventory model. When `fyn.lock` is
 present, ca9 reads it natively and extracts resolved packages, dependency edges, artifact
 URLs, artifact hashes, source registries, groups, and markers.
+
+For npm projects, ca9 also reads `package-lock.json` and `npm-shrinkwrap.json`, including
+locked package versions, scoped names, dependency edges, tarball URLs, integrity hashes,
+and registry evidence.
 
 ```bash
 ca9 inventory --repo . -f json
 ca9 vet --repo . -f json
 ```
 
-Without `fyn.lock`, ca9 falls back to native manifest readers.
+Without a high-fidelity lockfile, ca9 falls back to native Python manifest readers.
 
 ## Output formats
 

@@ -15,6 +15,7 @@ from packaging.utils import canonicalize_name
 from ca9.advisory import attach_cache_freshness, metadata_from_osv, normalize_ecosystem
 from ca9.analysis.ast_scanner import discover_declared_dependency_inventory
 from ca9.models import VersionRange, Vulnerability, finding_key
+from ca9.version import is_version_affected
 
 OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 OSV_VULN_URL = "https://api.osv.dev/v1/vulns"
@@ -233,11 +234,16 @@ def _cvss_to_level(score: float) -> str:
     return "unknown"
 
 
-def _extract_version_ranges(osv_vuln: dict, package_name: str) -> tuple[VersionRange, ...]:
+def _extract_version_ranges(
+    osv_vuln: dict,
+    package_name: str,
+    ecosystem: str = "pypi",
+) -> tuple[VersionRange, ...]:
     ranges: list[VersionRange] = []
+    normalized_ecosystem = normalize_ecosystem(ecosystem)
     for affected in osv_vuln.get("affected", []):
         pkg = affected.get("package", {})
-        if pkg.get("ecosystem", "").lower() != "pypi":
+        if normalize_ecosystem(pkg.get("ecosystem", "")) != normalized_ecosystem:
             continue
         if pkg.get("name", "").lower() != package_name.lower():
             continue
@@ -345,6 +351,7 @@ def _fetch_vuln_details(vuln_id: str, offline: bool = False) -> dict:
 
 def query_osv_batch(
     packages: list[tuple[str, str]],
+    ecosystem: str = "PyPI",
     offline: bool = False,
     refresh_cache: bool = False,
     max_workers: int = DEFAULT_MAX_WORKERS,
@@ -362,10 +369,10 @@ def query_osv_batch(
             pass
 
     if offline:
-        return _query_from_cache_only(packages)
+        return _query_from_cache_only(packages, ecosystem=ecosystem)
 
     queries = [
-        {"package": {"name": name, "ecosystem": "PyPI"}, "version": version}
+        {"package": {"name": name, "ecosystem": ecosystem}, "version": version}
         for name, version in packages
     ]
 
@@ -439,7 +446,7 @@ def query_osv_batch(
             severity = _extract_severity(details)
             title = details.get("summary", "") or details.get("details", "No description")[:120]
             description = details.get("details", "")
-            affected_ranges = _extract_version_ranges(details, pkg_name)
+            affected_ranges = _extract_version_ranges(details, pkg_name, ecosystem=ecosystem)
             references = _extract_references(details)
             metadata = metadata_from_osv(details, vuln_id)
         else:
@@ -458,7 +465,7 @@ def query_osv_batch(
                 severity=severity,
                 title=title,
                 description=description,
-                ecosystem="pypi",
+                ecosystem=normalize_ecosystem(ecosystem),
                 aliases=metadata.aliases,
                 cwes=metadata.cwes,
                 cpes=metadata.cpes,
@@ -476,7 +483,10 @@ def query_osv_batch(
     return vulns
 
 
-def _query_from_cache_only(packages: list[tuple[str, str]]) -> list[Vulnerability]:
+def _query_from_cache_only(
+    packages: list[tuple[str, str]],
+    ecosystem: str = "PyPI",
+) -> list[Vulnerability]:
     if not CACHE_DIR.exists():
         return []
 
@@ -505,16 +515,16 @@ def _query_from_cache_only(packages: list[tuple[str, str]]) -> list[Vulnerabilit
 
     vulns: list[Vulnerability] = []
     seen_keys: set[tuple[str, str, str]] = set()
+    normalized_ecosystem = normalize_ecosystem(ecosystem)
 
     for pkg_name, pkg_version in packages:
         for vuln_id, details in cached_vulns.items():
-            affected_pkgs = set()
-            for affected in details.get("affected", []):
-                pkg = affected.get("package", {})
-                if pkg.get("ecosystem", "").lower() == "pypi":
-                    affected_pkgs.add(pkg.get("name", "").lower())
-
-            if pkg_name.lower() not in affected_pkgs:
+            if not _osv_affects_package_version(
+                details,
+                package_name=pkg_name,
+                package_version=pkg_version,
+                ecosystem=normalized_ecosystem,
+            ):
                 continue
 
             key = finding_key(vuln_id, pkg_name, pkg_version)
@@ -531,7 +541,7 @@ def _query_from_cache_only(packages: list[tuple[str, str]]) -> list[Vulnerabilit
                     severity=_extract_severity(details),
                     title=details.get("summary", "") or vuln_id,
                     description=details.get("details", ""),
-                    ecosystem=normalize_ecosystem("pypi"),
+                    ecosystem=normalized_ecosystem,
                     aliases=metadata.aliases,
                     cwes=metadata.cwes,
                     cpes=metadata.cpes,
@@ -541,12 +551,54 @@ def _query_from_cache_only(packages: list[tuple[str, str]]) -> list[Vulnerabilit
                     modified_at=metadata.modified_at,
                     fetched_at=metadata.fetched_at,
                     cache_stale=metadata.cache_stale,
-                    affected_ranges=_extract_version_ranges(details, pkg_name),
+                    affected_ranges=_extract_version_ranges(
+                        details,
+                        pkg_name,
+                        ecosystem=ecosystem,
+                    ),
                     references=_extract_references(details),
                 )
             )
 
     return vulns
+
+
+def _osv_affects_package_version(
+    details: dict,
+    *,
+    package_name: str,
+    package_version: str,
+    ecosystem: str,
+) -> bool:
+    matched_package = False
+    version_evidence_seen = False
+
+    for affected in details.get("affected", []):
+        pkg = affected.get("package", {})
+        if normalize_ecosystem(pkg.get("ecosystem", "")) != ecosystem:
+            continue
+        if pkg.get("name", "").lower() != package_name.lower():
+            continue
+
+        matched_package = True
+        versions = affected.get("versions", [])
+        if isinstance(versions, list) and versions:
+            version_evidence_seen = True
+            if package_version in {str(version) for version in versions}:
+                return True
+
+        ranges = _extract_version_ranges(
+            {"affected": [affected]},
+            package_name,
+            ecosystem=ecosystem,
+        )
+        affected_by_range = is_version_affected(package_version, ranges)
+        if affected_by_range is True:
+            return True
+        if affected_by_range is False:
+            version_evidence_seen = True
+
+    return matched_package and not version_evidence_seen
 
 
 def scan_installed(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import tarfile
@@ -82,6 +83,28 @@ def test_collect_artifact_snapshots_blocks_hash_mismatch(tmp_path):
     assert result.findings[0].metadata["action"] == "block"
 
 
+def test_collect_artifact_snapshots_verifies_strongest_sri_token(tmp_path):
+    wheel = tmp_path / "bad-1.0.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as zf:
+        zf.writestr("bad/__init__.py", "VALUE = 1\n")
+
+    bad_sha512 = "sha512-" + base64.b64encode(b"\x00" * 64).decode()
+    artifact_hash = f"{_sri(wheel, 'sha1')} {bad_sha512}"
+    inventory = _inventory_for_artifact(
+        wheel,
+        package_name="bad",
+        artifact_hash=artifact_hash,
+    )
+
+    result = collect_artifact_snapshots(
+        inventory,
+        ArtifactScanConfig(cache_dir=tmp_path / "cache"),
+    )
+
+    assert result.scanned_artifacts == 0
+    assert result.findings[0].signal_type == "artifact_hash_mismatch"
+
+
 def test_collect_artifact_snapshots_refuses_unhashed_artifact_by_default(tmp_path):
     wheel = tmp_path / "bad-1.0.0-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w") as zf:
@@ -132,3 +155,11 @@ def _sha256(path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sri(path, algorithm: str) -> str:
+    digest = hashlib.new(algorithm)
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"{algorithm}-" + base64.b64encode(digest.digest()).decode()

@@ -18,7 +18,7 @@ from ca9.core.models import (
 )
 from ca9.models import Vulnerability
 
-DEFAULT_TRUSTED_INDEXES = ("https://pypi.org/simple",)
+DEFAULT_TRUSTED_INDEXES = ("https://pypi.org/simple", "https://registry.npmjs.org")
 BLOCKING_SIGNALS = {"malware", "untrusted_registry"}
 
 
@@ -52,8 +52,7 @@ def analyze_supply_chain(
 def findings_from_malware_advisories(vulnerabilities: list[Vulnerability]) -> list[Finding]:
     findings: list[Finding] = []
     for vuln in vulnerabilities:
-        advisory_ids = {vuln.id, *vuln.aliases}
-        if not any(_is_malware_advisory_id(advisory_id) for advisory_id in advisory_ids):
+        if not _is_malware_advisory(vuln):
             continue
 
         source = SourceEvidence(
@@ -381,6 +380,28 @@ def _kind_weighted_severity(package: Package, *, direct: str, transitive: str) -
     if package.dependency_kind in {"direct", "project"}:
         return direct
     return transitive
+
+
+def _is_malware_advisory(vuln: Vulnerability) -> bool:
+    advisory_ids = {vuln.id, *vuln.aliases}
+    if any(_is_malware_advisory_id(advisory_id) for advisory_id in advisory_ids):
+        return True
+    if any(cwe.upper() == "CWE-506" for cwe in vuln.cwes):
+        return True
+
+    text = f"{vuln.title}\n{vuln.description}".lower()
+    malware_terms = (
+        "malicious package",
+        "malicious code",
+        "embedded malicious",
+        "credential-stealing malware",
+        "credential stealing malware",
+        "credential stealer",
+        "exfiltrates cloud credentials",
+        "exfiltrates github tokens",
+        "exfiltrates ssh keys",
+    )
+    return any(term in text for term in malware_terms)
 
 
 def _is_malware_advisory_id(value: str) -> bool:

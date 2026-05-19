@@ -67,7 +67,8 @@ If you already have a Snyk, Dependabot, Trivy, or pip-audit report:
 ## Option C: Inspect package inventory and supply-chain risk
 
 Use `inventory` to see what ca9 knows about packages, artifact hashes, and dependency
-edges:
+edges. This reads `fyn.lock`, npm `package-lock.json` / `npm-shrinkwrap.json`, or
+native Python manifests depending on what is present:
 
 ```bash
 ca9 inventory --repo . -f json -o ca9-inventory.json
@@ -77,6 +78,12 @@ Run local supply-chain checks:
 
 ```bash
 ca9 vet --repo .
+```
+
+To check locked PyPI and npm package versions against OSV malicious-package advisories:
+
+```bash
+ca9 vet --repo . --malware-query
 ```
 
 For artifact-based malicious package heuristics, opt into artifact scanning:

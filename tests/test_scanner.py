@@ -409,6 +409,33 @@ class TestOfflineMode:
         assert len(vulns) == 1
         assert vulns[0].id == "PYSEC-2023-OFFLINE"
 
+    def test_offline_cache_respects_affected_versions(self, tmp_path, monkeypatch):
+        from ca9 import scanner
+
+        cache_dir = tmp_path / "osv_cache"
+        cache_dir.mkdir()
+        monkeypatch.setattr(scanner, "CACHE_DIR", cache_dir)
+
+        vuln_data = {
+            "id": "MAL-2026-3744",
+            "summary": "Malicious code in node-ipc",
+            "affected": [
+                {
+                    "package": {"ecosystem": "npm", "name": "node-ipc"},
+                    "versions": ["9.1.6"],
+                },
+            ],
+            "database_specific": {"severity": "CRITICAL"},
+        }
+        (cache_dir / "MAL-2026-3744.json").write_text(json.dumps(vuln_data))
+
+        unaffected = query_osv_batch([("node-ipc", "9.1.7")], ecosystem="npm", offline=True)
+        affected = query_osv_batch([("node-ipc", "9.1.6")], ecosystem="npm", offline=True)
+
+        assert unaffected == []
+        assert len(affected) == 1
+        assert affected[0].id == "MAL-2026-3744"
+
 
 class TestResolveScanInventory:
     @patch("ca9.scanner.get_installed_packages")

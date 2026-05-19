@@ -111,8 +111,8 @@ Options:
 | `-f, --format table\|json` | Output format. Defaults to `table`. |
 | `-o, --output PATH` | Write output to a file. |
 
-`inventory` reads `fyn.lock` natively when present. It otherwise falls back to ca9's
-native manifest readers.
+`inventory` reads `fyn.lock`, `package-lock.json`, and `npm-shrinkwrap.json` natively
+when present. It otherwise falls back to ca9's native Python manifest readers.
 
 Examples:
 
@@ -136,8 +136,8 @@ Options:
 | `-r, --repo PATH` | Project repository path. Defaults to `.`. |
 | `-f, --format table\|json` | Output format. Defaults to `table`. |
 | `-o, --output PATH` | Write output to a file. |
-| `--trusted-index URL` | Trusted Python package index. Can be repeated. Defaults to PyPI. |
-| `--private-index URL` | Private Python package index allowed for internal package names. Can be repeated. |
+| `--trusted-index URL` | Trusted package registry/index. Can be repeated. Defaults to PyPI and npm. |
+| `--private-index URL` | Private package registry/index allowed for internal package names. Can be repeated. |
 | `--internal-package PATTERN` | Internal package name or glob pattern, e.g. `acme-*`. Can be repeated. |
 | `--malware-query` | Query OSV for known malicious-package advisories. |
 | `--scan-artifacts` | Hash-verify, unpack, and statically inspect package artifacts. |

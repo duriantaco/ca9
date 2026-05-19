@@ -35,8 +35,8 @@ ca9 combines conservative static and runtime signals for each vulnerability:
 ## Key features
 
 - **Direct OSV scanning** with `ca9 scan`, so you can analyze installed or declared Python packages without a separate SCA report.
-- **Package inventory** with `ca9 inventory`, including native `fyn.lock` support for resolved packages, artifacts, hashes, markers, groups, and dependency edges.
-- **Supply-chain gates** with `ca9 vet` for untrusted indexes, dependency confusion, malicious package advisories, artifact static analysis, and license policy.
+- **Package inventory** with `ca9 inventory`, including native `fyn.lock` and npm lockfile support for resolved packages, artifacts, hashes, markers, groups, and dependency edges.
+- **Supply-chain gates** with `ca9 vet` for untrusted indexes, dependency confusion, malicious package advisories across PyPI/npm inventory, artifact static analysis, and license policy.
 - **SCA report parsing** for Snyk, Dependabot, Trivy, and pip-audit JSON.
 - **CI-friendly outputs** including table, JSON, SARIF, OpenVEX, Markdown, HTML, remediation plans, and machine-readable action plans.
 - **SBOM enrichment** for CycloneDX and SPDX documents.

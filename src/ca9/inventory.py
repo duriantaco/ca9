@@ -4,15 +4,29 @@ import json
 from pathlib import Path
 
 from ca9.analysis.ast_scanner import discover_declared_dependency_inventory
-from ca9.core.models import Inventory, Package, SourceEvidence, SourceInput
+from ca9.core.models import DependencyEdge, Inventory, Package, SourceEvidence, SourceInput
 from ca9.readers.fyn_lock import read_fyn_lock
+from ca9.readers.npm_lock import read_npm_lock
 
 
 def build_inventory(repo_path: Path) -> Inventory:
+    inventories: list[Inventory] = []
+
     fyn_lock_path = repo_path / "fyn.lock"
     if fyn_lock_path.is_file():
-        return read_fyn_lock(repo_path)
-    return _declared_dependency_inventory(repo_path)
+        inventories.append(read_fyn_lock(repo_path))
+
+    npm_lock_path = repo_path / "package-lock.json"
+    npm_shrinkwrap_path = repo_path / "npm-shrinkwrap.json"
+    if npm_lock_path.is_file() or npm_shrinkwrap_path.is_file():
+        inventories.append(read_npm_lock(repo_path))
+
+    if not fyn_lock_path.is_file():
+        declared = _declared_dependency_inventory(repo_path)
+        if declared.packages or not inventories:
+            inventories.append(declared)
+
+    return _merge_inventories(repo_path, inventories)
 
 
 def inventory_to_json(inventory: Inventory) -> str:
@@ -71,7 +85,7 @@ def _declared_dependency_inventory(repo_path: Path) -> Inventory:
 
     warnings: tuple[str, ...] = ()
     if not packages:
-        warnings = ("no fyn.lock or declared Python dependencies found",)
+        warnings = ("no fyn.lock, npm lockfile, or declared Python dependencies found",)
 
     return Inventory(
         repo_path=str(repo_path),
@@ -79,4 +93,59 @@ def _declared_dependency_inventory(repo_path: Path) -> Inventory:
         packages=packages,
         warnings=warnings,
         metadata={"reader": "declared dependency inventory"},
+    )
+
+
+def _merge_inventories(repo_path: Path, inventories: list[Inventory]) -> Inventory:
+    if not inventories:
+        return _declared_dependency_inventory(repo_path)
+    if len(inventories) == 1:
+        return inventories[0]
+
+    packages: dict[str, Package] = {}
+    edges: dict[
+        tuple[str | None, str, tuple[str, ...], tuple[str, ...], str | None],
+        DependencyEdge,
+    ] = {}
+    source_inputs: list[SourceInput] = []
+    warnings: list[str] = []
+    readers: list[str] = []
+
+    for inventory in inventories:
+        reader = inventory.metadata.get("reader")
+        if isinstance(reader, str):
+            readers.append(reader)
+        for source_input in inventory.source_inputs:
+            source_inputs.append(source_input)
+        warnings.extend(inventory.warnings)
+        for package in inventory.packages:
+            packages.setdefault(package.key, package)
+        for edge in inventory.dependency_edges:
+            edge_key = (
+                edge.parent_key,
+                edge.child_key,
+                edge.groups,
+                edge.extras,
+                edge.marker,
+            )
+            edges.setdefault(edge_key, edge)
+
+    return Inventory(
+        repo_path=str(repo_path),
+        source_inputs=tuple(source_inputs),
+        packages=tuple(sorted(packages.values(), key=lambda package: package.key)),
+        dependency_edges=tuple(
+            sorted(
+                edges.values(),
+                key=lambda edge: (
+                    edge.parent_key or "",
+                    edge.child_key,
+                    ",".join(edge.groups),
+                    ",".join(edge.extras),
+                    edge.marker or "",
+                ),
+            )
+        ),
+        warnings=tuple(warnings),
+        metadata={"reader": "merged inventory", "readers": sorted(set(readers))},
     )

@@ -7,7 +7,11 @@ from unittest.mock import patch
 
 from click.testing import CliRunner
 
-from ca9.analyzers.supply_chain import analyze_supply_chain, evaluate_supply_chain_findings
+from ca9.analyzers.supply_chain import (
+    analyze_supply_chain,
+    evaluate_supply_chain_findings,
+    findings_from_malware_advisories,
+)
 from ca9.cli import main
 from ca9.core.models import Artifact, Inventory, Package, SourceEvidence
 from ca9.models import Vulnerability
@@ -199,6 +203,75 @@ def test_vet_cli_can_query_known_malware_advisories(tmp_path):
     data = json.loads(result.output)
     assert data["summary"]["blocking"] == 1
     assert data["findings"][0]["signal_type"] == "malware"
+
+
+def test_vet_cli_queries_npm_lock_for_malware_advisories(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "name": "webapp",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "webapp",
+                        "version": "1.0.0",
+                        "dependencies": {"node-ipc": "^9.1.0"},
+                    },
+                    "node_modules/node-ipc": {
+                        "version": "9.1.6",
+                        "resolved": "https://registry.npmjs.org/node-ipc/-/node-ipc-9.1.6.tgz",
+                        "integrity": "sha512-test",
+                    },
+                },
+            }
+        )
+    )
+
+    vuln = Vulnerability(
+        id="MAL-2026-3744",
+        package_name="node-ipc",
+        package_version="9.1.6",
+        severity="critical",
+        title="Malicious code in node-ipc",
+        ecosystem="npm",
+        advisory_source="osv.dev",
+        advisory_url="https://osv.dev/vulnerability/MAL-2026-3744",
+    )
+
+    runner = CliRunner()
+    with patch("ca9.scanner.query_osv_batch", return_value=[vuln]) as mock_query:
+        result = runner.invoke(main, ["vet", "--repo", str(repo), "-f", "json", "--malware-query"])
+
+    assert result.exit_code == 1
+    mock_query.assert_called_once_with(
+        [("node-ipc", "9.1.6")],
+        ecosystem="npm",
+        offline=False,
+        refresh_cache=False,
+        max_workers=8,
+    )
+    data = json.loads(result.output)
+    assert data["summary"]["blocking"] == 1
+    assert data["findings"][0]["package_key"] == "npm:node-ipc@9.1.6"
+
+
+def test_malware_advisory_filter_blocks_ghsa_malware_titles():
+    vuln = Vulnerability(
+        id="GHSA-g7cv-rxg3-hmpx",
+        package_name="@tanstack/react-router",
+        package_version="1.120.13",
+        severity="critical",
+        title="Malware in @tanstack/* packages exfiltrates cloud credentials",
+        ecosystem="npm",
+    )
+
+    findings = findings_from_malware_advisories([vuln])
+
+    assert len(findings) == 1
+    assert findings[0].signal_type == "malware"
 
 
 def test_vet_cli_scan_artifacts_blocks_malicious_pth(tmp_path):

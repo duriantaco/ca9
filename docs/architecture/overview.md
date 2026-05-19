@@ -11,7 +11,7 @@ graph LR
     C --> D[Verdict engine]
     D --> E[Reports]
 
-    N[fyn.lock / manifests] --> O[Inventory readers]
+    N[fyn.lock / npm locks / manifests] --> O[Inventory readers]
     O --> P[Package inventory]
     P --> Q[Supply-chain analyzers]
     Q --> E
@@ -64,7 +64,8 @@ src/ca9/
 │   ├── models.py             # Package, Artifact, Finding, Evidence, Decision, Inventory
 │   └── pipeline.py           # Reader/analyzer/policy/reporter protocols
 ├── readers/
-│   └── fyn_lock.py           # Native fyn.lock reader
+│   ├── fyn_lock.py           # Native fyn.lock reader
+│   └── npm_lock.py           # Native package-lock/npm-shrinkwrap reader
 ├── artifacts/
 │   ├── fetch.py              # Hash-aware artifact cache/download
 │   └── unpack.py             # Safe wheel/sdist extraction
@@ -118,11 +119,11 @@ Parsers implement the `SCAParser` protocol. New SCA formats can be added without
 
 `ca9 vet` follows the newer package-security pipeline:
 
-1. **Inventory** - read `fyn.lock` when present, otherwise native manifests.
+1. **Inventory** - read `fyn.lock`, npm lockfiles, or native Python manifests.
 2. **Local metadata analysis** - check source registries, missing artifact hashes, source-only install risk, mutable sources, and internal package source policy.
-3. **Optional artifact acquisition** - with `--scan-artifacts`, download only hash-backed artifacts by default, verify digests, and safely unpack wheels/sdists.
-4. **Artifact analyzers** - statically inspect package files for startup hooks, install-time execution, encoded payloads, credential exfiltration patterns, import-time risky behavior, and license metadata.
-5. **Optional advisory query** - with `--malware-query`, query OSV for known malicious package advisories.
+3. **Optional artifact acquisition** - with `--scan-artifacts`, download only hash-backed artifacts by default, verify digests, and safely unpack wheels/sdists/npm tarballs.
+4. **Artifact analyzers** - statically inspect package files for startup hooks, install-time execution, encoded payloads, credential exfiltration patterns, npm lifecycle loaders, known npm campaign IOCs, import-time risky behavior, and license metadata.
+5. **Optional advisory query** - with `--malware-query`, query OSV for known malicious package advisories across supported ecosystems.
 6. **Decision/report** - emit findings and block/warn/investigate decisions in table or JSON output.
 
 Security constraints:

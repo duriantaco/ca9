@@ -241,13 +241,13 @@ def inventory_cmd(
     "--trusted-index",
     "trusted_indexes",
     multiple=True,
-    help="Trusted Python package index URL. Can be repeated. Defaults to PyPI.",
+    help="Trusted package registry/index URL. Can be repeated. Defaults to PyPI and npm.",
 )
 @click.option(
     "--private-index",
     "private_indexes",
     multiple=True,
-    help="Private Python package index URL for internal package names. Can be repeated.",
+    help="Private package registry/index URL for internal package names. Can be repeated.",
 )
 @click.option(
     "--internal-package",
@@ -349,18 +349,30 @@ def vet_cmd(
     if malware_query:
         from ca9.scanner import query_osv_batch
 
-        packages = [
-            (package.name, package.version)
-            for package in inventory.packages
-            if package.ecosystem.lower() == "pypi" and package.version
-        ]
+        packages_by_ecosystem: dict[str, list[tuple[str, str]]] = {}
+        for package in inventory.packages:
+            ecosystem = package.ecosystem.lower()
+            if (
+                ecosystem not in {"pypi", "npm"}
+                or not package.version
+                or package.dependency_kind == "project"
+            ):
+                continue
+            packages_by_ecosystem.setdefault(ecosystem, []).append((package.name, package.version))
+
         try:
-            malware_advisories = query_osv_batch(
-                packages,
-                offline=offline,
-                refresh_cache=refresh_cache,
-                max_workers=max_osv_workers,
-            )
+            refresh_for_query = refresh_cache
+            for ecosystem, packages in sorted(packages_by_ecosystem.items()):
+                malware_advisories.extend(
+                    query_osv_batch(
+                        packages,
+                        ecosystem="PyPI" if ecosystem == "pypi" else "npm",
+                        offline=offline,
+                        refresh_cache=refresh_for_query,
+                        max_workers=max_osv_workers,
+                    )
+                )
+                refresh_for_query = False
         except (ConnectionError, ValueError) as e:
             raise click.ClickException(str(e)) from None
 

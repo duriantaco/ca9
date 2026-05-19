@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import os
 import shutil
@@ -27,6 +29,14 @@ DEFAULT_ARTIFACT_CACHE_DIR = Path(
 DEFAULT_MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
 DEFAULT_MAX_EXTRACTED_BYTES = 250 * 1024 * 1024
 DEFAULT_MAX_EXTRACTED_FILES = 5000
+HASH_STRENGTH = {
+    "md5": 0,
+    "sha1": 1,
+    "sha224": 2,
+    "sha256": 3,
+    "sha384": 4,
+    "sha512": 5,
+}
 
 
 @dataclass(frozen=True)
@@ -65,7 +75,7 @@ def collect_artifact_snapshots(
 
     for package in inventory.packages:
         for artifact in package.artifacts:
-            if artifact.kind not in {"wheel", "sdist"}:
+            if artifact.kind not in {"wheel", "sdist", "npm-tarball"}:
                 continue
             _collect_one(package, artifact, active_config, state)
 
@@ -213,9 +223,18 @@ def _download_artifact(url: str, archive_path: Path, max_bytes: int) -> None:
 
 
 def _verify_hash(path: Path, expected: str) -> tuple[bool, str]:
-    algorithm, expected_value = _parse_hash(expected)
-    if algorithm not in hashlib.algorithms_available:
-        return False, f"unsupported artifact hash algorithm: {algorithm}"
+    parsed_hashes = _parse_hashes(expected)
+    supported_hashes = [item for item in parsed_hashes if item[0] in hashlib.algorithms_available]
+    if not parsed_hashes:
+        return False, "artifact hash is empty"
+    if not supported_hashes:
+        algorithms = ", ".join(sorted({algorithm for algorithm, _value in parsed_hashes}))
+        return False, f"unsupported artifact hash algorithm: {algorithms}"
+
+    algorithm, expected_value = max(
+        supported_hashes,
+        key=lambda item: HASH_STRENGTH.get(item[0], -1),
+    )
 
     digest = hashlib.new(algorithm)
     with path.open("rb") as f:
@@ -228,13 +247,33 @@ def _verify_hash(path: Path, expected: str) -> tuple[bool, str]:
     return True, "hash verified"
 
 
-def _parse_hash(value: str) -> tuple[str, str]:
-    if ":" in value:
-        algorithm, digest = value.split(":", 1)
-    elif "=" in value:
-        algorithm, digest = value.split("=", 1)
+def _parse_hashes(value: str) -> list[tuple[str, str]]:
+    hashes: list[tuple[str, str]] = []
+    for token in value.strip().split():
+        parsed = _parse_hash_token(token)
+        if parsed is not None:
+            hashes.append(parsed)
+    return hashes
+
+
+def _parse_hash_token(token: str) -> tuple[str, str] | None:
+    token = token.strip()
+    if not token:
+        return None
+    if ":" in token:
+        algorithm, digest = token.split(":", 1)
+    elif "-" in token:
+        algorithm, digest = token.split("-", 1)
+        normalized_algorithm = algorithm.lower().replace("-", "")
+        if normalized_algorithm in hashlib.algorithms_available:
+            try:
+                return normalized_algorithm, base64.b64decode(digest, validate=True).hex()
+            except (binascii.Error, ValueError):
+                pass
+    elif "=" in token:
+        algorithm, digest = token.split("=", 1)
     else:
-        algorithm, digest = "sha256", value
+        algorithm, digest = "sha256", token
     return algorithm.lower().replace("-", ""), digest.strip()
 
 

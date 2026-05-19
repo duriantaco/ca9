@@ -50,8 +50,12 @@ When a repository has `fyn.lock`, inventory includes:
 - artifact URLs, hashes, upload times, sizes, and registries
 - source evidence for each package and edge
 
-Without `fyn.lock`, ca9 falls back to native manifest readers for `pyproject.toml`,
-`requirements*.txt`, `Pipfile`, `uv.lock`, and `poetry.lock`.
+When a repository has npm `package-lock.json` or `npm-shrinkwrap.json`, inventory includes
+the locked npm packages, scoped package names, direct/transitive edges, resolved tarball
+URLs, integrity hashes, and registry evidence.
+
+Without a high-fidelity lockfile, ca9 falls back to native Python manifest readers for
+`pyproject.toml`, `requirements*.txt`, `Pipfile`, `uv.lock`, and `poetry.lock`.
 
 ## Basic Vetting
 
@@ -81,8 +85,8 @@ ca9 vet --repo . --scan-artifacts
 ```
 
 By default, ca9 only downloads artifacts that have hashes in the inventory. It verifies the
-hash, safely unpacks wheels/sdists, rejects path traversal or unsafe archive links, and
-scans files statically.
+hash, safely unpacks wheels/sdists/npm tarballs, rejects path traversal or unsafe archive
+links, and scans files statically.
 
 Current blocking rules include:
 
@@ -92,6 +96,10 @@ Current blocking rules include:
 - encoded payload decode plus execution
 - credential access near outbound network code
 - top-level import-time risky behavior
+- npm lifecycle loaders such as suspicious `preinstall` or `prepare` commands
+- known npm campaign IOCs such as malicious git dependencies, Session/git-tanstack
+  indicators, and AI/IDE poisoning paths
+- large obfuscated JavaScript payloads
 
 Suspicious process execution outside setup/import startup paths is marked for investigation.
 
@@ -115,8 +123,10 @@ Query OSV for known malicious-package advisories:
 ca9 vet --repo . --malware-query
 ```
 
-ca9 treats OSV `MAL-*` and `PYSEC-MAL-*` advisories as blocking malware findings. Use
-`--offline` to restrict the query path to cached OSV data.
+ca9 treats OSV `MAL-*`, `PYSEC-MAL-*`, CWE-506, and clearly malware-titled advisories as
+blocking malware findings. The query supports PyPI packages from Python inventory and npm
+packages from npm lockfiles. Use `--offline` to restrict the query path to cached OSV
+data.
 
 ## Dependency Confusion
 

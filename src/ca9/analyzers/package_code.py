@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 from dataclasses import dataclass
 
 from ca9.artifacts.model import ArtifactFile, ArtifactSnapshot
 from ca9.core.models import Evidence, Finding, RiskSignal, SourceEvidence
 
-MAX_TEXT_BYTES = 2 * 1024 * 1024
+MAX_TEXT_BYTES = 4 * 1024 * 1024
 
 _PTH_SUSPICIOUS_RE = re.compile(
     r"\b(import|exec|eval|compile|subprocess|os\.system|socket|urllib|requests|base64)\b",
@@ -60,6 +61,55 @@ _DANGEROUS_TOP_LEVEL_CALLS = {
     "urllib.request.urlopen",
     "socket.socket",
 }
+_NPM_LIFECYCLE_SCRIPT_NAMES = {"preinstall", "install", "postinstall", "prepare"}
+_NPM_LIFECYCLE_SCRIPT_RE = re.compile(
+    r"(^|[\s;&|()`$])("
+    r"node(?:\s+-(?:e|p)\b|\s+\S+\.(?:mjs|js|cjs)\b)?|npm|npx|bun|deno|"
+    r"python3?|bash|zsh|sh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh|curl|wget|"
+    r"setup\.(?:mjs|js|cjs)|router_init\.js|tanstack_runner\.js|child_process"
+    r")\b",
+    re.I,
+)
+_NPM_KNOWN_IOC_RE = re.compile(
+    r"(filev2\.getsession\.org/file|git-tanstack\.com/transformers\.pyz|"
+    r"tanstack/router#79ac49eedf774dd4b0cfa308722bc463cfe5885c|"
+    r"github\.com/oven-sh/bun/releases/download/bun-v1\.3\.13|"
+    r"169\.254\.169\.254/latest/meta-data/iam/security-credentials|"
+    r"createCommitOnBranch|\.claude/settings\.json|\.claude/setup\.mjs|"
+    r"\.claude/router_runtime\.js|\.vscode/tasks\.json|\.vscode/setup\.mjs|"
+    r"get_n_service_nodes|storage_rpc/v1)",
+    re.I,
+)
+_NPM_CREDENTIAL_RE = re.compile(
+    r"(process\.env\.(?:GITHUB_TOKEN|GH_TOKEN|ACTIONS_ID_TOKEN|AWS_ACCESS_KEY_ID|"
+    r"AWS_SECRET_ACCESS_KEY|VAULT_TOKEN|VAULT_AUTH_TOKEN|NPM_TOKEN)|"
+    r"JSON\.stringify\s*\(\s*process\.env\s*\)|"
+    r"Object\.(?:keys|values|entries)\s*\(\s*process\.env\s*\)|"
+    r"ghp_[A-Za-z0-9_\-.]{20,}|gho_[A-Za-z0-9_\-.]{20,}|"
+    r"ghs_[A-Za-z0-9_\-.]{20,}|npm_[A-Za-z0-9_\-.]{20,}|"
+    r"AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|ACTIONS_ID_TOKEN|VAULT_TOKEN)",
+    re.I,
+)
+_NPM_NETWORK_RE = re.compile(
+    r"\b(fetch\s*\(|https?\.(?:request|get)|axios\.|got\.|node-fetch|WebSocket|"
+    r"dns\.(?:promises\.)?(?:resolve|resolveTxt|resolve4|resolve6|lookup)\b|"
+    r"require\s*\(\s*['\"]dns['\"]\s*\)|"
+    r"child_process\.(?:exec|execSync|spawn|spawnSync)\b|"
+    r"filev2\.getsession\.org|storage_rpc|json_rpc|createCommitOnBranch)",
+    re.I,
+)
+_HEX_IDENTIFIER_RE = re.compile(r"\b_0x[a-fA-F0-9]{3,}\b")
+_TEXT_SCAN_EXTENSIONS = (
+    ".py",
+    ".pth",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".json",
+    ".txt",
+    ".md",
+)
 
 
 @dataclass(frozen=True)
@@ -128,6 +178,38 @@ _IMPORT_TIME_RULE = PackageCodeRule(
     confidence="medium",
     description="top-level package code runs as soon as the module is imported",
 )
+_NPM_LIFECYCLE_RULE = PackageCodeRule(
+    id="npm-lifecycle-script",
+    title="npm lifecycle script runs suspicious loader command",
+    severity="high",
+    action="block",
+    confidence="medium",
+    description="npm lifecycle scripts can execute during installation",
+)
+_NPM_KNOWN_IOC_RULE = PackageCodeRule(
+    id="npm-known-malware-ioc",
+    title="npm artifact contains known malware campaign indicator",
+    severity="critical",
+    action="block",
+    confidence="high",
+    description="package artifact contains an indicator from a known npm supply-chain campaign",
+)
+_NPM_CREDENTIAL_EXFIL_RULE = PackageCodeRule(
+    id="npm-credential-network-exfiltration",
+    title="npm package code accesses credentials and network APIs",
+    severity="high",
+    action="block",
+    confidence="medium",
+    description="credential access near outbound network code is a common npm malware pattern",
+)
+_NPM_OBFUSCATED_PAYLOAD_RULE = PackageCodeRule(
+    id="npm-obfuscated-payload",
+    title="npm package contains a large obfuscated JavaScript payload",
+    severity="high",
+    action="block",
+    confidence="medium",
+    description="large obfuscated JavaScript payloads in package artifacts are high-risk",
+)
 
 
 def analyze_package_snapshots(snapshots: tuple[ArtifactSnapshot, ...]) -> list[Finding]:
@@ -181,6 +263,102 @@ def _analyze_file(
             match = _SILENT_PROCESS_RE.search(text)
             if match:
                 findings.append(_finding(snapshot, file, text, _SILENT_PROCESS_RULE, match.start()))
+
+    if snapshot.artifact.kind == "npm-tarball":
+        findings.extend(_analyze_npm_file(snapshot, file, text, lower_path))
+
+    return findings
+
+
+def _analyze_npm_file(
+    snapshot: ArtifactSnapshot,
+    file: ArtifactFile,
+    text: str,
+    lower_path: str,
+) -> list[Finding]:
+    findings: list[Finding] = []
+
+    match = _NPM_KNOWN_IOC_RE.search(text)
+    if match:
+        findings.append(_finding(snapshot, file, text, _NPM_KNOWN_IOC_RULE, match.start()))
+
+    if lower_path.endswith("package.json"):
+        findings.extend(_analyze_npm_package_json(snapshot, file, text))
+
+    if lower_path.endswith((".js", ".mjs", ".cjs", ".ts")):
+        exfil_offset = _npm_credential_network_exfil_offset(text)
+        if exfil_offset is not None:
+            findings.append(
+                _finding(snapshot, file, text, _NPM_CREDENTIAL_EXFIL_RULE, exfil_offset)
+            )
+
+        obfuscated_offset = _npm_obfuscated_payload_offset(text)
+        if obfuscated_offset is not None:
+            findings.append(
+                _finding(snapshot, file, text, _NPM_OBFUSCATED_PAYLOAD_RULE, obfuscated_offset)
+            )
+
+    return findings
+
+
+def _analyze_npm_package_json(
+    snapshot: ArtifactSnapshot,
+    file: ArtifactFile,
+    text: str,
+) -> list[Finding]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    findings: list[Finding] = []
+    scripts = data.get("scripts")
+    if isinstance(scripts, dict):
+        for name, command in scripts.items():
+            if not isinstance(name, str) or name not in _NPM_LIFECYCLE_SCRIPT_NAMES:
+                continue
+            if not isinstance(command, str):
+                continue
+            match = _NPM_LIFECYCLE_SCRIPT_RE.search(command)
+            if match:
+                offset = text.find(command)
+                findings.append(
+                    _finding(
+                        snapshot,
+                        file,
+                        text,
+                        _NPM_LIFECYCLE_RULE,
+                        max(offset, 0),
+                    )
+                )
+
+    for dependency_group in (
+        "dependencies",
+        "optionalDependencies",
+        "devDependencies",
+        "peerDependencies",
+    ):
+        dependencies = data.get(dependency_group)
+        if not isinstance(dependencies, dict):
+            continue
+        for name, version in dependencies.items():
+            if not isinstance(name, str) or not isinstance(version, str):
+                continue
+            dependency_text = f"{name}@{version}"
+            match = _NPM_KNOWN_IOC_RE.search(dependency_text)
+            if match:
+                offset = text.find(version)
+                findings.append(
+                    _finding(
+                        snapshot,
+                        file,
+                        text,
+                        _NPM_KNOWN_IOC_RULE,
+                        max(offset, 0),
+                    )
+                )
 
     return findings
 
@@ -254,11 +432,17 @@ def _read_text_file(file: ArtifactFile) -> str | None:
     except OSError:
         return None
     if b"\x00" in raw[:4096]:
-        return None
+        if not _is_text_scan_path(file.relative_path):
+            return None
+        raw = raw.replace(b"\x00", b"")
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         return raw.decode("utf-8", errors="ignore")
+
+
+def _is_text_scan_path(path: str) -> bool:
+    return path.lower().endswith(_TEXT_SCAN_EXTENSIONS)
 
 
 def _line_snippet(text: str, offset: int) -> tuple[int, str]:
@@ -285,6 +469,32 @@ def _credential_network_exfil_offset(text: str) -> int | None:
     if abs(credential_line - network_line) > 80:
         return None
     return min(credential.start(), network.start())
+
+
+def _npm_credential_network_exfil_offset(text: str) -> int | None:
+    credential = _NPM_CREDENTIAL_RE.search(text)
+    network = _NPM_NETWORK_RE.search(text)
+    if credential is None or network is None:
+        return None
+
+    credential_line, _snippet = _line_snippet(text, credential.start())
+    network_line, _snippet = _line_snippet(text, network.start())
+    if abs(credential_line - network_line) > 120:
+        return None
+    return min(credential.start(), network.start())
+
+
+def _npm_obfuscated_payload_offset(text: str) -> int | None:
+    if len(text) < 100_000:
+        return None
+
+    first_line = text.splitlines()[0] if text.splitlines() else text
+    hex_identifiers = len(_HEX_IDENTIFIER_RE.findall(text[:500_000]))
+    if len(first_line) > 50_000 and hex_identifiers >= 75:
+        return 0
+    if hex_identifiers >= 75 and "createDecipheriv" in text and "gunzipSync" in text:
+        return 0
+    return None
 
 
 def _top_level_risky_call_offset(text: str) -> int | None:
