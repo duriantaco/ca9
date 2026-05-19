@@ -185,6 +185,17 @@ GuardDog-style static heuristics for suspicious `.pth` startup execution, instal
 `setup.py` execution, startup customization hooks, credential/network exfiltration,
 import-time risky behavior, silent process execution, and encoded payload execution.
 
+### Replay real incident fixtures
+
+```bash
+python scripts/incident_replay.py --strict --format table
+```
+
+ca9 keeps real incident fixtures for TanStack npm, Mistral npm/PyPI, and Grafana
+GitHub-token compromise scenarios. The current matrix is intentionally honest:
+unsupported npm and GitHub Actions attack surfaces are reported as gaps instead of
+passing demo cases.
+
 For dependency-confusion controls, use `--internal-package` with one or more private
 package name patterns and `--private-index` for the indexes those packages are allowed to
 resolve from. For license policy, use `--deny-license`; ca9 reads wheel/sdist metadata and

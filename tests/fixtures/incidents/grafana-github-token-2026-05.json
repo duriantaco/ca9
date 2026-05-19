@@ -1,0 +1,36 @@
+{
+  "schema_version": "ca9.incident.v1",
+  "id": "grafana-github-token-2026-05",
+  "title": "Grafana GitHub token compromise and codebase exfiltration",
+  "incident_date": "2026-05-17",
+  "source_urls": [
+    "https://thehackernews.com/2026/05/grafana-github-token-breach-led-to.html",
+    "https://www.bleepingcomputer.com/news/security/grafana-says-stolen-github-token-let-hackers-steal-codebase/amp/"
+  ],
+  "threat_classes": [
+    "github-token-compromise",
+    "source-code-exfiltration",
+    "credential-theft",
+    "extortion"
+  ],
+  "packages": [],
+  "advisories": [],
+  "workflow_patterns": [
+    {
+      "name": "github_token_access_review",
+      "workflow": "token-access-review.yml",
+      "snippet": "on:\n  workflow_dispatch:\n\npermissions:\n  contents: write\n  actions: write\n  id-token: write\n\njobs:\n  review:\n    steps:\n      - uses: actions/checkout@v6.0.2\n      - run: gh repo clone example/private-repo\n"
+    }
+  ],
+  "expected_current": {
+    "overall_status": "gap",
+    "inventory": "not_applicable",
+    "malware_advisory": "not_applicable",
+    "workflow": "gap"
+  },
+  "known_gaps": [
+    "ca9 does not currently scan GitHub token scopes, repository access grants, or audit-log events.",
+    "ca9 does not currently detect source-code exfiltration paths or GitHub environment compromise.",
+    "A future workflow scanner can catch risky permissions, but token theft response still needs audit-log and identity telemetry."
+  ]
+}

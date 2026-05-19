@@ -1,0 +1,57 @@
+{
+  "schema_version": "ca9.incident.v1",
+  "id": "mistral-npm-2026-05",
+  "title": "Mistral npm SDK packages affected by TanStack-related supply-chain attack",
+  "incident_date": "2026-05-12",
+  "source_urls": [
+    "https://docs.mistral.ai/resources/security-advisories"
+  ],
+  "threat_classes": [
+    "npm",
+    "install-time-malware",
+    "credential-theft"
+  ],
+  "packages": [
+    {
+      "ecosystem": "npm",
+      "name": "@mistralai/mistralai",
+      "version": "2.2.4",
+      "dependency_kind": "direct"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "@mistralai/mistralai-azure",
+      "version": "1.7.3",
+      "dependency_kind": "direct"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "@mistralai/mistralai-gcp",
+      "version": "1.7.3",
+      "dependency_kind": "direct"
+    }
+  ],
+  "advisories": [
+    {
+      "id": "MAI-2026-002",
+      "ecosystem": "npm",
+      "package_name": "@mistralai/mistralai",
+      "package_version": "2.2.4",
+      "severity": "critical",
+      "title": "TanStack supply chain attack affecting Mistral AI SDK packages",
+      "malicious": true,
+      "url": "https://docs.mistral.ai/resources/security-advisories"
+    }
+  ],
+  "expected_current": {
+    "overall_status": "gap",
+    "inventory": "gap",
+    "malware_advisory": "gap",
+    "workflow": "not_applicable"
+  },
+  "known_gaps": [
+    "package-lock.json, pnpm-lock.yaml, and yarn.lock are not currently parsed into ca9 inventory.",
+    "OSV/GHSA malware matching is currently PyPI-oriented in the vet path.",
+    "npm install-time malware and lifecycle-script analysis are not yet implemented."
+  ]
+}

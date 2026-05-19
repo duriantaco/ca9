@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from scripts.incident_replay import assert_expectations, render_markdown, replay_incidents
+
+FIXTURES = Path(__file__).parent / "fixtures" / "incidents"
+
+
+def test_incident_replay_current_expectations_match_fixtures():
+    report = replay_incidents(FIXTURES)
+
+    assert report["schema_version"] == "ca9.incident-replay.v1"
+    assert report["summary"]["incidents"] == 4
+    assert report["summary"]["covered"] == 0
+    assert report["summary"]["partial"] == 1
+    assert report["summary"]["gap"] == 3
+    assert_expectations(report)
+
+
+def test_incident_replay_exposes_mistral_pypi_partial_coverage():
+    report = replay_incidents(FIXTURES)
+    incident = _incident(report, "mistral-pypi-2026-05")
+    checks = _checks(incident)
+
+    assert incident["overall_status"] == "partial"
+    assert checks["inventory"]["status"] == "pass"
+    assert checks["malware_advisory"]["status"] == "gap"
+    assert checks["malware_advisory"]["advisory_ids"] == ["GHSA-wx9m-wx4f-4cmg"]
+    assert checks["malware_advisory"]["missing_package_keys"] == ["pypi:mistralai@2.4.6"]
+
+
+def test_incident_replay_exposes_npm_and_workflow_gaps():
+    report = replay_incidents(FIXTURES)
+    tanstack = _incident(report, "tanstack-npm-2026-05")
+    tanstack_checks = _checks(tanstack)
+    mistral_npm = _incident(report, "mistral-npm-2026-05")
+    mistral_checks = _checks(mistral_npm)
+
+    assert tanstack["overall_status"] == "gap"
+    assert tanstack_checks["inventory"]["status"] == "gap"
+    assert tanstack_checks["malware_advisory"]["status"] == "gap"
+    assert tanstack_checks["workflow"]["status"] == "gap"
+    assert tanstack_checks["workflow"]["missing_capability"] == "github_actions_workflow_scanner"
+    assert tanstack_checks["inventory"]["missing_package_keys"] == [
+        "npm:@tanstack/history@1.161.9",
+        "npm:@tanstack/react-router@1.169.5",
+    ]
+
+    assert mistral_npm["overall_status"] == "gap"
+    assert mistral_checks["inventory"]["missing_package_keys"] == [
+        "npm:@mistralai/mistralai-azure@1.7.3",
+        "npm:@mistralai/mistralai-gcp@1.7.3",
+        "npm:@mistralai/mistralai@2.2.4",
+    ]
+
+
+def test_incident_replay_markdown_calls_out_gaps():
+    report = replay_incidents(FIXTURES)
+    markdown = render_markdown(report)
+
+    assert "| mistral-pypi-2026-05 | partial | pass | gap | not_applicable |" in markdown
+    assert "| tanstack-npm-2026-05 | gap | gap | gap | gap |" in markdown
+    assert "github_actions_workflow_scanner" not in markdown
+    assert "npm lockfile inventory is not currently implemented." in markdown
+
+
+def _incident(report: dict, incident_id: str) -> dict:
+    return next(incident for incident in report["incidents"] if incident["id"] == incident_id)
+
+
+def _checks(incident: dict) -> dict:
+    return {check["name"]: check for check in incident["checks"]}
