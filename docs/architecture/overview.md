@@ -11,6 +11,11 @@ graph LR
     C --> D[Verdict engine]
     D --> E[Reports]
 
+    N[fyn.lock / manifests] --> O[Inventory readers]
+    O --> P[Package inventory]
+    P --> Q[Supply-chain analyzers]
+    Q --> E
+
     F[Repo source] --> G[AST scanner]
     G --> D
     H[coverage.json] --> I[Coverage reader]
@@ -35,6 +40,8 @@ src/ca9/
 ├── remediation.py            # Prioritized remediation plans
 ├── action_plan.py            # CI/CD action-plan decisions
 ├── sbom.py                   # CycloneDX/SPDX enrichment
+├── inventory.py              # Normalized package inventory builder and renderers
+├── supply_chain.py           # Supply-chain report assembly
 ├── threat_intel.py           # EPSS and CISA KEV enrichment
 ├── runtime_context.py        # Deployment-aware priority adjustment
 ├── coverage_provider.py      # Coverage discovery and generation helpers
@@ -53,6 +60,18 @@ src/ca9/
 │   ├── diff.py               # Capability diffing
 │   ├── policy.py             # Capability policy gates
 │   └── detectors/            # MCP, providers, prompts, egress, storage, tools
+├── core/
+│   ├── models.py             # Package, Artifact, Finding, Evidence, Decision, Inventory
+│   └── pipeline.py           # Reader/analyzer/policy/reporter protocols
+├── readers/
+│   └── fyn_lock.py           # Native fyn.lock reader
+├── artifacts/
+│   ├── fetch.py              # Hash-aware artifact cache/download
+│   └── unpack.py             # Safe wheel/sdist extraction
+├── analyzers/
+│   ├── supply_chain.py       # Registry/source/install-risk/dependency-confusion checks
+│   ├── package_code.py       # Static malicious package artifact heuristics
+│   └── license_policy.py     # Wheel/sdist metadata license policy
 └── parsers/
     ├── base.py               # SCAParser protocol
     ├── snyk.py               # Snyk JSON parser
@@ -94,3 +113,23 @@ Parsers implement the `SCAParser` protocol. New SCA formats can be added without
 4. **Verdict engine** - Combines evidence and proof policy for each vulnerability.
 5. **Enrichment** - Optional threat intel, runtime context, production traces, exploit paths, and capability blast radius.
 6. **Output** - Table, JSON, SARIF, OpenVEX, remediation plan, action plan, or enriched SBOM.
+
+## Supply-chain vetting flow
+
+`ca9 vet` follows the newer package-security pipeline:
+
+1. **Inventory** - read `fyn.lock` when present, otherwise native manifests.
+2. **Local metadata analysis** - check source registries, missing artifact hashes, source-only install risk, mutable sources, and internal package source policy.
+3. **Optional artifact acquisition** - with `--scan-artifacts`, download only hash-backed artifacts by default, verify digests, and safely unpack wheels/sdists.
+4. **Artifact analyzers** - statically inspect package files for startup hooks, install-time execution, encoded payloads, credential exfiltration patterns, import-time risky behavior, and license metadata.
+5. **Optional advisory query** - with `--malware-query`, query OSV for known malicious package advisories.
+6. **Decision/report** - emit findings and block/warn/investigate decisions in table or JSON output.
+
+Security constraints:
+
+- no package install
+- no package import
+- no package code execution
+- archive path traversal and unsafe links are rejected
+- unhashed artifact downloads are refused by default
+- network providers are opt-in

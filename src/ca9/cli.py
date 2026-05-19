@@ -156,6 +156,272 @@ def _resolve_option(ctx: click.Context, option_name: str, current_value):
     return current_value
 
 
+@main.command(name="inventory")
+@click.argument("path", required=False, type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "-r",
+    "--repo",
+    "repo_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=".",
+    help="Path to the project repository.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write output to file instead of stdout.",
+)
+@click.pass_context
+def inventory_cmd(
+    ctx: click.Context,
+    path: Path | None,
+    repo_path: Path,
+    output_format: str,
+    output_path: Path | None,
+) -> None:
+    """Show normalized package inventory."""
+    from ca9.inventory import build_inventory, inventory_to_json, inventory_to_table
+
+    if path is None:
+        repo_path = _resolve_option(ctx, "repo_path", repo_path)
+    else:
+        repo_path = path
+
+    inventory = build_inventory(repo_path)
+    if output_format == "json":
+        text = inventory_to_json(inventory)
+    else:
+        text = inventory_to_table(inventory)
+
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text)
+    else:
+        click.echo(text)
+
+
+@main.command(name="vet")
+@click.argument("path", required=False, type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "-r",
+    "--repo",
+    "repo_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=".",
+    help="Path to the project repository.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write output to file instead of stdout.",
+)
+@click.option(
+    "--trusted-index",
+    "trusted_indexes",
+    multiple=True,
+    help="Trusted Python package index URL. Can be repeated. Defaults to PyPI.",
+)
+@click.option(
+    "--private-index",
+    "private_indexes",
+    multiple=True,
+    help="Private Python package index URL for internal package names. Can be repeated.",
+)
+@click.option(
+    "--internal-package",
+    "internal_package_patterns",
+    multiple=True,
+    help="Internal package name or glob pattern, e.g. acme-*.",
+)
+@click.option(
+    "--malware-query",
+    is_flag=True,
+    default=False,
+    help="Query OSV for known malicious package advisories.",
+)
+@click.option(
+    "--scan-artifacts",
+    is_flag=True,
+    default=False,
+    help="Download/unpack package artifacts and run static malicious-package heuristics.",
+)
+@click.option(
+    "--allow-unhashed-downloads",
+    is_flag=True,
+    default=False,
+    help="Allow artifact scanning when the lockfile has no artifact hash.",
+)
+@click.option(
+    "--max-artifact-mb",
+    type=int,
+    default=100,
+    show_default=True,
+    help="Maximum artifact download size for --scan-artifacts.",
+)
+@click.option(
+    "--deny-license",
+    "denied_licenses",
+    multiple=True,
+    help="License identifier to block when found in artifact metadata. Can be repeated.",
+)
+@click.option(
+    "--require-known-license",
+    is_flag=True,
+    default=False,
+    help="Warn when scanned artifact metadata does not declare a known license.",
+)
+@click.option(
+    "--offline",
+    is_flag=True,
+    default=False,
+    help="Use only cached OSV data for --malware-query.",
+)
+@click.option(
+    "--refresh-cache",
+    is_flag=True,
+    default=False,
+    help="Clear OSV cache before --malware-query.",
+)
+@click.option(
+    "--max-osv-workers",
+    type=int,
+    default=8,
+    help="Max concurrent OSV detail fetches.",
+)
+@click.pass_context
+def vet_cmd(
+    ctx: click.Context,
+    path: Path | None,
+    repo_path: Path,
+    output_format: str,
+    output_path: Path | None,
+    trusted_indexes: tuple[str, ...],
+    private_indexes: tuple[str, ...],
+    internal_package_patterns: tuple[str, ...],
+    malware_query: bool,
+    scan_artifacts: bool,
+    allow_unhashed_downloads: bool,
+    max_artifact_mb: int,
+    denied_licenses: tuple[str, ...],
+    require_known_license: bool,
+    offline: bool,
+    refresh_cache: bool,
+    max_osv_workers: int,
+) -> None:
+    """Run package supply-chain risk checks."""
+    from ca9.analyzers.supply_chain import DEFAULT_TRUSTED_INDEXES, SupplyChainPolicy
+    from ca9.inventory import build_inventory
+    from ca9.supply_chain import (
+        build_supply_chain_report,
+        supply_chain_report_to_json,
+        supply_chain_report_to_table,
+    )
+
+    if path is None:
+        repo_path = _resolve_option(ctx, "repo_path", repo_path)
+    else:
+        repo_path = path
+
+    inventory = build_inventory(repo_path)
+    malware_advisories = []
+    if malware_query:
+        from ca9.scanner import query_osv_batch
+
+        packages = [
+            (package.name, package.version)
+            for package in inventory.packages
+            if package.ecosystem.lower() == "pypi" and package.version
+        ]
+        try:
+            malware_advisories = query_osv_batch(
+                packages,
+                offline=offline,
+                refresh_cache=refresh_cache,
+                max_workers=max_osv_workers,
+            )
+        except (ConnectionError, ValueError) as e:
+            raise click.ClickException(str(e)) from None
+
+    artifact_findings = []
+    artifact_warnings = []
+    artifact_scans = 0
+    skipped_artifacts = 0
+    artifact_scan_requested = scan_artifacts or bool(denied_licenses) or require_known_license
+    if artifact_scan_requested:
+        from ca9.analyzers.license_policy import LicensePolicy, analyze_license_policy
+        from ca9.analyzers.package_code import analyze_package_snapshots
+        from ca9.artifacts.fetch import ArtifactScanConfig, collect_artifact_snapshots
+
+        artifact_result = collect_artifact_snapshots(
+            inventory,
+            ArtifactScanConfig(
+                allow_unhashed_downloads=allow_unhashed_downloads,
+                max_artifact_bytes=max_artifact_mb * 1024 * 1024,
+            ),
+        )
+        artifact_findings = [*artifact_result.findings]
+        if scan_artifacts:
+            artifact_findings.extend(analyze_package_snapshots(artifact_result.snapshots))
+        license_policy = LicensePolicy(
+            denied_licenses=denied_licenses,
+            require_known_license=require_known_license,
+        )
+        artifact_findings.extend(analyze_license_policy(artifact_result.snapshots, license_policy))
+        artifact_warnings = list(artifact_result.warnings)
+        artifact_scans = artifact_result.scanned_artifacts
+        skipped_artifacts = artifact_result.skipped_artifacts
+
+    policy = SupplyChainPolicy(
+        trusted_indexes=trusted_indexes or DEFAULT_TRUSTED_INDEXES,
+        private_indexes=private_indexes,
+        internal_package_patterns=internal_package_patterns,
+    )
+    report = build_supply_chain_report(
+        inventory,
+        policy=policy,
+        malware_advisories=malware_advisories,
+        extra_findings=artifact_findings,
+        extra_warnings=artifact_warnings,
+        artifact_scans=artifact_scans,
+        skipped_artifacts=skipped_artifacts,
+    )
+
+    if output_format == "json":
+        text = supply_chain_report_to_json(report)
+    else:
+        text = supply_chain_report_to_table(report)
+
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text)
+    else:
+        click.echo(text)
+
+    sys.exit(report.exit_code)
+
+
 @main.command()
 @click.argument("sca_report", type=click.Path(exists=True, path_type=Path))
 @click.option(

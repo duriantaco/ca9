@@ -1,11 +1,11 @@
 ---
 title: CLI Reference
-description: Complete ca9 CLI reference for Python CVE reachability analysis, OSV scanning, SARIF, OpenVEX, SBOM enrichment, and AI capability checks.
+description: Complete ca9 CLI reference for Python CVE reachability analysis, package inventory, supply-chain vetting, OSV scanning, SARIF, OpenVEX, SBOM enrichment, and AI capability checks.
 ---
 
 # CLI Reference
 
-ca9 provides reachability-aware CVE triage for Python projects. The two primary commands are `check` for existing SCA reports and `scan` for direct OSV.dev scanning.
+ca9 provides reachability-aware CVE triage and local Python package security checks. The core commands are `check` for existing SCA reports, `scan` for direct OSV.dev scanning, `inventory` for normalized package evidence, and `vet` for supply-chain risk checks.
 
 ## Global options
 
@@ -94,6 +94,72 @@ ca9 scan --repo .
 ca9 scan --repo . --coverage coverage.json -f json
 ca9 scan --repo . --offline --show-confidence
 ```
+
+## `ca9 inventory`
+
+Show normalized package inventory.
+
+```bash
+ca9 inventory [PATH] [OPTIONS]
+```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `-r, --repo PATH` | Project repository path. Defaults to `.`. |
+| `-f, --format table\|json` | Output format. Defaults to `table`. |
+| `-o, --output PATH` | Write output to a file. |
+
+`inventory` reads `fyn.lock` natively when present. It otherwise falls back to ca9's
+native manifest readers.
+
+Examples:
+
+```bash
+ca9 inventory --repo .
+ca9 inventory --repo . -f json -o ca9-inventory.json
+```
+
+## `ca9 vet`
+
+Run package supply-chain risk checks.
+
+```bash
+ca9 vet [PATH] [OPTIONS]
+```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `-r, --repo PATH` | Project repository path. Defaults to `.`. |
+| `-f, --format table\|json` | Output format. Defaults to `table`. |
+| `-o, --output PATH` | Write output to a file. |
+| `--trusted-index URL` | Trusted Python package index. Can be repeated. Defaults to PyPI. |
+| `--private-index URL` | Private Python package index allowed for internal package names. Can be repeated. |
+| `--internal-package PATTERN` | Internal package name or glob pattern, e.g. `acme-*`. Can be repeated. |
+| `--malware-query` | Query OSV for known malicious-package advisories. |
+| `--scan-artifacts` | Hash-verify, unpack, and statically inspect package artifacts. |
+| `--allow-unhashed-downloads` | Allow artifact scanning when the lockfile has no artifact hash. |
+| `--max-artifact-mb N` | Maximum artifact download size for `--scan-artifacts`. Defaults to `100`. |
+| `--deny-license ID` | Denied license identifier. Can be repeated. |
+| `--require-known-license` | Warn when scanned artifact metadata has no known license. |
+| `--offline` | Use cached OSV data only for `--malware-query`. |
+| `--refresh-cache` | Clear OSV cache before `--malware-query`. |
+| `--max-osv-workers N` | Maximum concurrent OSV detail fetches. Defaults to `8`. |
+
+Examples:
+
+```bash
+ca9 vet --repo .
+ca9 vet --repo . --scan-artifacts
+ca9 vet --repo . --malware-query --offline
+ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.acme.internal/simple
+ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
+```
+
+See [Supply-Chain Vetting](supply-chain.md) for details on current findings and limits.
 
 ## Output formats
 
@@ -215,7 +281,7 @@ ca9 enrich-sbom sbom.json --repo . --coverage coverage.json -o sbom.ca9.json
 | Code | Meaning |
 |---|---|
 | `0` | No reachable CVEs were found, or the command completed without an action-blocking result. |
-| `1` | Reachable CVEs or VEX regressions require attention. |
+| `1` | Reachable CVEs, VEX regressions, or blocking supply-chain findings require attention. |
 | `2` | Only inconclusive findings remain, or a capability/action policy produced a blocking decision. |
 
 Input errors such as invalid JSON, missing files, or unsupported formats also return a non-zero exit code with a Click error message.

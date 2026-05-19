@@ -64,6 +64,40 @@ If you already have a Snyk, Dependabot, Trivy, or pip-audit report:
     ca9 check pip-audit.json
     ```
 
+## Option C: Inspect package inventory and supply-chain risk
+
+Use `inventory` to see what ca9 knows about packages, artifact hashes, and dependency
+edges:
+
+```bash
+ca9 inventory --repo . -f json -o ca9-inventory.json
+```
+
+Run local supply-chain checks:
+
+```bash
+ca9 vet --repo .
+```
+
+For artifact-based malicious package heuristics, opt into artifact scanning:
+
+```bash
+ca9 vet --repo . --scan-artifacts
+```
+
+To protect private package names and license policy:
+
+```bash
+ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.acme.internal/simple
+ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
+```
+
+To try a safe fixture with a screenshot-ready supply-chain report:
+
+```bash
+bash demo/supply_chain/run_demo.sh
+```
+
 ## Understanding the output
 
 ca9 produces a table by default:
@@ -98,6 +132,7 @@ ca9 check snyk-report.json --format vex --output openvex.json
 ## Next steps
 
 - [CLI Reference](../guide/cli.md) — all commands and options
+- [Supply-Chain Vetting](../guide/supply-chain.md) — inventory, artifact, dependency-confusion, and license gates
 - [Dynamic Analysis Guide](../guide/coverage.md) — get the most out of coverage data
 - [Proof Standards](../guide/proof-standards.md) — strict gates, accepted risks, and baselines
 - [Architecture Overview](../architecture/overview.md) — understand how ca9 works under the hood
