@@ -1,5 +1,5 @@
-name: ca9 Python Supply Chain Security
-description: Run ca9 Python CVE reachability and SCA triage in GitHub Actions
+name: ca9
+description: Run ca9 Python CVE reachability analysis in GitHub Actions
 author: duriantaco
 
 branding:
