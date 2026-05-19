@@ -47,11 +47,21 @@ def get_installed_packages() -> list[tuple[str, str]]:
     return packages
 
 
-def resolve_scan_inventory(repo_path: Path) -> ScanInventory:
+def resolve_scan_inventory(
+    repo_path: Path,
+    *,
+    allow_environment_fallback: bool = False,
+) -> ScanInventory:
     declared = discover_declared_dependency_inventory(repo_path)
     installed_packages = get_installed_packages()
 
     if not declared:
+        if not allow_environment_fallback:
+            return ScanInventory(
+                packages=(),
+                source="none",
+                warnings=("no declared dependencies with exact versions were found",),
+            )
         return ScanInventory(
             packages=tuple(installed_packages),
             source="environment",
@@ -77,7 +87,7 @@ def resolve_scan_inventory(repo_path: Path) -> ScanInventory:
             pinned += 1
             continue
 
-        installed = installed_by_name.get(key)
+        installed = installed_by_name.get(key) if allow_environment_fallback else None
         if installed is not None:
             packages.append((name, installed[1]))
             env_fallbacks += 1
@@ -110,12 +120,23 @@ def resolve_scan_inventory(repo_path: Path) -> ScanInventory:
             unresolved_dependencies=tuple(sorted(unresolved)),
         )
 
+    if allow_environment_fallback:
+        return ScanInventory(
+            packages=tuple(installed_packages),
+            source="environment",
+            warnings=(
+                "declared dependencies were found, but none had resolvable versions; "
+                "fell back to installed environment packages",
+            ),
+            declared_dependencies=len(declared),
+            unresolved_dependencies=tuple(sorted(unresolved)),
+        )
+
     return ScanInventory(
-        packages=tuple(installed_packages),
-        source="environment",
-        warnings=(
-            "declared dependencies were found, but none had resolvable versions; fell back to installed environment packages",
-        ),
+        packages=(),
+        source="none",
+        warnings=tuple(warnings)
+        or ("declared dependencies were found, but none had exact versions to scan",),
         declared_dependencies=len(declared),
         unresolved_dependencies=tuple(sorted(unresolved)),
     )
@@ -565,8 +586,12 @@ def scan_repository(
     offline: bool = False,
     refresh_cache: bool = False,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    allow_environment_fallback: bool = False,
 ) -> tuple[list[Vulnerability], ScanInventory]:
-    inventory = resolve_scan_inventory(repo_path)
+    inventory = resolve_scan_inventory(
+        repo_path,
+        allow_environment_fallback=allow_environment_fallback,
+    )
     vulnerabilities = query_osv_batch(
         list(inventory.packages),
         offline=offline,

@@ -424,18 +424,44 @@ class TestResolveScanInventory:
 
         assert isinstance(inventory, ScanInventory)
         assert inventory.source == "repo"
-        assert inventory.packages == (("django", "5.0.2"), ("requests", "2.31.0"))
+        assert inventory.packages == (("requests", "2.31.0"),)
         assert inventory.pinned_dependencies == 1
+        assert inventory.environment_fallbacks == 0
+        assert any("skipped declared package" in w for w in inventory.warnings)
+
+    @patch("ca9.scanner.get_installed_packages")
+    def test_allows_environment_fallback_when_requested(self, mock_get, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text('[tool.poetry.dependencies]\ndjango = "^5.0"\n')
+        mock_get.return_value = [("Django", "5.0.2"), ("unused", "1.0.0")]
+
+        inventory = resolve_scan_inventory(repo, allow_environment_fallback=True)
+
+        assert inventory.source == "repo"
+        assert inventory.packages == (("django", "5.0.2"),)
         assert inventory.environment_fallbacks == 1
         assert any("used installed environment versions" in w for w in inventory.warnings)
 
     @patch("ca9.scanner.get_installed_packages")
-    def test_falls_back_when_no_repo_inventory(self, mock_get, tmp_path):
+    def test_does_not_fall_back_when_no_repo_inventory_by_default(self, mock_get, tmp_path):
         repo = tmp_path / "repo"
         repo.mkdir()
         mock_get.return_value = [("requests", "2.31.0")]
 
         inventory = resolve_scan_inventory(repo)
+
+        assert inventory.source == "none"
+        assert inventory.packages == ()
+        assert any("no declared dependencies" in w for w in inventory.warnings)
+
+    @patch("ca9.scanner.get_installed_packages")
+    def test_falls_back_when_no_repo_inventory_if_allowed(self, mock_get, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        mock_get.return_value = [("requests", "2.31.0")]
+
+        inventory = resolve_scan_inventory(repo, allow_environment_fallback=True)
 
         assert inventory.source == "environment"
         assert inventory.packages == (("requests", "2.31.0"),)

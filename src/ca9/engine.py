@@ -189,10 +189,11 @@ def collect_evidence(
         if sub_imported:
             submodule_imported = True
         else:
+            root_imported = any(imp.lower() == import_name.lower() for imp in repo_imports)
             has_dotted_imports = any(
                 imp.lower().startswith(import_name.lower() + ".") for imp in repo_imports
             )
-            if has_dotted_imports:
+            if has_dotted_imports and not root_imported:
                 submodule_imported = False
             else:
                 submodule_imported = None

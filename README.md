@@ -138,14 +138,17 @@ Django alone brought 21 CVEs that were pure noise.
 
 ## Quick start
 
-### Scan declared or installed packages (no SCA tool needed)
+### Scan repository dependency versions (no SCA tool needed)
 
 ```bash
 pip install ca9[cli]
 ca9 scan --repo .
 ```
 
-This resolves dependency inventory from the target repository, queries [OSV.dev](https://osv.dev), and falls back to the current Python environment when no resolvable manifest is available. No Snyk, no Dependabot, no config files.
+This resolves exact dependency versions from the target repository and queries
+[OSV.dev](https://osv.dev). ca9 does not use the ambient Python environment unless
+you explicitly pass `--allow-env-fallback`, which keeps CI scans tied to repository
+evidence. No Snyk, no Dependabot, no config files.
 
 ### Inspect package inventory and lockfile evidence
 
@@ -275,7 +278,7 @@ Confidence scoring is **verdict-directional** — evidence that supports the ver
 ## CLI reference
 
 ```
-ca9 scan [OPTIONS]              Scan declared or installed packages via OSV.dev
+ca9 scan [OPTIONS]              Scan repository dependency versions via OSV.dev
 ca9 check SCA_REPORT [OPTIONS]  Analyze a Snyk/Dependabot/Trivy/pip-audit report
 ca9 inventory [PATH] [OPTIONS]  Show normalized package inventory
 ca9 vet [PATH] [OPTIONS]        Run package supply-chain risk checks
@@ -304,6 +307,7 @@ Common options:
 Scan-only options:
   --offline                        Use only cached OSV data, no network requests
   --refresh-cache                  Clear OSV cache before fetching
+  --allow-env-fallback             Use installed package versions when repo versions cannot be resolved
   --max-osv-workers N              Max concurrent OSV detail fetches  [default: 8]
 
 Inventory-only options:
@@ -405,7 +409,7 @@ Available tools:
 | Tool | What it does |
 |------|-------------|
 | `check_reachability` | Analyze an SCA report (Snyk, Dependabot, Trivy, pip-audit) |
-| `scan_dependencies` | Scan declared or installed packages via OSV.dev |
+| `scan_dependencies` | Scan repository dependency versions via OSV.dev |
 | `check_coverage_quality` | Assess how reliable your coverage data is |
 | `explain_verdict` | Deep-dive a specific CVE's verdict with full evidence |
 | `generate_vex` | Generate OpenVEX exploitability statements |

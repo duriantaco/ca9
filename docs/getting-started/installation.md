@@ -56,5 +56,5 @@ Commands:
   action-plan   Generate a machine-readable action plan for CI/CD...
   capabilities  Scan repository for AI capabilities...
   check         Analyze an SCA report for reachability.
-  scan          Scan declared or installed packages via OSV.dev.
+  scan          Scan repository dependency versions via OSV.dev.
 ```

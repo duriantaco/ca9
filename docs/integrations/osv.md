@@ -12,9 +12,11 @@ pip install ca9[cli]
 ca9 scan --repo .
 ```
 
-ca9 first looks for dependency inventory in the repository. Supported sources include `requirements*.txt`, nested requirement files, constraints, `pyproject.toml` dependencies and optional extras, Poetry metadata, `uv.lock`, `poetry.lock`, `Pipfile`, and `Pipfile.lock`.
+ca9 first looks for exact dependency versions in the repository. Supported sources include `requirements*.txt`, nested requirement files, constraints, `pyproject.toml` dependencies and optional extras, Poetry metadata, `uv.lock`, `poetry.lock`, `Pipfile`, and `Pipfile.lock`.
 
-If ca9 cannot resolve a usable inventory, it falls back to installed packages in the current Python environment.
+If ca9 cannot resolve exact versions, it skips those dependencies by default. Use
+`--allow-env-fallback` only when you intentionally want unresolved dependencies to use
+versions from the current Python environment.
 
 ## Add coverage evidence
 
