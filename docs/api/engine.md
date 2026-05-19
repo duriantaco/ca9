@@ -9,6 +9,11 @@ def analyze(
     vulnerabilities: list[Vulnerability],
     repo_path: Path,
     coverage_path: Path | None = None,
+    proof_standard: str = "strict",
+    scan_capabilities: bool = False,
+    trace_exploit_paths: bool = False,
+    threat_intel: bool = False,
+    otel_traces_path: Path | None = None,
 ) -> Report
 ```
 
@@ -21,6 +26,11 @@ Main entry point for reachability analysis.
 | `vulnerabilities` | `list[Vulnerability]` | Vulnerabilities to analyze |
 | `repo_path` | `Path` | Path to the project repository |
 | `coverage_path` | `Path \| None` | Path to `coverage.json` (optional) |
+| `proof_standard` | `str` | Suppression policy, either `strict` or `balanced` |
+| `scan_capabilities` | `bool` | Attach AI capability blast-radius data to reachable findings |
+| `trace_exploit_paths` | `bool` | Trace paths from entry points to vulnerable API call sites |
+| `threat_intel` | `bool` | Enrich CVEs with EPSS and CISA KEV data |
+| `otel_traces_path` | `Path \| None` | OTLP JSON export for production runtime evidence |
 
 **Returns:** `Report` with a `VerdictResult` for each vulnerability.
 
@@ -34,7 +44,8 @@ For each vulnerability, the engine:
 4. Checks transitive dependency relationships
 5. If high/medium confidence: performs submodule-level analysis
 6. If coverage available: performs dynamic execution check
-7. Assigns a verdict and records the reasoning
+7. If enabled, attaches API exploit paths, threat intelligence, production trace evidence, and AI capability blast radius
+8. Applies the selected proof standard, assigns a verdict, and records the reasoning
 
 **Example:**
 
@@ -54,6 +65,7 @@ report = analyze(
     vulnerabilities=vulns,
     repo_path=Path("."),
     coverage_path=Path("coverage.json"),
+    proof_standard="strict",
 )
 
 # Inspect results

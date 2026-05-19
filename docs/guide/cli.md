@@ -77,7 +77,12 @@ Scan declared or installed packages directly through OSV.dev.
 ca9 scan [OPTIONS]
 ```
 
-`scan` first tries to resolve dependency inventory from the target repository. If no resolvable manifest is found, it falls back to installed packages from the current Python environment.
+`scan` first tries to resolve Python dependency inventory from the target repository. If no resolvable manifest is found, it falls back to installed packages from the current Python environment.
+
+`scan` supports the same output, reachability, policy, and enrichment options as `check`,
+including `--coverage`, `--format`, `--output`, `--proof-standard`, `--capabilities`,
+`--runtime-context`, `--trace-paths`, `--threat-intel`, `--otel-traces`,
+`--accepted-risks`, `--baseline`, and `--new-only`.
 
 Additional scan options:
 
@@ -93,6 +98,7 @@ Examples:
 ca9 scan --repo .
 ca9 scan --repo . --coverage coverage.json -f json
 ca9 scan --repo . --offline --show-confidence
+ca9 scan --repo . --proof-standard strict --baseline ca9-baseline.json --new-only
 ```
 
 ## `ca9 inventory`
@@ -228,6 +234,14 @@ ca9 capabilities --repo .
 ca9 capabilities --repo . -f json -o aibom.json
 ```
 
+Options:
+
+| Option | Description |
+|---|---|
+| `-r, --repo PATH` | Project repository path. Defaults to `.`. |
+| `-f, --format json\|summary` | Output format. Defaults to `summary`. |
+| `-o, --output PATH` | Write output to a file. |
+
 ### `ca9 cap-diff`
 
 Compare two AI-BOM documents and summarize added, removed, or widened capabilities.
@@ -235,6 +249,15 @@ Compare two AI-BOM documents and summarize added, removed, or widened capabiliti
 ```bash
 ca9 cap-diff --base base-aibom.json --head head-aibom.json --md capability-diff.md
 ```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `--base PATH` | Base AI-BOM JSON. Required. |
+| `--head PATH` | Head AI-BOM JSON. Required. |
+| `-o, --output PATH` | Write diff JSON to a file. |
+| `--md PATH` | Write a Markdown diff to a file. |
 
 ### `ca9 cap-gate`
 
@@ -244,6 +267,13 @@ Evaluate a capability diff against a policy file.
 ca9 cap-gate --diff capability-diff.json --policy ca9-policy.yaml
 ```
 
+Options:
+
+| Option | Description |
+|---|---|
+| `--diff PATH` | Capability diff JSON. Required. |
+| `--policy PATH` | Policy YAML file. Required. |
+
 ### `ca9 vex-diff`
 
 Compare two OpenVEX documents and fail when vulnerabilities become affected or newly require attention.
@@ -251,6 +281,14 @@ Compare two OpenVEX documents and fail when vulnerabilities become affected or n
 ```bash
 ca9 vex-diff --base previous.openvex.json --head current.openvex.json
 ```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `--base PATH` | Base VEX document. Required. |
+| `--head PATH` | Head VEX document. Required. |
+| `-o, --output PATH` | Write diff output to a file. |
 
 ### `ca9 action-plan`
 
@@ -260,6 +298,20 @@ Generate a machine-readable CI/CD action plan from an SCA report.
 ca9 action-plan snyk-report.json --repo . --coverage coverage.json -o action-plan.json
 ```
 
+Options:
+
+| Option | Description |
+|---|---|
+| `-r, --repo PATH` | Project repository path. Defaults to `.`. |
+| `-c, --coverage PATH` | `coverage.py` JSON file for dynamic reachability evidence. |
+| `--proof-standard strict\|balanced` | Proof policy. Defaults to `strict`. |
+| `--capabilities` | Include capability scanning for blast radius. |
+| `--runtime-context PATH` | Apply deployment-aware context such as auth and network isolation. |
+| `-o, --output PATH` | Write action plan JSON to a file. |
+| `--accepted-risks PATH` | TOML or JSON file listing findings that should not affect gates. |
+| `--baseline PATH` | Previous ca9 JSON report for baseline comparison. |
+| `--new-only` | Only gate on reachable or inconclusive findings not present in `--baseline`. |
+
 ### `ca9 trace`
 
 Trace exploit paths from project entry points to vulnerable API call sites.
@@ -268,6 +320,15 @@ Trace exploit paths from project entry points to vulnerable API call sites.
 ca9 trace snyk-report.json --repo . --coverage coverage.json --vuln-id CVE-2024-1234
 ```
 
+Options:
+
+| Option | Description |
+|---|---|
+| `-r, --repo PATH` | Project repository path. Defaults to `.`. |
+| `-c, --coverage PATH` | `coverage.py` JSON file for dynamic reachability evidence. |
+| `--vuln-id ID` | Restrict output to one vulnerability ID. |
+| `-o, --output PATH` | Write JSON trace output to a file. |
+
 ### `ca9 enrich-sbom`
 
 Enrich a CycloneDX or SPDX SBOM with reachability verdicts.
@@ -275,6 +336,14 @@ Enrich a CycloneDX or SPDX SBOM with reachability verdicts.
 ```bash
 ca9 enrich-sbom sbom.json --repo . --coverage coverage.json -o sbom.ca9.json
 ```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `-r, --repo PATH` | Project repository path. Defaults to `.`. |
+| `-c, --coverage PATH` | `coverage.py` JSON file for dynamic reachability evidence. |
+| `-o, --output PATH` | Write enriched SBOM JSON to a file. |
 
 ## Exit codes
 

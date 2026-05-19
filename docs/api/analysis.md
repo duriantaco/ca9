@@ -41,13 +41,14 @@ Checks if a PyPI package is imported anywhere in the repository.
 
 Checks if any of the given submodule paths are imported. Returns `(is_imported, matched_import)`.
 
-### `resolve_transitive_deps(repo_imports) -> dict[str, str]`
+### `resolve_transitive_deps(repo_imports) -> tuple[dict[str, str], bool]`
 
-Maps transitive dependency package names to the root packages that bring them in.
+Maps transitive dependency package names to the root packages that bring them in, and
+returns whether package metadata was available for graph construction.
 
 ```python
 resolve_transitive_deps({"flask", "jinja2"})
-# {'markupsafe': 'jinja2', 'werkzeug': 'flask', 'itsdangerous': 'flask'}
+# ({'markupsafe': 'jinja2', 'werkzeug': 'flask', 'itsdangerous': 'flask'}, True)
 ```
 
 ---
@@ -64,6 +65,10 @@ Loads and returns the raw coverage JSON data.
 
 Extracts a mapping of `{filename: [executed_line_numbers]}` from coverage data.
 
+### `get_coverage_completeness(coverage_data) -> float | None`
+
+Returns the `coverage.py` total percentage when present.
+
 ### `is_package_executed(package_name, covered_files) -> tuple[bool, list[str]]`
 
 Checks if any file from the given package was executed. Returns `(was_executed, matching_files)`.
@@ -71,6 +76,12 @@ Checks if any file from the given package was executed. Returns `(was_executed, 
 ### `is_submodule_executed(submodule_paths, file_hints, covered_files) -> tuple[bool, list[str]]`
 
 Checks if files matching the given submodule paths or file hints were executed. Returns `(was_executed, matching_files)`.
+
+### `are_call_sites_covered(call_sites, covered_files) -> tuple[bool | None, int, int]`
+
+Checks whether vulnerable first-party call sites executed. Returns
+`(covered, covered_count, matched_count)`, with `covered` set to `None` when no call sites
+could be matched to coverage files.
 
 ---
 

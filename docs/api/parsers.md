@@ -12,7 +12,9 @@ from ca9.parsers import detect_parser
 parser = detect_parser(Path("report.json"))
 ```
 
-Auto-detects the SCA format of the given JSON file. Tries each registered parser in order and returns the first match. Raises `ValueError` if no parser can handle the file.
+Auto-detects the SCA format of the given JSON file. Tries Snyk, Dependabot, Trivy, and
+pip-audit parsers in order and returns the first match. Raises `ValueError` if no parser
+can handle the file.
 
 ---
 
@@ -57,3 +59,39 @@ Returns `True` if the data is a list of objects with `security_advisory` and `de
 ### `parse(data) -> list[Vulnerability]`
 
 Extracts vulnerabilities from Dependabot alert objects. Uses GHSA ID, CVE ID, or alert number as the vulnerability ID.
+
+---
+
+## TrivyParser
+
+**Module:** `ca9.parsers.trivy`
+
+Parses output from `trivy fs --format json`.
+
+### `can_parse(data) -> bool`
+
+Returns `True` when the data has Trivy result metadata such as `Results` or
+`SchemaVersion`.
+
+### `parse(data) -> list[Vulnerability]`
+
+Extracts package vulnerability findings from Trivy result entries. Preserves target
+metadata, dependency paths when present, CWE/CPE data, references, advisory URLs, and
+published/modified timestamps.
+
+---
+
+## PipAuditParser
+
+**Module:** `ca9.parsers.pip_audit`
+
+Parses output from `pip-audit --format json`.
+
+### `can_parse(data) -> bool`
+
+Returns `True` when the data has a `dependencies` array.
+
+### `parse(data) -> list[Vulnerability]`
+
+Extracts vulnerability entries from dependency records and preserves aliases and CWE data
+where pip-audit provides them.

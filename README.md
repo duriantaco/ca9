@@ -283,6 +283,13 @@ ca9 scan [OPTIONS]              Scan declared or installed packages via OSV.dev
 ca9 check SCA_REPORT [OPTIONS]  Analyze a Snyk/Dependabot/Trivy/pip-audit report
 ca9 inventory [PATH] [OPTIONS]  Show normalized package inventory
 ca9 vet [PATH] [OPTIONS]        Run package supply-chain risk checks
+ca9 capabilities [OPTIONS]      Scan repository for AI capabilities
+ca9 cap-diff [OPTIONS]          Compare two AI-BOM documents
+ca9 cap-gate [OPTIONS]          Evaluate an AI-BOM diff against policy
+ca9 vex-diff [OPTIONS]          Compare two OpenVEX documents
+ca9 action-plan SCA_REPORT      Generate a machine-readable CI/CD action plan
+ca9 trace SCA_REPORT            Trace exploit paths to vulnerable call sites
+ca9 enrich-sbom SBOM_INPUT      Enrich CycloneDX or SPDX SBOM JSON
 
 Common options:
   -r, --repo PATH                  Path to the project repository  [default: .]
@@ -314,7 +321,7 @@ Inventory-only options:
   -f, --format [table|json]         Output format  [default: table]
 
 Vet-only options:
-  --trusted-index URL               Trusted Python package index; repeatable
+  --trusted-index URL               Trusted package registry/index; repeatable
   --private-index URL               Private index allowed for internal packages
   --internal-package PATTERN        Internal package glob, e.g. acme-*; repeatable
   --malware-query                   Query OSV for known malicious packages
@@ -324,11 +331,13 @@ Vet-only options:
   --deny-license ID                 Denied license identifier; repeatable
   --require-known-license           Warn when artifact metadata has no known license
   --offline                         Use cached OSV data only for malware query
+  --refresh-cache                   Clear OSV cache before malware query
+  --max-osv-workers N               Max concurrent OSV detail fetches  [default: 8]
 
 Exit codes:
-  0  Clean — no reachable CVEs
-  1  Reachable CVEs found — action needed
-  2  Inconclusive only — need more coverage data
+  0  Clean or no blocking decision
+  1  Reachable CVEs, VEX regressions, or blocking supply-chain findings
+  2  Inconclusive-only reachability results, or blocking capability/action policy
 ```
 
 ### Config file

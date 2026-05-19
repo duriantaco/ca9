@@ -27,6 +27,8 @@ Converts a `Report` object to a JSON-serializable dictionary.
   },
   "repo_path": ".",
   "coverage_path": "coverage.json",
+  "proof_standard": "strict",
+  "warnings": [],
   "results": [
     {
       "id": "GHSA-abcd-1234",
@@ -35,9 +37,25 @@ Converts a `Report` object to a JSON-serializable dictionary.
       "severity": "high",
       "verdict": "UNREACHABLE (static)",
       "reason": "submodule jinja2.sandbox not imported",
+      "confidence": 86,
       "imported_as": null,
       "executed_files": [],
-      "dependency_of": null
+      "dependency_of": null,
+      "affected_component": {
+        "submodule_paths": ["jinja2.sandbox"],
+        "confidence": "high",
+        "extraction_source": "curated"
+      },
+      "evidence": {
+        "version_in_range": true,
+        "package_imported": false,
+        "coverage_seen": null
+      },
+      "advisory": {
+        "ecosystem": "pypi",
+        "aliases": ["CVE-2024-1234"],
+        "source": "osv.dev"
+      }
     }
   ],
   "ignored_results": [
@@ -72,7 +90,7 @@ Writes the report as formatted JSON.
 
 ---
 
-## `write_table(report, output=None, verbose=False) -> str`
+## `write_table(report, output=None, verbose=False, show_confidence=False, show_evidence_source=False) -> str`
 
 Writes the report as an ASCII table.
 
@@ -81,8 +99,10 @@ Writes the report as an ASCII table.
 | Parameter | Type | Description |
 |---|---|---|
 | `report` | `Report` | The report to format |
-| `output` | `Path \| TextIO \| None` | Output destination |
+| `output` | `TextIO \| None` | Output stream. Defaults to stdout. |
 | `verbose` | `bool` | Include reasoning trace for each verdict |
+| `show_confidence` | `bool` | Include confidence score column |
+| `show_evidence_source` | `bool` | Include affected-component extraction source column |
 
 **Returns:** The table string.
 

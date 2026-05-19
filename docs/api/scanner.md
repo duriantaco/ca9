@@ -22,12 +22,19 @@ Supported inventory sources include `requirements*.txt`, nested `-r` requirement
 ## `scan_installed()`
 
 ```python
-def scan_installed() -> list[Vulnerability]
+def scan_installed(
+    offline: bool = False,
+    refresh_cache: bool = False,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+) -> list[Vulnerability]
 ```
 
 Scans all packages installed in the current Python environment for known vulnerabilities via OSV.dev.
 
 Combines `get_installed_packages()` and `query_osv_batch()` into a single call.
+
+Optional `offline`, `refresh_cache`, and `max_workers` arguments are passed through to
+`query_osv_batch()`.
 
 **Returns:** List of `Vulnerability` objects found.
 
@@ -48,6 +55,7 @@ Returns a list of `(name, version)` tuples for all packages installed in the cur
 ```python
 def query_osv_batch(
     packages: list[tuple[str, str]],
+    ecosystem: str = "PyPI",
     offline: bool = False,
     refresh_cache: bool = False,
     max_workers: int = DEFAULT_MAX_WORKERS,
@@ -61,6 +69,7 @@ Queries the [OSV.dev batch API](https://osv.dev/docs/) for vulnerabilities affec
 | Parameter | Type | Description |
 |---|---|---|
 | `packages` | `list[tuple[str, str]]` | List of `(name, version)` tuples |
+| `ecosystem` | `str` | OSV ecosystem name. Defaults to `PyPI`. |
 | `offline` | `bool` | Use cached OSV details only |
 | `refresh_cache` | `bool` | Clear cached OSV details before querying |
 | `max_workers` | `int` | Concurrent OSV detail fetches |
