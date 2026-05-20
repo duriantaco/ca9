@@ -1,7 +1,7 @@
 {
   "schema_version": "ca9.incident.v1",
-  "id": "grafana-github-token-2026-05",
-  "title": "Grafana GitHub token compromise and codebase exfiltration",
+  "id": "github-token-exfiltration-2026-05",
+  "title": "GitHub token compromise and codebase exfiltration",
   "incident_date": "2026-05-17",
   "source_urls": [
     "https://thehackernews.com/2026/05/grafana-github-token-breach-led-to.html",

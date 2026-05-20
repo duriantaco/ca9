@@ -1,7 +1,7 @@
 {
   "schema_version": "ca9.incident.v1",
-  "id": "mistral-npm-2026-05",
-  "title": "Mistral npm SDK packages affected by TanStack-related supply-chain attack",
+  "id": "npm-sdk-compromise-2026-05",
+  "title": "npm SDK packages affected by related supply-chain attack",
   "incident_date": "2026-05-12",
   "source_urls": [
     "https://docs.mistral.ai/resources/security-advisories"
@@ -38,7 +38,7 @@
       "package_name": "@mistralai/mistralai",
       "package_version": "2.2.4",
       "severity": "critical",
-      "title": "TanStack supply chain attack affecting Mistral AI SDK packages",
+      "title": "Related supply-chain attack affecting npm SDK packages",
       "malicious": true,
       "url": "https://docs.mistral.ai/resources/security-advisories"
     }

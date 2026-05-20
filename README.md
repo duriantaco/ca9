@@ -191,8 +191,8 @@ import-time risky behavior, silent process execution, and encoded payload execut
 python scripts/incident_replay.py --strict --format table
 ```
 
-ca9 keeps real incident fixtures for TanStack npm, Mistral npm/PyPI, and Grafana
-GitHub-token compromise scenarios. The current matrix is intentionally honest:
+ca9 keeps real incident fixtures for npm package compromise, PyPI import-time malware,
+and GitHub-token compromise scenarios. The current matrix is intentionally honest:
 unsupported npm and GitHub Actions attack surfaces are reported as gaps instead of
 passing demo cases.
 

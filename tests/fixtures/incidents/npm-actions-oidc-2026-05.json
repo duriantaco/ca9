@@ -1,7 +1,7 @@
 {
   "schema_version": "ca9.incident.v1",
-  "id": "tanstack-npm-2026-05",
-  "title": "TanStack npm supply-chain compromise through Actions cache and OIDC",
+  "id": "npm-actions-oidc-2026-05",
+  "title": "npm package compromise through Actions cache and OIDC",
   "incident_date": "2026-05-11",
   "source_urls": [
     "https://tanstack.com/blog/npm-supply-chain-compromise-postmortem",
@@ -41,7 +41,7 @@
       "package_name": "@tanstack/history",
       "package_version": "1.161.9",
       "severity": "critical",
-      "title": "Malware in @tanstack/* packages exfiltrates cloud credentials, GitHub tokens, and SSH keys",
+      "title": "Malware in npm packages exfiltrates cloud credentials, GitHub tokens, and SSH keys",
       "malicious": true,
       "url": "https://github.com/advisories/GHSA-g7cv-rxg3-hmpx"
     }

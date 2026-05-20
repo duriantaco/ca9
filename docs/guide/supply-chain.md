@@ -24,9 +24,9 @@ Replay recent real incidents against ca9's current supported surfaces:
 python scripts/incident_replay.py --strict --format table
 ```
 
-The fixtures live in `tests/fixtures/incidents/` and currently cover the May 2026
-TanStack npm compromise, Mistral npm/PyPI compromises, and Grafana GitHub token/codebase
-exfiltration incident. See `docs/proof/incident-coverage.md` for the current matrix.
+The fixtures live in `tests/fixtures/incidents/` and currently cover May 2026 npm package
+compromise, PyPI import-time malware, and GitHub token/codebase exfiltration patterns. See
+`docs/proof/incident-coverage.md` for the current matrix.
 
 ## Demo Fixture
 
