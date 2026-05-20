@@ -46,6 +46,24 @@ wheels = [
 ]
 """
 
+NPM_PACKAGE_LOCK = {
+    "name": "demo-npm",
+    "version": "0.1.0",
+    "lockfileVersion": 3,
+    "packages": {
+        "": {
+            "name": "demo-npm",
+            "version": "0.1.0",
+            "dependencies": {"left-pad": "1.3.0"},
+        },
+        "node_modules/left-pad": {
+            "version": "1.3.0",
+            "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+            "integrity": "sha512-left-pad",
+        },
+    },
+}
+
 
 def test_supply_chain_analyzer_flags_untrusted_registry_and_install_risk():
     evidence = SourceEvidence(source="test", path="fyn.lock", reader="fyn.lock")
@@ -199,6 +217,20 @@ def test_vet_cli_can_query_known_malware_advisories(tmp_path):
     data = json.loads(result.output)
     assert data["summary"]["blocking"] == 1
     assert data["findings"][0]["signal_type"] == "malware"
+
+
+def test_vet_cli_allows_default_npm_registry_from_package_lock(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text(json.dumps(NPM_PACKAGE_LOCK))
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["vet", "--repo", str(repo), "-f", "json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["summary"]["blocking"] == 0
+    assert not any(finding["signal_type"] == "untrusted_registry" for finding in data["findings"])
 
 
 def test_vet_cli_scan_artifacts_blocks_malicious_pth(tmp_path):

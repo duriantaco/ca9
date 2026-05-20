@@ -13,12 +13,14 @@ def _drop_none(data: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in data.items() if value is not None}
 
 
-def normalized_package_name(name: str) -> str:
+def normalized_package_name(name: str, ecosystem: str = "pypi") -> str:
+    if ecosystem.lower() == "npm":
+        return name.strip().lower()
     return str(canonicalize_name(name))
 
 
 def package_key(ecosystem: str, name: str, version: str | None = None) -> str:
-    base = f"{ecosystem.lower()}:{normalized_package_name(name)}"
+    base = f"{ecosystem.lower()}:{normalized_package_name(name, ecosystem)}"
     if version:
         return f"{base}@{version}"
     return base
@@ -26,7 +28,7 @@ def package_key(ecosystem: str, name: str, version: str | None = None) -> str:
 
 def purl_for_package(ecosystem: str, name: str, version: str | None = None) -> str:
     purl_type = ecosystem.lower()
-    normalized = normalized_package_name(name)
+    normalized = normalized_package_name(name, ecosystem)
     if version:
         return f"pkg:{purl_type}/{quote(normalized)}@{quote(version)}"
     return f"pkg:{purl_type}/{quote(normalized)}"
@@ -105,7 +107,7 @@ class Package:
 
     @property
     def normalized_name(self) -> str:
-        return normalized_package_name(self.name)
+        return normalized_package_name(self.name, self.ecosystem)
 
     @property
     def key(self) -> str:

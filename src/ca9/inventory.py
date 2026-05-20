@@ -6,12 +6,16 @@ from pathlib import Path
 from ca9.analysis.ast_scanner import discover_declared_dependency_inventory
 from ca9.core.models import Inventory, Package, SourceEvidence, SourceInput
 from ca9.readers.fyn_lock import read_fyn_lock
+from ca9.readers.package_lock import read_package_lock
 
 
 def build_inventory(repo_path: Path) -> Inventory:
     fyn_lock_path = repo_path / "fyn.lock"
     if fyn_lock_path.is_file():
         return read_fyn_lock(repo_path)
+    package_lock_path = repo_path / "package-lock.json"
+    if package_lock_path.is_file():
+        return read_package_lock(repo_path)
     return _declared_dependency_inventory(repo_path)
 
 
@@ -71,7 +75,7 @@ def _declared_dependency_inventory(repo_path: Path) -> Inventory:
 
     warnings: tuple[str, ...] = ()
     if not packages:
-        warnings = ("no fyn.lock or declared Python dependencies found",)
+        warnings = ("no fyn.lock, package-lock.json, or declared Python dependencies found",)
 
     return Inventory(
         repo_path=str(repo_path),

@@ -18,7 +18,7 @@ from ca9.core.models import (
 )
 from ca9.models import Vulnerability
 
-DEFAULT_TRUSTED_INDEXES = ("https://pypi.org/simple",)
+DEFAULT_TRUSTED_INDEXES = ("https://pypi.org/simple", "https://registry.npmjs.org")
 BLOCKING_SIGNALS = {"malware", "untrusted_registry"}
 
 
