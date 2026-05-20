@@ -200,6 +200,23 @@ class TestSubmoduleAnalysis:
         assert r.affected_component is not None
         assert r.affected_component.confidence == "high"
 
+    def test_root_package_import_does_not_prove_submodule_unreachable(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("import django\n")
+
+        vulns = [
+            _make_vuln(
+                "Django",
+                title="Session fixation vulnerability",
+            )
+        ]
+        report = analyze(vulns, repo)
+        r = report.results[0]
+        assert r.verdict == Verdict.INCONCLUSIVE
+        assert r.evidence is not None
+        assert r.evidence.submodule_imported is None
+
     def test_submodule_imported_no_coverage(self, tmp_path):
         repo = tmp_path / "repo"
         repo.mkdir()

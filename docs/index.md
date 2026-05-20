@@ -64,7 +64,7 @@ Total: 3  |  Reachable: 1  |  Unreachable: 2  |  Inconclusive: 0
 
 | Workflow | Command |
 |---|---|
-| Scan declared or installed dependencies with OSV | `ca9 scan --repo .` |
+| Scan repository dependency versions with OSV | `ca9 scan --repo .` |
 | Inspect normalized package inventory | `ca9 inventory --repo . -f json` |
 | Run supply-chain risk checks | `ca9 vet --repo . --scan-artifacts` |
 | Gate internal package resolution | `ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.acme.internal/simple` |

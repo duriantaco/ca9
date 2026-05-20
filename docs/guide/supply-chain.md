@@ -14,6 +14,19 @@ The current implementation is intentionally local-first:
 - package code is never installed, imported, or executed.
 - artifact downloads are explicit and hash-verified by default.
 - OSV malware advisory queries are opt-in.
+- Real incident replay fixtures track current coverage and gaps.
+
+## Incident Replay
+
+Replay recent real incidents against ca9's current supported surfaces:
+
+```bash
+python scripts/incident_replay.py --strict --format table
+```
+
+The fixtures live in `tests/fixtures/incidents/` and currently cover the May 2026
+TanStack npm compromise, Mistral npm/PyPI compromises, and Grafana GitHub token/codebase
+exfiltration incident. See `docs/proof/incident-coverage.md` for the current matrix.
 
 ## Demo Fixture
 

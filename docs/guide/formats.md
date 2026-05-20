@@ -71,7 +71,9 @@ pip-audit aliases are preserved so PYSEC findings can still match CVE-oriented r
 ca9 scan --repo .
 ```
 
-The scanner prefers dependency inventory from the repository. If no resolvable dependency inventory is available, it falls back to installed packages in the current Python environment.
+The scanner prefers exact dependency versions from the repository. Dependencies without
+resolved versions are skipped by default; pass `--allow-env-fallback` only when you
+intentionally want ca9 to use versions from the current Python environment.
 OSV vulnerability details populate advisory aliases, CWE/CPE IDs, source URLs, published/modified timestamps, and cache freshness metadata in JSON, SARIF, and OpenVEX outputs.
 
 Useful scan options:

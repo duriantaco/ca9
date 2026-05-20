@@ -684,6 +684,12 @@ def check(
     help="Clear OSV cache before fetching.",
 )
 @click.option(
+    "--allow-env-fallback",
+    is_flag=True,
+    default=False,
+    help="Use the current Python environment when repo dependency versions cannot be resolved.",
+)
+@click.option(
     "--max-osv-workers",
     type=int,
     default=8,
@@ -771,6 +777,7 @@ def scan(
     no_auto_coverage: bool,
     offline: bool,
     refresh_cache: bool,
+    allow_env_fallback: bool,
     max_osv_workers: int,
     show_confidence: bool,
     show_evidence_source: bool,
@@ -784,7 +791,7 @@ def scan(
     baseline_path: Path | None,
     new_only: bool,
 ) -> None:
-    """Scan declared or installed packages via OSV.dev."""
+    """Scan repository dependency versions via OSV.dev."""
     from ca9.scanner import query_osv_batch, resolve_scan_inventory
 
     repo_path = _resolve_option(ctx, "repo_path", repo_path)
@@ -800,7 +807,10 @@ def scan(
 
     coverage_path = resolve_coverage(coverage_path, repo_path, auto_generate=not no_auto_coverage)
 
-    inventory = resolve_scan_inventory(repo_path)
+    inventory = resolve_scan_inventory(
+        repo_path,
+        allow_environment_fallback=allow_env_fallback,
+    )
 
     if inventory.source == "repo":
         click.echo(
@@ -809,14 +819,30 @@ def scan(
             f"{inventory.environment_fallbacks} environment fallback(s))...",
             err=True,
         )
-    else:
+    elif inventory.source == "environment":
         click.echo(
             f"No resolvable repo inventory found. Falling back to {len(inventory.packages)} installed package(s)...",
             err=True,
         )
+    else:
+        click.echo("No exact repo dependency versions found to scan.", err=True)
 
     for warning in inventory.warnings:
         click.echo(f"ca9: {warning}", err=True)
+
+    if not inventory.packages:
+        from ca9.models import Report
+
+        report = Report(results=[], repo_path=str(repo_path), warnings=list(inventory.warnings))
+        _output_report(
+            report,
+            output_format,
+            output_path,
+            verbose=verbose,
+            show_confidence=show_confidence,
+            show_evidence_source=show_evidence_source,
+        )
+        return
 
     try:
         vulnerabilities = query_osv_batch(
@@ -829,7 +855,18 @@ def scan(
         raise click.ClickException(str(e)) from None
 
     if not vulnerabilities:
+        from ca9.models import Report
+
         click.echo("No known vulnerabilities found in scanned packages.")
+        report = Report(results=[], repo_path=str(repo_path), warnings=list(inventory.warnings))
+        _output_report(
+            report,
+            output_format,
+            output_path,
+            verbose=verbose,
+            show_confidence=show_confidence,
+            show_evidence_source=show_evidence_source,
+        )
         return
 
     click.echo(

@@ -71,13 +71,16 @@ ca9 check snyk-report.json --repo . --baseline previous-ca9.json --new-only
 
 ## `ca9 scan`
 
-Scan declared or installed packages directly through OSV.dev.
+Scan exact repository dependency versions directly through OSV.dev.
 
 ```bash
 ca9 scan [OPTIONS]
 ```
 
-`scan` first tries to resolve dependency inventory from the target repository. If no resolvable manifest is found, it falls back to installed packages from the current Python environment.
+`scan` resolves dependency inventory from the target repository. Dependencies without
+exact versions are skipped by default so CI scans do not accidentally analyze the
+ambient Python environment. Use `--allow-env-fallback` only when you intentionally
+want to scan installed package versions for unresolved dependencies.
 
 Additional scan options:
 
@@ -85,6 +88,7 @@ Additional scan options:
 |---|---|
 | `--offline` | Use cached OSV vulnerability details only. |
 | `--refresh-cache` | Clear the OSV cache before fetching. |
+| `--allow-env-fallback` | Use installed package versions when repo versions cannot be resolved. |
 | `--max-osv-workers N` | Maximum concurrent OSV detail fetches. Defaults to `8`. |
 
 Examples:

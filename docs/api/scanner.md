@@ -1,6 +1,6 @@
 # ca9.scanner
 
-OSV.dev integration for scanning declared repository dependencies or installed packages.
+OSV.dev integration for scanning exact repository dependency versions or, when explicitly requested, installed packages.
 
 ## `scan_repository()`
 
@@ -10,12 +10,16 @@ def scan_repository(
     offline: bool = False,
     refresh_cache: bool = False,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    allow_environment_fallback: bool = False,
 ) -> tuple[list[Vulnerability], ScanInventory]
 ```
 
 Resolves dependency inventory for a repository, queries OSV.dev for known vulnerabilities, and returns both the vulnerabilities and inventory metadata.
 
-The inventory resolver prefers declared repository dependencies. If no resolvable dependency inventory is found, it falls back to installed packages in the current Python environment.
+The inventory resolver prefers declared repository dependencies with exact versions.
+Unresolved dependencies are skipped by default. Set `allow_environment_fallback=True`
+only when you intentionally want unresolved dependencies to use versions from the
+current Python environment.
 
 Supported inventory sources include `requirements*.txt`, nested `-r` requirement files, constraints used to pin declared requirements, `pyproject.toml` dependencies and optional dependencies, Poetry metadata, `uv.lock`, `poetry.lock`, `Pipfile`, and `Pipfile.lock`.
 
