@@ -18,12 +18,12 @@ claim.
 
 ## Current Matrix
 
-| Incident | Current status | Inventory | Malware advisory | Workflow | Source |
+| Incident class | Current status | Inventory | Malware advisory | Workflow | Source handling |
 |---|---:|---:|---:|---:|---|
-| Mistral PyPI `mistralai==2.4.6` import-time dropper | partial | pass | gap | not applicable | [Mistral advisory](https://docs.mistral.ai/resources/security-advisories), [GHSA-wx9m-wx4f-4cmg](https://github.com/advisories/GHSA-wx9m-wx4f-4cmg) |
-| Mistral npm SDK package compromise | gap | gap | gap | not applicable | [Mistral advisory](https://docs.mistral.ai/resources/security-advisories) |
-| TanStack npm supply-chain compromise | gap | gap | gap | gap | [TanStack postmortem](https://tanstack.com/blog/npm-supply-chain-compromise-postmortem), [GHSA-g7cv-rxg3-hmpx](https://github.com/advisories/GHSA-g7cv-rxg3-hmpx) |
-| Grafana GitHub token/codebase exfiltration | gap | not applicable | not applicable | gap | [The Hacker News](https://thehackernews.com/2026/05/grafana-github-token-breach-led-to.html), [BleepingComputer](https://www.bleepingcomputer.com/news/security/grafana-says-stolen-github-token-let-hackers-steal-codebase/amp/) |
+| PyPI import-time dropper | partial | pass | gap | not applicable | fixture metadata |
+| npm SDK package compromise | gap | gap | gap | not applicable | fixture metadata |
+| npm package compromise through Actions/OIDC | gap | gap | gap | gap | fixture metadata |
+| GitHub token/codebase exfiltration | gap | not applicable | not applicable | gap | fixture metadata |
 
 Summary for this commit: `0 covered`, `1 partial`, `3 gap`.
 
@@ -37,21 +37,21 @@ Summary for this commit: `0 covered`, `1 partial`, `3 gap`.
 
 ## Known Gaps
 
-Mistral PyPI is partial because ca9 can inventory the pinned PyPI package from `fyn.lock`,
+The PyPI import-time dropper case is partial because ca9 can inventory the pinned PyPI package from `fyn.lock`,
 but a GHSA malicious-package advisory is not currently classified as blocking malware
 unless it also uses a `MAL-*` or `PYSEC-MAL-*` identifier. ca9 also needs import-time
-Python malware analysis to prove whether `import mistralai` could execute the dropper.
+Python malware analysis to prove whether importing the package could execute the dropper.
 
-Mistral npm and TanStack npm are gaps because ca9 does not yet parse `package-lock.json`,
+The npm package compromise cases are gaps because ca9 does not yet parse `package-lock.json`,
 `pnpm-lock.yaml`, or `yarn.lock`; does not query OSV/GHSA dynamically by npm ecosystem in
 the `vet --malware-query` path; and does not inspect npm lifecycle/install-time malware.
 
-TanStack also needs GitHub Actions analysis for `pull_request_target`, cache trust
+The Actions/OIDC compromise case also needs GitHub Actions analysis for `pull_request_target`, cache trust
 boundaries, OIDC token scope, mutable action refs, and publish provenance. Package
 provenance alone would not have been enough because the malicious packages carried trusted
 publisher provenance.
 
-Grafana is a gap because the reported incident was a stolen GitHub token and codebase
+The GitHub token/codebase exfiltration case is a gap because the reported incident was a stolen GitHub token and codebase
 exfiltration event, not a dependency CVE or package reachability case. A future workflow
 scanner can catch risky permissions and token exposure patterns, but full prevention also
 requires identity, access, audit-log, and incident-response controls outside ca9.

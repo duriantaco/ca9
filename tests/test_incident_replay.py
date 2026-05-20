@@ -18,9 +18,9 @@ def test_incident_replay_current_expectations_match_fixtures():
     assert_expectations(report)
 
 
-def test_incident_replay_exposes_mistral_pypi_partial_coverage():
+def test_incident_replay_exposes_pypi_import_dropper_partial_coverage():
     report = replay_incidents(FIXTURES)
-    incident = _incident(report, "mistral-pypi-2026-05")
+    incident = _incident(report, "pypi-import-dropper-2026-05")
     checks = _checks(incident)
 
     assert incident["overall_status"] == "partial"
@@ -32,23 +32,23 @@ def test_incident_replay_exposes_mistral_pypi_partial_coverage():
 
 def test_incident_replay_exposes_npm_and_workflow_gaps():
     report = replay_incidents(FIXTURES)
-    tanstack = _incident(report, "tanstack-npm-2026-05")
-    tanstack_checks = _checks(tanstack)
-    mistral_npm = _incident(report, "mistral-npm-2026-05")
-    mistral_checks = _checks(mistral_npm)
+    npm_actions = _incident(report, "npm-actions-oidc-2026-05")
+    npm_actions_checks = _checks(npm_actions)
+    npm_sdk = _incident(report, "npm-sdk-compromise-2026-05")
+    npm_sdk_checks = _checks(npm_sdk)
 
-    assert tanstack["overall_status"] == "gap"
-    assert tanstack_checks["inventory"]["status"] == "gap"
-    assert tanstack_checks["malware_advisory"]["status"] == "gap"
-    assert tanstack_checks["workflow"]["status"] == "gap"
-    assert tanstack_checks["workflow"]["missing_capability"] == "github_actions_workflow_scanner"
-    assert tanstack_checks["inventory"]["missing_package_keys"] == [
+    assert npm_actions["overall_status"] == "gap"
+    assert npm_actions_checks["inventory"]["status"] == "gap"
+    assert npm_actions_checks["malware_advisory"]["status"] == "gap"
+    assert npm_actions_checks["workflow"]["status"] == "gap"
+    assert npm_actions_checks["workflow"]["missing_capability"] == "github_actions_workflow_scanner"
+    assert npm_actions_checks["inventory"]["missing_package_keys"] == [
         "npm:@tanstack/history@1.161.9",
         "npm:@tanstack/react-router@1.169.5",
     ]
 
-    assert mistral_npm["overall_status"] == "gap"
-    assert mistral_checks["inventory"]["missing_package_keys"] == [
+    assert npm_sdk["overall_status"] == "gap"
+    assert npm_sdk_checks["inventory"]["missing_package_keys"] == [
         "npm:@mistralai/mistralai-azure@1.7.3",
         "npm:@mistralai/mistralai-gcp@1.7.3",
         "npm:@mistralai/mistralai@2.2.4",
@@ -59,8 +59,8 @@ def test_incident_replay_markdown_calls_out_gaps():
     report = replay_incidents(FIXTURES)
     markdown = render_markdown(report)
 
-    assert "| mistral-pypi-2026-05 | partial | pass | gap | not_applicable |" in markdown
-    assert "| tanstack-npm-2026-05 | gap | gap | gap | gap |" in markdown
+    assert "| pypi-import-dropper-2026-05 | partial | pass | gap | not_applicable |" in markdown
+    assert "| npm-actions-oidc-2026-05 | gap | gap | gap | gap |" in markdown
     assert "github_actions_workflow_scanner" not in markdown
     assert "npm lockfile inventory is not currently implemented." in markdown
 

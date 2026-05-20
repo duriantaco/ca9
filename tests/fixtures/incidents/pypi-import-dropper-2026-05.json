@@ -1,7 +1,7 @@
 {
   "schema_version": "ca9.incident.v1",
-  "id": "mistral-pypi-2026-05",
-  "title": "Mistral PyPI mistralai 2.4.6 import-time dropper",
+  "id": "pypi-import-dropper-2026-05",
+  "title": "PyPI package import-time dropper",
   "incident_date": "2026-05-12",
   "source_urls": [
     "https://docs.mistral.ai/resources/security-advisories",
@@ -27,7 +27,7 @@
       "package_name": "mistralai",
       "package_version": "2.4.6",
       "severity": "critical",
-      "title": "Malicious dropper in mistralai 2.4.6 PyPI package",
+      "title": "Malicious dropper in PyPI package",
       "malicious": true,
       "url": "https://github.com/advisories/GHSA-wx9m-wx4f-4cmg"
     }
