@@ -37,15 +37,7 @@ def replay_incidents(fixtures_dir: Path) -> dict[str, Any]:
             results.append(replay_incident(incident, root / incident["id"]))
 
     summary = Counter(result["overall_status"] for result in results)
-    expectation_failures = [
-        {
-            "incident_id": result["id"],
-            "expected": result["expected_current"]["overall_status"],
-            "actual": result["overall_status"],
-        }
-        for result in results
-        if result["overall_status"] != result["expected_current"]["overall_status"]
-    ]
+    expectation_failures = _expectation_failures(results)
     return {
         "schema_version": SCHEMA_VERSION,
         "fixtures_dir": str(fixtures_dir),
@@ -155,10 +147,46 @@ def assert_expectations(report: dict[str, Any]) -> None:
     if not report["expectation_failures"]:
         return
     failures = ", ".join(
-        f"{failure['incident_id']} expected {failure['expected']} got {failure['actual']}"
+        (
+            f"{failure['incident_id']} {failure['field']} "
+            f"expected {failure['expected']} got {failure['actual']}"
+        )
         for failure in report["expectation_failures"]
     )
     raise AssertionError(f"incident replay expectations changed: {failures}")
+
+
+def _expectation_failures(results: list[dict[str, Any]]) -> list[dict[str, str]]:
+    failures: list[dict[str, str]] = []
+    for result in results:
+        expected = result.get("expected_current", {})
+        expected_overall = expected.get("overall_status")
+        if expected_overall is not None and result["overall_status"] != expected_overall:
+            failures.append(
+                {
+                    "incident_id": result["id"],
+                    "field": "overall_status",
+                    "expected": expected_overall,
+                    "actual": result["overall_status"],
+                }
+            )
+
+        checks = {check["name"]: check for check in result["checks"]}
+        for check_name in ("inventory", "malware_advisory", "workflow"):
+            expected_status = expected.get(check_name)
+            if expected_status is None:
+                continue
+            actual_status = checks.get(check_name, {}).get("status", "not_applicable")
+            if actual_status != expected_status:
+                failures.append(
+                    {
+                        "incident_id": result["id"],
+                        "field": check_name,
+                        "expected": expected_status,
+                        "actual": actual_status,
+                    }
+                )
+    return failures
 
 
 def _write_repo_fixture(incident: dict[str, Any], repo_path: Path) -> None:

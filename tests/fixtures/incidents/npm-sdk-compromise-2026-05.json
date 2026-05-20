@@ -44,13 +44,13 @@
     }
   ],
   "expected_current": {
-    "overall_status": "gap",
-    "inventory": "gap",
+    "overall_status": "partial",
+    "inventory": "pass",
     "malware_advisory": "gap",
     "workflow": "not_applicable"
   },
   "known_gaps": [
-    "package-lock.json, pnpm-lock.yaml, and yarn.lock are not currently parsed into ca9 inventory.",
+    "pnpm-lock.yaml and yarn.lock are not currently parsed into ca9 inventory.",
     "OSV/GHSA malware matching is currently PyPI-oriented in the vet path.",
     "npm install-time malware and lifecycle-script analysis are not yet implemented."
   ]

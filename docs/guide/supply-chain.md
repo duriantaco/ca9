@@ -1,6 +1,6 @@
 ---
 title: Supply-Chain Vetting
-description: Use ca9 inventory and ca9 vet to inspect Python package inventory, fyn.lock evidence, malicious package behavior, dependency confusion, artifact integrity, and license policy.
+description: Use ca9 inventory and ca9 vet to inspect Python/npm package inventory, lockfile evidence, malicious package behavior, dependency confusion, artifact integrity, and license policy.
 ---
 
 # Supply-Chain Vetting
@@ -11,6 +11,7 @@ checks dependency risk beyond CVE reachability.
 The current implementation is intentionally local-first:
 
 - fyn is optional; ca9 reads `fyn.lock` natively when present.
+- npm projects can be inventoried from `package-lock.json`.
 - package code is never installed, imported, or executed.
 - artifact downloads are explicit and hash-verified by default.
 - OSV malware advisory queries are opt-in.
@@ -54,16 +55,16 @@ Inspect the normalized package inventory:
 ca9 inventory --repo . -f json
 ```
 
-When a repository has `fyn.lock`, inventory includes:
+When a repository has `fyn.lock` or npm `package-lock.json`, inventory includes:
 
 - resolved package names and versions
 - direct/transitive/project dependency kind
 - dependency edges
-- groups, markers, and extras where available
-- artifact URLs, hashes, upload times, sizes, and registries
+- groups, markers, extras, and npm dependency classes where available
+- artifact URLs, hashes/integrity values, upload times, sizes, and registries
 - source evidence for each package and edge
 
-Without `fyn.lock`, ca9 falls back to native manifest readers for `pyproject.toml`,
+Without lockfiles, ca9 falls back to native Python manifest readers for `pyproject.toml`,
 `requirements*.txt`, `Pipfile`, `uv.lock`, and `poetry.lock`.
 
 ## Basic Vetting

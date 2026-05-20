@@ -40,7 +40,7 @@ ca9 scan --repo . --coverage coverage.json
 ```
 
 For package inventory and supply-chain evidence, ca9 can read project manifests natively
-and uses `fyn.lock` when present:
+and uses `fyn.lock` or npm `package-lock.json` when present:
 
 ```bash
 ca9 inventory --repo . -f json
@@ -67,7 +67,7 @@ ca9 combines repository evidence with advisory metadata to determine whether vul
 
 **1. Static analysis (AST import tracing)** — Parses every Python file in your repo and traces `import` statements. If a vulnerable package is never imported, it's unreachable.
 
-**2. Dependency inventory** — Uses declared dependencies, report metadata, local package metadata, and `fyn.lock` when available to separate direct, transitive, imported, and unused packages.
+**2. Dependency inventory** — Uses declared dependencies, report metadata, local package metadata, `fyn.lock`, and npm `package-lock.json` when available to separate direct, transitive, imported, and unused packages.
 
 **3. Dynamic analysis (coverage.py)** — Checks whether vulnerable code was actually *executed* during your test suite. A package might be imported but the specific vulnerable function might never be called.
 
@@ -95,7 +95,7 @@ ca9 does not replace your SCA tool. It adds local, evidence-first reachability a
 | **Local analysis** | Runs in your repo/CI | Varies | Often requires source upload or hosted project import |
 | **Direct OSV scan** | Yes — `ca9 scan` queries OSV.dev directly | Not always | Varies |
 | **SCA report parsing** | Snyk, Dependabot, Trivy, pip-audit | Native to each tool | Platform-specific |
-| **Package inventory** | Native manifests plus optional `fyn.lock` artifacts and dependency edges | Varies | Varies |
+| **Package inventory** | Native manifests plus optional `fyn.lock` and npm `package-lock.json` artifacts and dependency edges | Varies | Varies |
 | **Static + dynamic evidence** | Imports, dependency graph, coverage, API usage | Usually package-level alerts | Varies by vendor and integration |
 | **Open outputs** | JSON, SARIF, OpenVEX, Markdown, HTML, remediation, action plan | Vendor-specific | Platform-specific |
 | **Confidence/evidence trail** | Structured evidence per verdict | Limited | Varies |
@@ -156,11 +156,11 @@ evidence. No Snyk, no Dependabot, no config files.
 ca9 inventory --repo . -f json
 ```
 
-When `fyn.lock` is present, ca9 reads it directly and includes package versions,
-direct/transitive dependency edges, dependency groups, markers, artifact URLs, hashes,
-upload times, and source evidence. If there is no `fyn.lock`, ca9 falls back to native
-manifest readers for `pyproject.toml`, `requirements*.txt`, `Pipfile`, `uv.lock`, and
-`poetry.lock`.
+When `fyn.lock` or npm `package-lock.json` is present, ca9 reads it directly and includes
+package versions, direct/transitive dependency edges, dependency groups, artifact URLs,
+hashes or integrity values, registries, and source evidence. If there is no lockfile, ca9
+falls back to native Python manifest readers for `pyproject.toml`, `requirements*.txt`,
+`Pipfile`, `uv.lock`, and `poetry.lock`.
 
 ### Run supply-chain risk checks
 
@@ -193,8 +193,8 @@ python scripts/incident_replay.py --strict --format table
 
 ca9 keeps real incident fixtures for npm package compromise, PyPI import-time malware,
 and GitHub-token compromise scenarios. The current matrix is intentionally honest:
-unsupported npm and GitHub Actions attack surfaces are reported as gaps instead of
-passing demo cases.
+unsupported npm advisory, package-tarball, and GitHub Actions attack surfaces are reported
+as gaps instead of passing demo cases.
 
 For dependency-confusion controls, use `--internal-package` with one or more private
 package name patterns and `--private-index` for the indexes those packages are allowed to
@@ -325,7 +325,7 @@ Inventory-only options:
   -f, --format [table|json]         Output format  [default: table]
 
 Vet-only options:
-  --trusted-index URL               Trusted Python package index; repeatable
+  --trusted-index URL               Trusted package index; repeatable
   --private-index URL               Private index allowed for internal packages
   --internal-package PATTERN        Internal package glob, e.g. acme-*; repeatable
   --malware-query                   Query OSV for known malicious packages
@@ -377,10 +377,11 @@ ca9 check snyk.json --repo .
 
 ### fyn integration
 
-ca9 does not require fyn. If a repository has `fyn.lock`, `ca9 inventory` parses it
-natively and treats it as high-fidelity package evidence. This gives ca9 exact resolved
-versions, direct/transitive edges, groups, markers, artifact hashes, artifact URLs, and
-source registries without shelling out to `fyn`.
+ca9 does not require fyn. If a repository has `fyn.lock` or npm `package-lock.json`,
+`ca9 inventory` parses it natively and treats it as high-fidelity package evidence. This
+gives ca9 exact resolved versions, direct/transitive edges, groups, artifact hashes or
+integrity values, artifact URLs, and source registries without shelling out to package
+manager CLIs.
 
 `ca9 vet` builds on that evidence for local supply-chain checks. For example, a direct
 dependency resolved from a non-trusted index is treated as risky, and an internal package
@@ -468,8 +469,8 @@ without pulling in a large dependency tree.
 - Static analysis traces `import` statements and `importlib.metadata` dependency trees. Dynamic imports (`importlib.import_module`, `__import__`) are not detected.
 - Coverage quality directly impacts dynamic analysis. If your tests don't exercise a code path, ca9 can't detect it dynamically.
 - Transitive dependency resolution requires packages to be installed. Without installed deps, ca9 falls back to direct-import-only checking.
-- `fyn.lock` support currently powers inventory, the first `ca9 vet` local supply-chain checks, and optional artifact static analysis. Full attack detection still needs richer external intelligence for maintainer changes, release-age anomalies, typosquatting, provenance, and active malware analysis.
-- Python only (for now).
+- `fyn.lock` and npm `package-lock.json` support currently power inventory and the first `ca9 vet` local supply-chain checks. Optional artifact static analysis currently scans Python wheel/sdist artifacts only. Full attack detection still needs richer external intelligence for maintainer changes, release-age anomalies, typosquatting, provenance, and active malware analysis.
+- Python reachability only for now; npm support is inventory evidence, not JavaScript reachability.
 
 ## Development
 

@@ -241,13 +241,13 @@ def inventory_cmd(
     "--trusted-index",
     "trusted_indexes",
     multiple=True,
-    help="Trusted Python package index URL. Can be repeated. Defaults to PyPI.",
+    help="Trusted package index URL. Can be repeated. Defaults to PyPI and npmjs.",
 )
 @click.option(
     "--private-index",
     "private_indexes",
     multiple=True,
-    help="Private Python package index URL for internal package names. Can be repeated.",
+    help="Private package index URL for internal package names. Can be repeated.",
 )
 @click.option(
     "--internal-package",

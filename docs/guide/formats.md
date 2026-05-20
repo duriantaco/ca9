@@ -9,7 +9,7 @@ ca9 supports two kinds of input:
 
 - Existing SCA reports from tools such as Snyk, Dependabot, Trivy, and pip-audit.
 - Repository or environment dependency inventory scanned directly against OSV.dev with `ca9 scan`.
-- Package inventory from manifests and `fyn.lock` with `ca9 inventory` and `ca9 vet`.
+- Package inventory from manifests, `fyn.lock`, and npm `package-lock.json` with `ca9 inventory` and `ca9 vet`.
 
 It can also emit multiple output formats for humans, CI systems, code scanning, VEX workflows, and SBOM enrichment.
 
@@ -84,18 +84,19 @@ ca9 scan --repo . --refresh-cache
 ca9 scan --repo . --max-osv-workers 16
 ```
 
-## Input: Package inventory and fyn.lock
+## Input: Package inventory and lockfiles
 
-`ca9 inventory` and `ca9 vet` use the normalized inventory model. When `fyn.lock` is
-present, ca9 reads it natively and extracts resolved packages, dependency edges, artifact
-URLs, artifact hashes, source registries, groups, and markers.
+`ca9 inventory` and `ca9 vet` use the normalized inventory model. When `fyn.lock` or npm
+`package-lock.json` is present, ca9 reads it natively and extracts resolved packages,
+dependency edges, artifact URLs, artifact hashes or integrity values, source registries,
+groups, and markers or npm dependency classes.
 
 ```bash
 ca9 inventory --repo . -f json
 ca9 vet --repo . -f json
 ```
 
-Without `fyn.lock`, ca9 falls back to native manifest readers.
+Without lockfiles, ca9 falls back to native Python manifest readers.
 
 ## Output formats
 
