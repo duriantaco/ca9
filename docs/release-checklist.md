@@ -26,28 +26,42 @@ python -m ca9.cli check --help
 
 ## Automated release
 
-The release workflow is manual by design: a maintainer chooses the SemVer version, then GitHub Actions handles the version bump, verification, tag, GitHub release, and PyPI publish.
+ca9 uses Release Please for automatic versioning. Contributors merge PRs with semantic titles, and Release Please opens or updates the release PR from commits on `main`.
 
-One-time PyPI setup:
+One-time setup:
 
 - Configure PyPI Trusted Publisher for `duriantaco/ca9`.
-- Use workflow name `release.yml`.
+- Use workflow file `release.yml`.
 - Use environment `pypi`.
+- Prefer a `RELEASE_PLEASE_TOKEN` secret so release PRs can satisfy required checks; the workflow falls back to `GITHUB_TOKEN`.
 
-Before running the workflow:
+PR title format:
 
-- Add a `CHANGELOG.md` section for the target version, such as `## [0.2.0] - 2026-04-26`.
-- Commit and push the release candidate changes to `main`.
-- Confirm there is no existing `vX.Y.Z` tag for the target version.
-
-Run the release:
-
-```bash
-gh workflow run release.yml -f version=0.2.0
-gh run watch
+```text
+<type>(<scope>): <subject>
 ```
 
-The workflow validates SemVer, writes the version into `pyproject.toml`, `ca9.__version__`, and docs structured data, runs tests/lint/docs build, builds the package, commits the version bump, tags `vX.Y.Z`, creates the GitHub release, and publishes to PyPI.
+Examples:
+
+```text
+feat(inventory): add npm package-lock reader
+fix(scanner): preserve npm package names
+docs(release): document automated publishing
+```
+
+Release flow:
+
+- Pushes to `main` run `.github/workflows/release.yml`.
+- Release Please updates `CHANGELOG.md`, `pyproject.toml`, `src/ca9/__init__.py`, docs structured metadata, and the release manifest.
+- A maintainer reviews and merges the Release Please PR.
+- Release Please creates the `vX.Y.Z` tag and GitHub release.
+- The publish job checks tag provenance and version consistency, runs tests/lint/docs build, builds the package, and publishes to PyPI.
+- If publish needs a safe retry after a GitHub release exists, manually dispatch `release.yml` with `ref=vX.Y.Z`.
+
+Baseline:
+
+- The release manifest starts from the existing `v0.3.1` GitHub release to avoid duplicate tag creation.
+- Future versions are derived from semantic commit history after the bootstrap SHA.
 
 ## Metadata
 
