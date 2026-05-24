@@ -38,3 +38,4 @@ Example MCP client configuration:
 | `trace_exploit_path` | Trace paths to vulnerable API call sites. |
 | `lookup_threat_intel` | Look up EPSS and CISA KEV data. |
 | `enrich_sbom` | Enrich a CycloneDX or SPDX SBOM. |
+| `ingest_sarif` | Normalize SARIF scanner output into ca9 evidence findings. |

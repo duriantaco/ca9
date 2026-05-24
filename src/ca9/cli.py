@@ -422,6 +422,64 @@ def vet_cmd(
     sys.exit(report.exit_code)
 
 
+@main.command(name="ingest-sarif")
+@click.argument("sarif_input", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "-r",
+    "--repo",
+    "repo_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=".",
+    help="Path to the project repository.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write output to file instead of stdout.",
+)
+def ingest_sarif_cmd(
+    sarif_input: Path,
+    repo_path: Path,
+    output_format: str,
+    output_path: Path | None,
+) -> None:
+    """Normalize SARIF static-analysis output into ca9 evidence findings."""
+    from ca9.ingest.sarif import (
+        evidence_report_to_json,
+        evidence_report_to_table,
+        load_sarif_report,
+    )
+
+    try:
+        report = load_sarif_report(sarif_input, repo_path=repo_path)
+    except json.JSONDecodeError as e:
+        raise click.ClickException(f"Invalid JSON in {sarif_input}: {e}") from None
+    except (OSError, ValueError) as e:
+        raise click.ClickException(str(e)) from None
+
+    if output_format == "json":
+        text = evidence_report_to_json(report)
+    else:
+        text = evidence_report_to_table(report)
+
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text)
+    else:
+        click.echo(text)
+
+
 @main.command()
 @click.argument("sca_report", type=click.Path(exists=True, path_type=Path))
 @click.option(
