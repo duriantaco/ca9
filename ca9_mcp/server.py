@@ -602,6 +602,45 @@ def enrich_sbom(
     return _json_response(enriched)
 
 
+@_tool()
+def ingest_sarif(
+    sarif_path: str,
+    repo_path: str = ".",
+    format: str = "json",
+) -> str:
+    """Normalize SARIF static-analysis output into ca9 evidence findings."""
+    from ca9.ingest.sarif import (
+        evidence_report_to_json,
+        evidence_report_to_table,
+        load_sarif_report,
+    )
+
+    sarif_file = Path(sarif_path)
+    if not sarif_file.is_file():
+        return _json_error(f"SARIF file not found: {sarif_path}")
+
+    repo, error = _resolve_repo(repo_path)
+    if error:
+        return error
+
+    if format not in ("json", "table"):
+        return _json_error("Unsupported format. Use 'json' or 'table'.", error_type="ValueError")
+
+    try:
+        report = load_sarif_report(sarif_file, repo_path=repo)
+    except json.JSONDecodeError as exc:
+        return _json_error(
+            f"Invalid JSON in SARIF file {sarif_path}: {exc}",
+            error_type=type(exc).__name__,
+        )
+    except (OSError, ValueError) as exc:
+        return _json_error(str(exc), error_type=type(exc).__name__)
+
+    if format == "table":
+        return evidence_report_to_table(report)
+    return evidence_report_to_json(report)
+
+
 def main():
     if mcp is None:
         print(

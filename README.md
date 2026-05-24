@@ -47,6 +47,13 @@ ca9 inventory --repo . -f json
 ca9 vet --repo . -f json
 ```
 
+For agentic triage, ca9 can normalize SARIF from tools such as CodeQL or Semgrep
+into a `ca9.evidence.v1` evidence report:
+
+```bash
+ca9 ingest-sarif codeql.sarif --repo . -f json
+```
+
 ```
 CVE ID               Package   Severity  Verdict
 --------------------------------------------------------------

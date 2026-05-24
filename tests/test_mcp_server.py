@@ -41,6 +41,39 @@ class TestMCPServer:
         assert data["inventory_source"] == "repo"
         assert data["message"] == "No known vulnerabilities found in scanned packages."
 
+    def test_ingest_sarif_returns_evidence_report(self, tmp_path):
+        sarif = {
+            "version": "2.1.0",
+            "runs": [
+                {
+                    "tool": {"driver": {"name": "Semgrep", "rules": [{"id": "python.lang.security.audit"}]}},
+                    "results": [
+                        {
+                            "ruleId": "python.lang.security.audit",
+                            "level": "error",
+                            "message": {"text": "Potential command injection."},
+                            "locations": [
+                                {
+                                    "physicalLocation": {
+                                        "artifactLocation": {"uri": "app.py"},
+                                        "region": {"startLine": 7},
+                                    }
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        path = tmp_path / "semgrep.sarif"
+        path.write_text(json.dumps(sarif))
+
+        data = json.loads(server.ingest_sarif(str(path), repo_path=str(tmp_path)))
+
+        assert data["schema_version"] == "ca9.evidence.v1"
+        assert data["summary"]["findings"] == 1
+        assert data["findings"][0]["severity"] == "high"
+
     def test_main_requires_optional_dependency(self, monkeypatch, capsys):
         monkeypatch.setattr(server, "mcp", None)
         monkeypatch.setattr(server, "_MCP_IMPORT_ERROR", ImportError("No module named 'mcp'"))

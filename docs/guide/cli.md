@@ -5,7 +5,7 @@ description: Complete ca9 CLI reference for Python CVE reachability analysis, pa
 
 # CLI Reference
 
-ca9 provides reachability-aware CVE triage and local Python package security checks. The core commands are `check` for existing SCA reports, `scan` for direct OSV.dev scanning, `inventory` for normalized package evidence, and `vet` for supply-chain risk checks.
+ca9 provides reachability-aware CVE triage and local Python package security checks. The core commands are `check` for existing SCA reports, `scan` for direct OSV.dev scanning, `inventory` for normalized package evidence, `vet` for supply-chain risk checks, and `ingest-sarif` for normalizing static-analysis evidence from other tools.
 
 ## Global options
 
@@ -164,6 +164,32 @@ ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
 ```
 
 See [Supply-Chain Vetting](supply-chain.md) for details on current findings and limits.
+
+## `ca9 ingest-sarif`
+
+Normalize SARIF 2.1.0 scanner output into ca9 evidence findings.
+
+```bash
+ca9 ingest-sarif SARIF_INPUT [OPTIONS]
+```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `-r, --repo PATH` | Project repository path. Defaults to `.`. |
+| `-f, --format table\|json` | Output format. Defaults to `table`. |
+| `-o, --output PATH` | Write output to a file. |
+
+Examples:
+
+```bash
+ca9 ingest-sarif codeql.sarif --repo . -f json -o ca9-evidence.json
+ca9 ingest-sarif semgrep.sarif --repo . -f table
+```
+
+The JSON output uses `ca9.evidence.v1` and preserves tool, rule, location,
+fingerprint, severity, and confidence metadata for agentic triage.
 
 ## Output formats
 
