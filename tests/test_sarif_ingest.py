@@ -312,7 +312,9 @@ def test_sarif_fingerprint_ignores_preserved_snippet_when_fingerprints_exist(tmp
             ],
         }
 
-    finding_a = sarif_to_evidence_report(sarif_with_snippet("open(path)"), repo_path=repo).findings[0]
+    finding_a = sarif_to_evidence_report(sarif_with_snippet("open(path)"), repo_path=repo).findings[
+        0
+    ]
     finding_b = sarif_to_evidence_report(
         sarif_with_snippet("open(user_controlled_path)"),
         repo_path=repo,

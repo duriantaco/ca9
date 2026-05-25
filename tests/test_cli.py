@@ -347,7 +347,10 @@ def parse_payload(payload: str):
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["summary"]["research_packets"] == 2
-        assert "research packets do not include exploit payloads or crash inputs" in data["containment"]
+        assert (
+            "research packets do not include exploit payloads or crash inputs"
+            in data["containment"]
+        )
         assert (repo / "research_packets" / "manifest.json").exists()
 
     def test_cap_diff_command(self, tmp_path):

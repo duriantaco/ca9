@@ -59,7 +59,9 @@ def sarif_to_evidence_report(
 
         for result_index, result in enumerate(results):
             if not isinstance(result, dict):
-                warnings.append(f"Skipped non-object result at run {run_index}, index {result_index}.")
+                warnings.append(
+                    f"Skipped non-object result at run {run_index}, index {result_index}."
+                )
                 continue
             rule = _rule_for_result(run, result)
             findings.append(

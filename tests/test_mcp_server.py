@@ -46,7 +46,12 @@ class TestMCPServer:
             "version": "2.1.0",
             "runs": [
                 {
-                    "tool": {"driver": {"name": "Semgrep", "rules": [{"id": "python.lang.security.audit"}]}},
+                    "tool": {
+                        "driver": {
+                            "name": "Semgrep",
+                            "rules": [{"id": "python.lang.security.audit"}],
+                        }
+                    },
                     "results": [
                         {
                             "ruleId": "python.lang.security.audit",
