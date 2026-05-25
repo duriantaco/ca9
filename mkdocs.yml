@@ -86,6 +86,7 @@ nav:
       - CI/CD: integrations/ci-cd.md
   - Architecture:
       - Overview: architecture/overview.md
+      - Evidence Layer: architecture/evidence.md
       - Verdict Engine: architecture/engine.md
       - Analysis Pipeline: architecture/analysis.md
       - Parsers: architecture/parsers.md

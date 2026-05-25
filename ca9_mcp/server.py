@@ -429,6 +429,84 @@ def scan_capabilities(
 
 
 @_tool()
+def hunt_zero_days(
+    repo_path: str = ".",
+    limit: int = 20,
+    fuzz_introspector_summary_path: str | None = None,
+    generate_harnesses_path: str | None = None,
+    harness_limit: int = 5,
+    generate_research_packet_path: str | None = None,
+    research_packet_limit: int = 5,
+    scope: str | None = None,
+    recipient: str | None = None,
+) -> str:
+    """Find authorized local unknown-bug research targets and private handoff packets."""
+    from ca9.hunt import (
+        apply_fuzz_introspector_summary,
+        generate_atheris_harnesses,
+        generate_research_packets,
+        scan_hunt_targets,
+    )
+
+    repo, error = _resolve_repo(repo_path)
+    if error:
+        return error
+
+    try:
+        report = scan_hunt_targets(repo, limit=limit)
+        if fuzz_introspector_summary_path:
+            summary_path = Path(fuzz_introspector_summary_path)
+            if not summary_path.is_absolute():
+                summary_path = repo / summary_path
+            if not summary_path.is_file():
+                return _json_error(
+                    f"Fuzz Introspector summary not found: {fuzz_introspector_summary_path}"
+                )
+            report = apply_fuzz_introspector_summary(report, summary_path)
+        if generate_harnesses_path:
+            harness_path = Path(generate_harnesses_path)
+            if not harness_path.is_absolute():
+                harness_path = repo / harness_path
+            try:
+                harness_path.resolve().relative_to(repo.resolve())
+            except ValueError:
+                return _json_error(
+                    "Harness output path must be inside the repository for MCP use.",
+                    error_type="ValueError",
+                )
+            report = generate_atheris_harnesses(
+                report,
+                harness_path,
+                limit=harness_limit,
+            )
+        if generate_research_packet_path:
+            packet_path = Path(generate_research_packet_path)
+            if not packet_path.is_absolute():
+                packet_path = repo / packet_path
+            try:
+                packet_path.resolve().relative_to(repo.resolve())
+            except ValueError:
+                return _json_error(
+                    "Research packet output path must be inside the repository for MCP use.",
+                    error_type="ValueError",
+                )
+            report = generate_research_packets(
+                report,
+                packet_path,
+                limit=research_packet_limit,
+                scope=scope,
+                recipient=recipient,
+            )
+    except Exception as exc:
+        return _json_error(
+            f"Hunt target discovery failed: {exc}",
+            error_type=type(exc).__name__,
+        )
+
+    return _json_response(report.to_dict())
+
+
+@_tool()
 def check_blast_radius(
     report_path: str,
     repo_path: str = ".",
@@ -600,6 +678,45 @@ def enrich_sbom(
             error_type=type(exc).__name__,
         )
     return _json_response(enriched)
+
+
+@_tool()
+def ingest_sarif(
+    sarif_path: str,
+    repo_path: str = ".",
+    format: str = "json",
+) -> str:
+    """Normalize SARIF static-analysis output into ca9 evidence findings."""
+    from ca9.ingest.sarif import (
+        evidence_report_to_json,
+        evidence_report_to_table,
+        load_sarif_report,
+    )
+
+    sarif_file = Path(sarif_path)
+    if not sarif_file.is_file():
+        return _json_error(f"SARIF file not found: {sarif_path}")
+
+    repo, error = _resolve_repo(repo_path)
+    if error:
+        return error
+
+    if format not in ("json", "table"):
+        return _json_error("Unsupported format. Use 'json' or 'table'.", error_type="ValueError")
+
+    try:
+        report = load_sarif_report(sarif_file, repo_path=repo)
+    except json.JSONDecodeError as exc:
+        return _json_error(
+            f"Invalid JSON in SARIF file {sarif_path}: {exc}",
+            error_type=type(exc).__name__,
+        )
+    except (OSError, ValueError) as exc:
+        return _json_error(str(exc), error_type=type(exc).__name__)
+
+    if format == "table":
+        return evidence_report_to_table(report)
+    return evidence_report_to_json(report)
 
 
 def main():

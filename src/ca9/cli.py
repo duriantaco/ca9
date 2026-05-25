@@ -422,6 +422,64 @@ def vet_cmd(
     sys.exit(report.exit_code)
 
 
+@main.command(name="ingest-sarif")
+@click.argument("sarif_input", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "-r",
+    "--repo",
+    "repo_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=".",
+    help="Path to the project repository.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write output to file instead of stdout.",
+)
+def ingest_sarif_cmd(
+    sarif_input: Path,
+    repo_path: Path,
+    output_format: str,
+    output_path: Path | None,
+) -> None:
+    """Normalize SARIF static-analysis output into ca9 evidence findings."""
+    from ca9.ingest.sarif import (
+        evidence_report_to_json,
+        evidence_report_to_table,
+        load_sarif_report,
+    )
+
+    try:
+        report = load_sarif_report(sarif_input, repo_path=repo_path)
+    except json.JSONDecodeError as e:
+        raise click.ClickException(f"Invalid JSON in {sarif_input}: {e}") from None
+    except (OSError, ValueError) as e:
+        raise click.ClickException(str(e)) from None
+
+    if output_format == "json":
+        text = evidence_report_to_json(report)
+    else:
+        text = evidence_report_to_table(report)
+
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text)
+    else:
+        click.echo(text)
+
+
 @main.command()
 @click.argument("sca_report", type=click.Path(exists=True, path_type=Path))
 @click.option(
@@ -976,6 +1034,107 @@ def capabilities_cmd(repo_path: Path, output_path: Path | None, output_format: s
                             lines.append(f"  {prop.value}")
         text = "\n".join(lines)
 
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text)
+        click.echo(f"Written to {output_path}", err=True)
+    else:
+        click.echo(text)
+
+
+@main.command(name="hunt")
+@click.option(
+    "-r",
+    "--repo",
+    "repo_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=".",
+    help="Path to the project repository.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write output to file instead of stdout.",
+)
+@click.option("--limit", type=int, default=20, help="Maximum targets to report.")
+@click.option(
+    "--include-tests",
+    is_flag=True,
+    default=False,
+    help="Include tests, docs examples, and demo files in target discovery.",
+)
+@click.option(
+    "--generate-harnesses",
+    "harness_dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write Atheris harness skeletons for directly fuzzable targets.",
+)
+@click.option(
+    "--harness-limit",
+    type=int,
+    default=5,
+    help="Maximum harness skeletons to generate.",
+)
+@click.option(
+    "--fuzz-introspector-summary",
+    "fuzz_introspector_summary",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Merge Fuzz Introspector summary.json sink/reachability evidence.",
+)
+@click.option(
+    "--research-packet-dir",
+    "research_packet_dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write private researcher handoff packets for top candidates.",
+)
+def hunt_cmd(
+    repo_path: Path,
+    output_format: str,
+    output_path: Path | None,
+    limit: int,
+    include_tests: bool,
+    harness_dir: Path | None,
+    harness_limit: int,
+    fuzz_introspector_summary: Path | None,
+    research_packet_dir: Path | None,
+) -> None:
+    """Find local unknown-bug research targets and optional private artifacts."""
+    from ca9.hunt import (
+        apply_fuzz_introspector_summary,
+        generate_atheris_harnesses,
+        generate_research_packets,
+        hunt_report_to_json,
+        hunt_report_to_table,
+        scan_hunt_targets,
+    )
+
+    report = scan_hunt_targets(repo_path, limit=limit, include_tests=include_tests)
+    if fuzz_introspector_summary:
+        report = apply_fuzz_introspector_summary(report, fuzz_introspector_summary)
+    if harness_dir:
+        report = generate_atheris_harnesses(report, harness_dir, limit=harness_limit)
+    if research_packet_dir:
+        report = generate_research_packets(
+            report,
+            research_packet_dir,
+            limit=None,
+        )
+
+    text = hunt_report_to_json(report) if output_format == "json" else hunt_report_to_table(report)
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(text)

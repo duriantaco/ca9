@@ -5,7 +5,7 @@ description: Complete ca9 CLI reference for Python CVE reachability analysis, pa
 
 # CLI Reference
 
-ca9 provides reachability-aware CVE triage and local Python package security checks. The core commands are `check` for existing SCA reports, `scan` for direct OSV.dev scanning, `inventory` for normalized package evidence, and `vet` for supply-chain risk checks.
+ca9 provides reachability-aware CVE triage and local Python package security checks. The core commands are `check` for existing SCA reports, `scan` for direct OSV.dev scanning, `inventory` for normalized package evidence, `vet` for supply-chain risk checks, and `ingest-sarif` for normalizing static-analysis evidence from other tools.
 
 ## Global options
 
@@ -165,6 +165,32 @@ ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
 
 See [Supply-Chain Vetting](supply-chain.md) for details on current findings and limits.
 
+## `ca9 ingest-sarif`
+
+Normalize SARIF 2.1.0 scanner output into ca9 evidence findings.
+
+```bash
+ca9 ingest-sarif SARIF_INPUT [OPTIONS]
+```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `-r, --repo PATH` | Project repository path. Defaults to `.`. |
+| `-f, --format table\|json` | Output format. Defaults to `table`. |
+| `-o, --output PATH` | Write output to a file. |
+
+Examples:
+
+```bash
+ca9 ingest-sarif codeql.sarif --repo . -f json -o ca9-evidence.json
+ca9 ingest-sarif semgrep.sarif --repo . -f table
+```
+
+The JSON output uses `ca9.evidence.v1` and preserves tool, rule, location,
+fingerprint, severity, and confidence metadata for agentic triage.
+
 ## Output formats
 
 | Format | Use case |
@@ -231,6 +257,46 @@ Scan a repository for AI capabilities and emit an AI-BOM summary or JSON.
 ca9 capabilities --repo .
 ca9 capabilities --repo . -f json -o aibom.json
 ```
+
+### `ca9 hunt`
+
+Find local unknown-bug research targets by ranking parser-like functions, exposed
+handlers, risky sinks, and complexity. The command can also generate reviewable
+Atheris harness skeletons for targets with a single fuzzable input and private
+researcher handoff packets for human validation.
+
+```bash
+ca9 hunt --repo .
+ca9 hunt --repo . -f json -o hunt.json
+ca9 hunt --repo . --generate-harnesses fuzz_harnesses
+ca9 hunt --repo . --research-packet-dir research_packets
+ca9 hunt --repo . --fuzz-introspector-summary summary.json
+```
+
+Current flags:
+
+| Flag | Purpose |
+| --- | --- |
+| `-r, --repo PATH` | Path to the project repository. |
+| `-f, --format [table\|json]` | Output format. |
+| `-o, --output PATH` | Write output to file instead of stdout. |
+| `--limit N` | Maximum targets to report. |
+| `--include-tests` | Include tests, docs examples, and demo files in target discovery. |
+| `--generate-harnesses PATH` | Write Atheris harness skeletons for directly fuzzable targets. |
+| `--harness-limit N` | Maximum harness skeletons to generate. |
+| `--fuzz-introspector-summary PATH` | Merge Fuzz Introspector `summary.json` sink/reachability evidence. |
+| `--research-packet-dir PATH` | Write private researcher handoff packets for reported candidates. |
+| `--help` | Show command help. |
+
+Hunt output is local-only. The public package contains the workflow code, not the
+user's private findings. The command does not phone home, publish findings, or
+probe remote systems. Generated harness directories include a `.gitignore` guard
+and best-effort private permissions. Researcher packet directories use the same
+private artifact guard and are intended for authorized disclosure workflows.
+Reports and packets do not include raw fuzzing inputs or exploit payloads.
+
+When a Fuzz Introspector `summary.json` is available, ca9 can merge its sink and
+fuzzer reachability evidence into the hunt ranking.
 
 ### `ca9 cap-diff`
 

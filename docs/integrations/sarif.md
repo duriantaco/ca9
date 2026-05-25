@@ -38,3 +38,18 @@ steps:
     with:
       sarif_file: ca9.sarif
 ```
+
+## Ingest SARIF as evidence
+
+ca9 can also read SARIF produced by other tools and normalize it into the
+`ca9.evidence.v1` evidence schema:
+
+```bash
+ca9 ingest-sarif codeql.sarif --repo . -f json
+ca9 ingest-sarif semgrep.sarif --repo . -f table
+```
+
+This is the first generic evidence adapter for agentic security workflows. It preserves
+tool provenance, SARIF run/result indexes, rule metadata, primary source locations,
+severity, confidence, and fingerprints so MCP clients and future ca9 agents can triage
+findings without losing the raw audit trail.
