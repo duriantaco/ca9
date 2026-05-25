@@ -234,6 +234,122 @@ class TestCLINewCommands:
         assert result.exit_code == 0
         assert "Components" in result.output
 
+    def test_hunt_command_json_and_harness_generation(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "parser.py").write_text(
+            """
+import json
+
+
+def parse_payload(payload: str):
+    return json.loads(payload)
+"""
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "hunt",
+                "--repo",
+                str(repo),
+                "-f",
+                "json",
+                "--generate-harnesses",
+                str(repo / "fuzz_harnesses"),
+            ],
+        )
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["schema_version"] == "ca9.hunt.v1"
+        assert data["summary"]["targets"] == 1
+        assert data["summary"]["generated_harnesses"] == 1
+        assert data["private_artifact_root"] == str(repo / "fuzz_harnesses")
+        assert "artifact directory is ignored by git" in data["containment"]
+
+    def test_hunt_command_merges_fuzz_introspector_summary(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "parser.py").write_text(
+            """
+import json
+
+
+def parse_payload(payload: str):
+    return json.loads(payload)
+"""
+        )
+        summary = repo / "summary.json"
+        summary.write_text(
+            json.dumps(
+                {
+                    "analyses": {
+                        "SinkCoverageAnalyser": [
+                            {
+                                "func_name": "parse_payload",
+                                "filename": "parser.py",
+                                "call_loc": "Not in call tree",
+                                "fuzzer_reach": [],
+                            }
+                        ]
+                    }
+                }
+            )
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "hunt",
+                "--repo",
+                str(repo),
+                "-f",
+                "json",
+                "--fuzz-introspector-summary",
+                str(summary),
+            ],
+        )
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["targets"][0]["fuzz_introspector"]["reach_state"] == "not_reached"
+
+    def test_hunt_command_generates_research_packets(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "parser.py").write_text(
+            """
+import json
+
+
+def parse_payload(payload: str):
+    return json.loads(payload)
+"""
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "hunt",
+                "--repo",
+                str(repo),
+                "-f",
+                "json",
+                "--research-packet-dir",
+                str(repo / "research_packets"),
+            ],
+        )
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["summary"]["research_packets"] == 2
+        assert "research packets do not include exploit payloads or crash inputs" in data["containment"]
+        assert (repo / "research_packets" / "manifest.json").exists()
+
     def test_cap_diff_command(self, tmp_path):
         base_bom = {"components": [], "services": [], "metadata": {"properties": []}}
         head_bom = {
