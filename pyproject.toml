@@ -45,6 +45,7 @@ Documentation = "https://duriantaco.github.io/ca9/"
 Source = "https://github.com/duriantaco/ca9"
 Issues = "https://github.com/duriantaco/ca9/issues"
 Changelog = "https://github.com/duriantaco/ca9/blob/main/CHANGELOG.md"
+Security = "https://github.com/duriantaco/ca9/security/policy"
 
 [project.optional-dependencies]
 cli = ["click>=8.0"]
