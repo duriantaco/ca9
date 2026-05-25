@@ -56,6 +56,33 @@ Do not interpret this table as proof that ca9 catches every vulnerability. The s
 claim is narrower: when ca9 lacks enough evidence, it should prefer `INCONCLUSIVE` over
 an unsafe `UNREACHABLE` verdict.
 
+## npm Lockfile Inventory Validation
+
+Before publishing npm inventory claims, run the pinned public-repo lockfile validation
+harness:
+
+```bash
+python scripts/npm_real_repo_validation.py --output-dir /tmp/ca9-npm-real-repo-validation
+```
+
+The harness downloads real `package-lock.json` files at fixed commits, builds an
+independent baseline directly from each lockfile, then compares ca9 inventory output
+against that baseline. The baseline checks package keys, dependency edges, direct package
+count, and artifact/tarball count. It does not install packages or execute JavaScript.
+
+Current npm validation set:
+
+| Case | Commit | Lockfile | Packages | Edges | Direct | Artifacts | Result |
+|---|---|---:|---:|---:|---:|---:|---|
+| axios | `979918445324cb9150134d068ba06f8cc9723346` | 3 | 686 | 1277 | 43 | 716 | Pass |
+| Mocha | `6695fba397a6d1ca2d7cd4de86d9dda2d3fba342` | 3 | 809 | 1431 | 63 | 846 | Pass |
+| npm CLI | `c97b39b1e3436cd20a67ab5f4012a5f395c538b9` | 3 | 971 | 2151 | 70 | 312 | Pass |
+| Socket.IO | `5257ef9adfa02a4e8f8eaa5f6810565f979ccc48` | 3 | 1140 | 2131 | 59 | 1271 | Pass |
+
+Do not interpret this as proof of npm malware detection. It proves the narrower
+inventory contract: ca9 can read real npm lockfiles and preserve the package, dependency,
+registry, and tarball evidence needed by later advisory and artifact analyzers.
+
 ## Demo benchmark
 
 The repository includes a demo app designed to show dependency noise reduction.

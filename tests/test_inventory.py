@@ -7,6 +7,7 @@ from click.testing import CliRunner
 from ca9.cli import main
 from ca9.inventory import build_inventory
 from ca9.readers.fyn_lock import read_fyn_lock
+from ca9.readers.package_lock import read_package_lock
 
 FYN_LOCK = """
 version = 1
@@ -41,6 +42,47 @@ name = "urllib3"
 version = "2.2.0"
 source = { registry = "https://pypi.org/simple" }
 """
+
+PACKAGE_LOCK = {
+    "name": "demo-npm",
+    "version": "0.1.0",
+    "lockfileVersion": 3,
+    "requires": True,
+    "packages": {
+        "": {
+            "name": "demo-npm",
+            "version": "0.1.0",
+            "dependencies": {"@scope/cli": "^1.2.3"},
+            "devDependencies": {"eslint": "^9.0.0"},
+            "optionalDependencies": {"fsevents": "2.3.3"},
+        },
+        "node_modules/@scope/cli": {
+            "version": "1.2.3",
+            "resolved": "https://registry.npmjs.org/@scope/cli/-/cli-1.2.3.tgz",
+            "integrity": "sha512-cli",
+            "dependencies": {"lodash": "^4.17.21"},
+            "optionalDependencies": {"fsevents": "2.3.3"},
+            "hasInstallScript": True,
+        },
+        "node_modules/eslint": {
+            "version": "9.0.0",
+            "resolved": "https://registry.npmjs.org/eslint/-/eslint-9.0.0.tgz",
+            "integrity": "sha512-eslint",
+            "dev": True,
+        },
+        "node_modules/fsevents": {
+            "version": "2.3.3",
+            "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
+            "integrity": "sha512-fsevents",
+            "optional": True,
+        },
+        "node_modules/lodash": {
+            "version": "4.17.21",
+            "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+            "integrity": "sha512-lodash",
+        },
+    },
+}
 
 
 def test_fyn_lock_inventory_includes_packages_edges_and_artifacts(tmp_path):
@@ -80,6 +122,46 @@ def test_build_inventory_falls_back_to_declared_dependencies(tmp_path):
     assert inventory.source_inputs[0].source == "ca9 native manifest readers"
 
 
+def test_package_lock_inventory_includes_npm_packages_edges_and_artifacts(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text(json.dumps(PACKAGE_LOCK))
+
+    inventory = read_package_lock(repo)
+
+    packages = {package.name: package for package in inventory.packages}
+    assert packages["demo-npm"].ecosystem == "npm"
+    assert packages["demo-npm"].dependency_kind == "project"
+    assert packages["@scope/cli"].dependency_kind == "direct"
+    assert packages["eslint"].dependency_kind == "direct"
+    assert packages["fsevents"].dependency_kind == "direct"
+    assert packages["lodash"].dependency_kind == "transitive"
+    assert packages["@scope/cli"].artifacts[0].kind == "npm-tarball"
+    assert packages["@scope/cli"].artifacts[0].hash == "sha512-cli"
+    assert packages["@scope/cli"].source_registry == "https://registry.npmjs.org"
+    assert packages["@scope/cli"].metadata["has_install_script"] is True
+
+    eslint_edge = next(edge for edge in inventory.dependency_edges if edge.child_name == "eslint")
+    assert eslint_edge.dependency_kind == "direct"
+    assert eslint_edge.groups == ("dev",)
+
+    lodash_edge = next(edge for edge in inventory.dependency_edges if edge.child_name == "lodash")
+    assert lodash_edge.dependency_kind == "transitive"
+    assert lodash_edge.parent_name == "@scope/cli"
+
+
+def test_build_inventory_prefers_package_lock_when_no_fyn_lock(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text(json.dumps(PACKAGE_LOCK))
+
+    inventory = build_inventory(repo)
+
+    assert inventory.source_inputs[0].source == "package-lock.json"
+    assert inventory.summary()["dependency_kinds"]["direct"] == 3
+    assert any(package.key == "npm:@scope/cli@1.2.3" for package in inventory.packages)
+
+
 def test_inventory_cli_outputs_json_for_fyn_lock(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -96,3 +178,21 @@ def test_inventory_cli_outputs_json_for_fyn_lock(tmp_path):
     assert data["summary"]["dependency_kinds"]["direct"] == 2
     assert data["source_inputs"][0]["source"] == "fyn.lock"
     assert any(package["name"] == "requests" for package in data["packages"])
+
+
+def test_inventory_cli_outputs_json_for_package_lock(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text(json.dumps(PACKAGE_LOCK))
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["inventory", "--repo", str(repo), "-f", "json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["schema_version"] == "ca9.inventory.v1"
+    assert data["summary"]["packages"] == 5
+    assert data["summary"]["dependency_edges"] == 5
+    assert data["summary"]["dependency_kinds"]["direct"] == 3
+    assert data["source_inputs"][0]["source"] == "package-lock.json"
+    assert any(package["key"] == "npm:@scope/cli@1.2.3" for package in data["packages"])
