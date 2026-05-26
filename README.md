@@ -300,7 +300,6 @@ ca9 scan [OPTIONS]              Scan repository dependency versions via OSV.dev
 ca9 check SCA_REPORT [OPTIONS]  Analyze a Snyk/Dependabot/Trivy/pip-audit report
 ca9 inventory [PATH] [OPTIONS]  Show normalized package inventory
 ca9 vet [PATH] [OPTIONS]        Run package supply-chain risk checks
-ca9 hunt [OPTIONS]              Find local unknown-bug research targets
 
 Common options:
   -r, --repo PATH                  Path to the project repository  [default: .]
@@ -344,34 +343,11 @@ Vet-only options:
   --require-known-license           Warn when artifact metadata has no known license
   --offline                         Use cached OSV data only for malware query
 
-Hunt options (all current flags):
-  -r, --repo PATH                   Path to the project repository  [default: .]
-  -f, --format [table|json]         Output format  [default: table]
-  -o, --output PATH                 Write output to file instead of stdout
-  --limit N                         Max targets to report  [default: 20]
-  --include-tests                   Include tests, docs examples, and demos
-  --generate-harnesses PATH         Write Atheris harness skeletons
-  --harness-limit N                 Max harness skeletons to generate  [default: 5]
-  --fuzz-introspector-summary PATH  Merge Fuzz Introspector summary.json evidence
-  --research-packet-dir PATH        Write private researcher handoff packets
-  --help                            Show command help
-
 Exit codes:
   0  Clean — no reachable CVEs
   1  Reachable CVEs found — action needed
   2  Inconclusive only — need more coverage data
 ```
-
-### Hunt containment
-
-`ca9 hunt` is designed for authorized local research on code you control. It does
-not publish findings, phone home, send crash inputs, or probe remote systems. The
-PyPI package contains the workflow code, not the user's private findings. Generated
-harness artifacts are written to a local directory with a `.gitignore` guard and
-best-effort private directory permissions. Researcher packets are also local
-private triage material for authorized validation and disclosure. Normal hunt
-reports include target metadata and recommendations, not raw fuzzing inputs or
-exploit payloads.
 
 ### Config file
 
@@ -458,7 +434,6 @@ Available tools:
 | `generate_vex` | Generate OpenVEX exploitability statements |
 | `generate_remediation_plan` | Generate prioritized remediation actions |
 | `scan_capabilities` | Scan AI capabilities and emit an AI-BOM |
-| `hunt_zero_days` | Find local unknown-bug research targets and optional fuzz harnesses |
 | `check_blast_radius` | Attach capability blast radius to reachable CVEs |
 | `trace_exploit_path` | Trace paths to vulnerable API call sites |
 | `lookup_threat_intel` | Look up EPSS and CISA KEV data |
