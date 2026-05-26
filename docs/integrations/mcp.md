@@ -34,16 +34,8 @@ Example MCP client configuration:
 | `generate_vex` | Generate OpenVEX output. |
 | `generate_remediation_plan` | Generate remediation actions. |
 | `scan_capabilities` | Emit an AI-BOM. |
-| `hunt_zero_days` | Find local unknown-bug research targets, fuzz harnesses, and private researcher packets. |
 | `check_blast_radius` | Add capability blast radius to reachable CVEs. |
 | `trace_exploit_path` | Trace paths to vulnerable API call sites. |
 | `lookup_threat_intel` | Look up EPSS and CISA KEV data. |
 | `enrich_sbom` | Enrich a CycloneDX or SPDX SBOM. |
 | `ingest_sarif` | Normalize SARIF scanner output into ca9 evidence findings. |
-
-For MCP use, `hunt_zero_days` only writes generated harness and researcher packet
-artifacts inside the requested repository. Normal responses contain target
-metadata, not raw fuzzing inputs or exploit payloads.
-
-If a Fuzz Introspector `summary.json` already exists in the repository, pass it as
-`fuzz_introspector_summary_path` to merge sink and fuzzer-reachability evidence.
