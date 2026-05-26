@@ -69,4 +69,23 @@ Phase 3 should add agent taskflows:
 - Attack-surface map task.
 - Static-analysis triage task.
 - Reachability and exploit-path validation task.
+- Fuzz-target recommendation task.
 - Report and remediation task.
+
+Phase 4 should add unknown-bug discovery loops:
+
+- Harness suggestion from parser/API/entry-point evidence.
+- Fuzz target generation for Python first.
+- Crash/minimization evidence ingestion.
+- Regression test generation after confirmed bugs.
+
+The first local step is `ca9 hunt`, which does not probe remote systems or generate
+exploits. It ranks Python functions that look like owned attack surface, then can
+write Atheris harness skeletons for human-reviewed local fuzzing.
+
+Containment is part of the evidence contract. Hunt reports should carry metadata,
+hashes, paths, and reproduction guidance, but not raw crashing inputs by default.
+Private artifacts stay in local ignored directories so teams can decide when and
+how to disclose confirmed vulnerabilities. Publishing ca9 as a package exposes the
+workflow implementation, not user-specific findings; the hunt workflow must not add
+telemetry or automatic uploads.
