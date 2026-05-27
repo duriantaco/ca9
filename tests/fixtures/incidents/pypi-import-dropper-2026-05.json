@@ -35,10 +35,11 @@
   "expected_current": {
     "overall_status": "partial",
     "inventory": "pass",
-    "malware_advisory": "pass",
+    "malware_advisory": "gap",
     "workflow": "not_applicable"
   },
   "known_gaps": [
+    "GHSA malicious-package advisories are not classified as malware unless they also use MAL-* or PYSEC-MAL-* IDs.",
     "Import-time Python malware static analysis is not yet part of incident replay.",
     "Reachability should be used as execution evidence, not as a reason to suppress a known malicious package."
   ]

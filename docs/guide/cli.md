@@ -145,7 +145,6 @@ Options:
 | `--internal-package PATTERN` | Internal package name or glob pattern, e.g. `acme-*`. Can be repeated. |
 | `--malware-query` | Query OSV for known malicious-package advisories. |
 | `--scan-artifacts` | Hash-verify, unpack, and statically inspect package artifacts. |
-| `--scan-workflows` | Scan GitHub Actions workflows for risky token, OIDC, and trust-boundary patterns. |
 | `--allow-unhashed-downloads` | Allow artifact scanning when the lockfile has no artifact hash. |
 | `--max-artifact-mb N` | Maximum artifact download size for `--scan-artifacts`. Defaults to `100`. |
 | `--deny-license ID` | Denied license identifier. Can be repeated. |
@@ -159,7 +158,6 @@ Examples:
 ```bash
 ca9 vet --repo .
 ca9 vet --repo . --scan-artifacts
-ca9 vet --repo . --scan-workflows
 ca9 vet --repo . --malware-query --offline
 ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.acme.internal/simple
 ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0

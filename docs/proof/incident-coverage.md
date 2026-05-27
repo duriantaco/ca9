@@ -20,12 +20,12 @@ claim.
 
 | Incident class | Current status | Inventory | Malware advisory | Workflow | Source handling |
 |---|---:|---:|---:|---:|---|
-| PyPI import-time dropper | partial | pass | pass | not applicable | fixture metadata |
-| npm SDK package compromise | partial | pass | pass | not applicable | fixture metadata |
-| npm package compromise through Actions/OIDC | partial | pass | pass | pass | fixture metadata |
-| GitHub token/codebase exfiltration | partial | not applicable | not applicable | pass | fixture metadata |
+| PyPI import-time dropper | partial | pass | gap | not applicable | fixture metadata |
+| npm SDK package compromise | partial | pass | gap | not applicable | fixture metadata |
+| npm package compromise through Actions/OIDC | partial | pass | gap | gap | fixture metadata |
+| GitHub token/codebase exfiltration | gap | not applicable | not applicable | gap | fixture metadata |
 
-Summary for this commit: `0 covered`, `4 partial`, `0 gap`.
+Summary for this commit: `0 covered`, `3 partial`, `1 gap`.
 
 ## What The Results Mean
 
@@ -38,24 +38,26 @@ Summary for this commit: `0 covered`, `4 partial`, `0 gap`.
 ## Known Gaps
 
 The PyPI import-time dropper case is partial because ca9 can inventory the pinned PyPI
-package from `fyn.lock` and classify the GHSA malicious-package advisory as blocking
-malware. ca9 still needs import-time Python malware analysis to prove whether importing
-the package could execute the dropper.
+package from `fyn.lock`, but a GHSA malicious-package advisory is not currently classified
+as blocking malware unless it also uses a `MAL-*` or `PYSEC-MAL-*` identifier. ca9 also
+needs import-time Python malware analysis to prove whether importing the package could
+execute the dropper.
 
 The npm package compromise cases are partial because ca9 now parses `package-lock.json`
-inventory and can classify malicious npm advisories, but it does not yet parse
-`pnpm-lock.yaml` or `yarn.lock` and does not inspect npm lifecycle/install-time malware.
+inventory, but it does not yet parse `pnpm-lock.yaml` or `yarn.lock`; does not query
+OSV/GHSA dynamically by npm ecosystem in the `vet --malware-query` path; and does not
+inspect npm lifecycle/install-time malware.
 
-The Actions/OIDC compromise case now exercises the GitHub Actions workflow scanner for
-`pull_request_target`, OIDC token scope, broad write permissions, mutable action refs,
-cache trust boundaries, and source-clone commands. It remains partial because package
-provenance and npm tarball/lifecycle analysis are separate surfaces.
+The Actions/OIDC compromise case also needs GitHub Actions analysis for
+`pull_request_target`, cache trust boundaries, OIDC token scope, mutable action refs, and
+publish provenance. Package provenance alone would not have been enough because the
+malicious packages carried trusted publisher provenance.
 
-The GitHub token/codebase exfiltration case is partial because ca9 can now flag risky
-workflow permissions and source-clone commands, but the reported incident was a stolen
-GitHub token and codebase exfiltration event, not a dependency CVE or package reachability
-case. Full prevention still requires identity, access, audit-log, and incident-response
-controls outside ca9.
+The GitHub token/codebase exfiltration case is a gap because the reported incident was a
+stolen GitHub token and codebase exfiltration event, not a dependency CVE or package
+reachability case. A future workflow scanner can catch risky permissions and token
+exposure patterns, but full prevention also requires identity, access, audit-log, and
+incident-response controls outside ca9.
 
 ## Promotion Rule
 

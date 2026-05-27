@@ -7,11 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- `ca9 vet --malware-query` now treats explicit malicious-package advisories and malware-labeled GHSA/OSV records as blocking malware findings, including npm packages.
-- `ca9 vet --scan-workflows` scans GitHub Actions workflow files for risky `pull_request_target`, OIDC token, broad write-permission, mutable action-ref, cache trust-boundary, and source-clone patterns.
-
 ## [0.3.0] - 2026-05-13
 
 ### Added
