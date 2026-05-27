@@ -5,6 +5,26 @@ All notable changes to ca9 will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0](https://github.com/duriantaco/ca9/compare/v0.3.1...v0.4.0) (2026-05-27)
+
+
+### Features
+
+* **ingest:** add SARIF evidence normalization ([#21](https://github.com/duriantaco/ca9/issues/21)) ([ea44a43](https://github.com/duriantaco/ca9/commit/ea44a43d03972fb0590de1e60e002b30dd4f9c3b))
+* **inventory:** add npm package-lock reader ([#19](https://github.com/duriantaco/ca9/issues/19)) ([f63f12f](https://github.com/duriantaco/ca9/commit/f63f12f93bf84a9c928029f72afc6b92d72b73e8))
+* **vet:** add malware and workflow incident checks ([#28](https://github.com/duriantaco/ca9/issues/28)) ([0c6d6a1](https://github.com/duriantaco/ca9/commit/0c6d6a1825ceffcc65b64324d5d8aefbd505a0ef))
+
+
+### Bug Fixes
+
+* **scan:** harden evidence defaults ([#17](https://github.com/duriantaco/ca9/issues/17)) ([fa17091](https://github.com/duriantaco/ca9/commit/fa17091ff08164b27b68a0f2e0192304194eaa79))
+* **vet:** unstack incident checks from hunt cleanup ([#27](https://github.com/duriantaco/ca9/issues/27)) ([864be3f](https://github.com/duriantaco/ca9/commit/864be3fffdd82aab0018c868133b3020d5c809ed))
+
+
+### Documentation
+
+* **proof:** use generic incident labels ([#18](https://github.com/duriantaco/ca9/issues/18)) ([6f6b322](https://github.com/duriantaco/ca9/commit/6f6b322ec407c8b3c6a9e1a52afba068ca809b59))
+
 ## [Unreleased]
 
 ### Added
