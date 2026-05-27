@@ -7,6 +7,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from ca9.analyzers.github_actions import analyze_github_actions_workflows
 from ca9.analyzers.supply_chain import findings_from_malware_advisories
 from ca9.core.models import package_key
 from ca9.inventory import build_inventory
@@ -62,7 +63,7 @@ def replay_incident(incident: dict[str, Any], repo_path: Path) -> dict[str, Any]
         _malware_advisory_check(incident),
         _workflow_check(incident, repo_path),
     ]
-    overall_status = _overall_status(checks)
+    overall_status = _overall_status(checks, incident.get("known_gaps", []))
     expected_current = incident.get("expected_current", {})
     return {
         "id": incident["id"],
@@ -323,6 +324,7 @@ def _malware_advisory_check(incident: dict[str, Any]) -> dict[str, Any]:
             aliases=tuple(advisory.get("aliases", [])),
             advisory_source=advisory.get("source", ""),
             advisory_url=advisory.get("url", ""),
+            malicious=bool(advisory.get("malicious", False)),
         )
         for advisory in advisories
     ]
@@ -352,21 +354,40 @@ def _workflow_check(incident: dict[str, Any], repo_path: Path) -> dict[str, Any]
     workflow_paths = sorted(
         str(path.relative_to(repo_path)) for path in repo_path.glob(".github/workflows/*")
     )
+    findings = analyze_github_actions_workflows(repo_path)
+    detected_paths = sorted(
+        {
+            str(finding.metadata.get("workflow_path"))
+            for finding in findings
+            if finding.metadata.get("workflow_path")
+        }
+    )
+    missing = sorted(set(workflow_paths) - set(detected_paths))
+    if not missing:
+        status = "pass"
+    elif detected_paths:
+        status = "partial"
+    else:
+        status = "gap"
     return {
         "name": "workflow",
-        "status": "gap",
+        "status": status,
         "workflow_paths": workflow_paths,
-        "missing_capability": "github_actions_workflow_scanner",
+        "detected_workflow_paths": detected_paths,
+        "missing_workflow_paths": missing,
+        "finding_signal_types": sorted({finding.signal_type for finding in findings}),
     }
 
 
-def _overall_status(checks: list[dict[str, Any]]) -> str:
+def _overall_status(checks: list[dict[str, Any]], known_gaps: list[str] | None = None) -> str:
     relevant = [check for check in checks if check["status"] != "not_applicable"]
     if not relevant:
         return "gap"
     if all(check["status"] == "pass" for check in relevant):
+        if known_gaps:
+            return "partial"
         return "covered"
-    if any(check["status"] == "pass" for check in relevant):
+    if any(check["status"] in {"pass", "partial"} for check in relevant):
         return "partial"
     return "gap"
 
