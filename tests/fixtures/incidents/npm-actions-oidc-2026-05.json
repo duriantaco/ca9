@@ -61,10 +61,12 @@
   "expected_current": {
     "overall_status": "partial",
     "inventory": "pass",
-    "malware_advisory": "pass",
-    "workflow": "pass"
+    "malware_advisory": "gap",
+    "workflow": "gap"
   },
   "known_gaps": [
+    "GHSA malicious-package advisories are not currently classified as blocking malware.",
+    "No GitHub Actions scanner exists for pull_request_target, cache trust boundaries, OIDC token scope, or mutable action refs.",
     "No npm package tarball analysis exists for malicious optionalDependencies or install-time payload fingerprints.",
     "pnpm-lock.yaml and yarn.lock inventory are not currently implemented."
   ]

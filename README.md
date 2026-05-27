@@ -175,7 +175,6 @@ falls back to native Python manifest readers for `pyproject.toml`, `requirements
 ca9 vet --repo .
 ca9 vet --repo . --malware-query
 ca9 vet --repo . --scan-artifacts
-ca9 vet --repo . --scan-workflows
 ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.acme.internal/simple
 ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
 ```
@@ -183,12 +182,9 @@ ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
 `ca9 vet` evaluates the normalized package inventory for local supply-chain risk signals:
 untrusted package indexes, missing artifact hashes, missing artifact metadata, source-only
 install risk, and mutable package sources. With `--malware-query`, ca9 also queries OSV
-for known malicious-package advisories such as `MAL-*`, `PYSEC-MAL-*`, and malware-labeled
-GHSA/OSV records across PyPI and npm. With `--scan-workflows`, ca9 checks GitHub Actions
-workflows for risky token scopes, OIDC write access, `pull_request_target` trust-boundary
-patterns, mutable action refs, cache trust boundaries, and source-clone commands. Direct
-dependencies from untrusted indexes, known malicious packages, and high-risk workflow
-patterns are blocking findings; weaker local signals are warnings or investigation items.
+for known malicious-package advisories such as `MAL-*` records. Direct dependencies from
+untrusted indexes and known malicious packages are blocking findings; weaker local signals
+are warnings by default.
 
 With `--scan-artifacts`, ca9 downloads only lockfile artifacts with hashes by default,
 verifies the hash, safely unpacks wheels/sdists without executing code, and runs
@@ -204,8 +200,8 @@ python scripts/incident_replay.py --strict --format table
 
 ca9 keeps real incident fixtures for npm package compromise, PyPI import-time malware,
 and GitHub-token compromise scenarios. The current matrix is intentionally honest:
-malware advisories and workflow-risk patterns are covered where fixtures prove them, while
-package-tarball, import-time malware, and identity/audit-log surfaces remain partial.
+unsupported npm advisory, package-tarball, and GitHub Actions attack surfaces are reported
+as gaps instead of passing demo cases.
 
 For dependency-confusion controls, use `--internal-package` with one or more private
 package name patterns and `--private-index` for the indexes those packages are allowed to
@@ -341,7 +337,6 @@ Vet-only options:
   --internal-package PATTERN        Internal package glob, e.g. acme-*; repeatable
   --malware-query                   Query OSV for known malicious packages
   --scan-artifacts                  Hash-verify, unpack, and statically inspect artifacts
-  --scan-workflows                  Scan GitHub Actions workflow risk patterns
   --allow-unhashed-downloads        Allow artifact downloads without lockfile hashes
   --max-artifact-mb N               Max artifact download size  [default: 100]
   --deny-license ID                 Denied license identifier; repeatable

@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import os
-import re
 import time
 import urllib.error
 import urllib.request
@@ -25,18 +24,6 @@ CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 hours
 DEFAULT_MAX_WORKERS = 8
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 0.5
-OSV_ECOSYSTEM_NAMES = {
-    "pypi": "PyPI",
-    "npm": "npm",
-}
-_MALWARE_TEXT_RE = re.compile(
-    r"\bmalware\b|"
-    r"\bmalicious\s+(?:package|code|payload|release|version|dependency|dropper|artifact)\b|"
-    r"\bcontains\s+malicious\b|"
-    r"\bcredential\s+exfiltration\b|"
-    r"\bexfiltrat(?:e|es|ed|ing|ion)\b",
-    re.I,
-)
 
 
 @dataclass(frozen=True)
@@ -267,16 +254,11 @@ def _cvss_to_level(score: float) -> str:
     return "unknown"
 
 
-def _extract_version_ranges(
-    osv_vuln: dict,
-    package_name: str,
-    ecosystem: str = "pypi",
-) -> tuple[VersionRange, ...]:
+def _extract_version_ranges(osv_vuln: dict, package_name: str) -> tuple[VersionRange, ...]:
     ranges: list[VersionRange] = []
-    normalized_ecosystem = normalize_ecosystem(ecosystem) or "pypi"
     for affected in osv_vuln.get("affected", []):
         pkg = affected.get("package", {})
-        if normalize_ecosystem(pkg.get("ecosystem", "")) != normalized_ecosystem:
+        if pkg.get("ecosystem", "").lower() != "pypi":
             continue
         if pkg.get("name", "").lower() != package_name.lower():
             continue
@@ -311,67 +293,6 @@ def _extract_references(osv_vuln: dict) -> tuple[str, ...]:
         if url:
             urls.append(url)
     return tuple(urls)
-
-
-def _osv_ecosystem_name(ecosystem: str) -> str:
-    normalized = normalize_ecosystem(ecosystem) or "pypi"
-    return OSV_ECOSYSTEM_NAMES.get(normalized, ecosystem)
-
-
-def _is_malicious_osv(data: dict, vuln_id: str = "") -> bool:
-    aliases = data.get("aliases", [])
-    if not isinstance(aliases, list):
-        aliases = []
-    advisory_ids = {vuln_id, str(data.get("id") or ""), *[str(a) for a in aliases]}
-    if any(_is_malware_advisory_id(advisory_id) for advisory_id in advisory_ids):
-        return True
-
-    for value in _walk_values(data):
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, str) and _MALWARE_TEXT_RE.search(value):
-            return True
-
-    return _has_explicit_malicious_marker(data)
-
-
-def _has_explicit_malicious_marker(data: dict) -> bool:
-    for key, value in _walk_items(data):
-        normalized_key = key.lower().replace("_", "-")
-        if normalized_key in {"malicious", "is-malicious", "malware"} and value is True:
-            return True
-        if normalized_key in {"type", "classification", "category"}:
-            if isinstance(value, str) and value.strip().lower() in {"malware", "malicious"}:
-                return True
-    return False
-
-
-def _is_malware_advisory_id(value: str) -> bool:
-    upper = value.upper()
-    return upper.startswith("MAL-") or upper.startswith("PYSEC-MAL-")
-
-
-def _walk_values(value):
-    if isinstance(value, dict):
-        for child in value.values():
-            yield from _walk_values(child)
-        return
-    if isinstance(value, list | tuple | set):
-        for child in value:
-            yield from _walk_values(child)
-        return
-    yield value
-
-
-def _walk_items(value):
-    if isinstance(value, dict):
-        for key, child in value.items():
-            yield str(key), child
-            yield from _walk_items(child)
-        return
-    if isinstance(value, list | tuple | set):
-        for child in value:
-            yield from _walk_items(child)
 
 
 def _cache_path(vuln_id: str) -> Path:
@@ -448,12 +369,9 @@ def query_osv_batch(
     offline: bool = False,
     refresh_cache: bool = False,
     max_workers: int = DEFAULT_MAX_WORKERS,
-    ecosystem: str = "pypi",
 ) -> list[Vulnerability]:
     if not packages:
         return []
-
-    normalized_ecosystem = normalize_ecosystem(ecosystem) or "pypi"
 
     if refresh_cache:
         try:
@@ -465,11 +383,10 @@ def query_osv_batch(
             pass
 
     if offline:
-        return _query_from_cache_only(packages, ecosystem=normalized_ecosystem)
+        return _query_from_cache_only(packages)
 
-    osv_ecosystem = _osv_ecosystem_name(normalized_ecosystem)
     queries = [
-        {"package": {"name": name, "ecosystem": osv_ecosystem}, "version": version}
+        {"package": {"name": name, "ecosystem": "PyPI"}, "version": version}
         for name, version in packages
     ]
 
@@ -543,10 +460,9 @@ def query_osv_batch(
             severity = _extract_severity(details)
             title = details.get("summary", "") or details.get("details", "No description")[:120]
             description = details.get("details", "")
-            affected_ranges = _extract_version_ranges(details, pkg_name, normalized_ecosystem)
+            affected_ranges = _extract_version_ranges(details, pkg_name)
             references = _extract_references(details)
             metadata = metadata_from_osv(details, vuln_id)
-            malicious = _is_malicious_osv(details, vuln_id)
         else:
             severity = "unknown"
             title = vuln_id
@@ -554,7 +470,6 @@ def query_osv_batch(
             affected_ranges = ()
             references = ()
             metadata = metadata_from_osv({}, vuln_id)
-            malicious = _is_malware_advisory_id(vuln_id)
 
         vulns.append(
             Vulnerability(
@@ -564,7 +479,7 @@ def query_osv_batch(
                 severity=severity,
                 title=title,
                 description=description,
-                ecosystem=normalized_ecosystem,
+                ecosystem="pypi",
                 aliases=metadata.aliases,
                 cwes=metadata.cwes,
                 cpes=metadata.cpes,
@@ -576,17 +491,13 @@ def query_osv_batch(
                 cache_stale=metadata.cache_stale,
                 affected_ranges=affected_ranges,
                 references=references,
-                malicious=malicious,
             )
         )
 
     return vulns
 
 
-def _query_from_cache_only(
-    packages: list[tuple[str, str]],
-    ecosystem: str = "pypi",
-) -> list[Vulnerability]:
+def _query_from_cache_only(packages: list[tuple[str, str]]) -> list[Vulnerability]:
     if not CACHE_DIR.exists():
         return []
 
@@ -615,14 +526,13 @@ def _query_from_cache_only(
 
     vulns: list[Vulnerability] = []
     seen_keys: set[tuple[str, str, str]] = set()
-    normalized_ecosystem = normalize_ecosystem(ecosystem) or "pypi"
 
     for pkg_name, pkg_version in packages:
         for vuln_id, details in cached_vulns.items():
             affected_pkgs = set()
             for affected in details.get("affected", []):
                 pkg = affected.get("package", {})
-                if normalize_ecosystem(pkg.get("ecosystem", "")) == normalized_ecosystem:
+                if pkg.get("ecosystem", "").lower() == "pypi":
                     affected_pkgs.add(pkg.get("name", "").lower())
 
             if pkg_name.lower() not in affected_pkgs:
@@ -642,7 +552,7 @@ def _query_from_cache_only(
                     severity=_extract_severity(details),
                     title=details.get("summary", "") or vuln_id,
                     description=details.get("details", ""),
-                    ecosystem=normalized_ecosystem,
+                    ecosystem=normalize_ecosystem("pypi"),
                     aliases=metadata.aliases,
                     cwes=metadata.cwes,
                     cpes=metadata.cpes,
@@ -652,11 +562,8 @@ def _query_from_cache_only(
                     modified_at=metadata.modified_at,
                     fetched_at=metadata.fetched_at,
                     cache_stale=metadata.cache_stale,
-                    affected_ranges=_extract_version_ranges(
-                        details, pkg_name, normalized_ecosystem
-                    ),
+                    affected_ranges=_extract_version_ranges(details, pkg_name),
                     references=_extract_references(details),
-                    malicious=_is_malicious_osv(details, vuln_id),
                 )
             )
 

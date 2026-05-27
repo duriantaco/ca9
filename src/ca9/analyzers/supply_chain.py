@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from urllib.parse import urlparse
@@ -21,14 +20,6 @@ from ca9.models import Vulnerability
 
 DEFAULT_TRUSTED_INDEXES = ("https://pypi.org/simple", "https://registry.npmjs.org")
 BLOCKING_SIGNALS = {"malware", "untrusted_registry"}
-_MALWARE_TEXT_RE = re.compile(
-    r"\bmalware\b|"
-    r"\bmalicious\s+(?:package|code|payload|release|version|dependency|dropper|artifact)\b|"
-    r"\bcontains\s+malicious\b|"
-    r"\bcredential\s+exfiltration\b|"
-    r"\bexfiltrat(?:e|es|ed|ing|ion)\b",
-    re.I,
-)
 
 
 @dataclass(frozen=True)
@@ -61,7 +52,8 @@ def analyze_supply_chain(
 def findings_from_malware_advisories(vulnerabilities: list[Vulnerability]) -> list[Finding]:
     findings: list[Finding] = []
     for vuln in vulnerabilities:
-        if not _is_malware_advisory(vuln):
+        advisory_ids = {vuln.id, *vuln.aliases}
+        if not any(_is_malware_advisory_id(advisory_id) for advisory_id in advisory_ids):
             continue
 
         source = SourceEvidence(
@@ -76,7 +68,6 @@ def findings_from_malware_advisories(vulnerabilities: list[Vulnerability]) -> li
             metadata={
                 "advisory_id": vuln.id,
                 "aliases": list(vuln.aliases),
-                "malicious": vuln.malicious,
                 "references": list(vuln.references),
                 "published_at": vuln.published_at,
                 "modified_at": vuln.modified_at,
@@ -108,7 +99,6 @@ def findings_from_malware_advisories(vulnerabilities: list[Vulnerability]) -> li
                     "package": vuln.package_name,
                     "version": vuln.package_version,
                     "advisory_id": vuln.id,
-                    "malicious": vuln.malicious,
                 },
             )
         )
@@ -396,27 +386,6 @@ def _kind_weighted_severity(package: Package, *, direct: str, transitive: str) -
 def _is_malware_advisory_id(value: str) -> bool:
     upper = value.upper()
     return upper.startswith("MAL-") or upper.startswith("PYSEC-MAL-")
-
-
-def _is_malware_advisory(vuln: Vulnerability) -> bool:
-    if vuln.malicious:
-        return True
-
-    advisory_ids = {vuln.id, *vuln.aliases}
-    if any(_is_malware_advisory_id(advisory_id) for advisory_id in advisory_ids):
-        return True
-
-    haystack = "\n".join(
-        item
-        for item in (
-            vuln.title,
-            vuln.description,
-            " ".join(vuln.references),
-            vuln.advisory_url,
-        )
-        if item
-    )
-    return bool(_MALWARE_TEXT_RE.search(haystack))
 
 
 def _default_reason(finding: Finding) -> str:

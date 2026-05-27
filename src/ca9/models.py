@@ -50,7 +50,6 @@ class Vulnerability:
     modified_at: str | None = None
     fetched_at: str | None = None
     cache_stale: bool | None = None
-    malicious: bool = False
 
 
 @dataclass(frozen=True)

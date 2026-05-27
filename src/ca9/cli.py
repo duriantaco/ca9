@@ -268,12 +268,6 @@ def inventory_cmd(
     help="Download/unpack package artifacts and run static malicious-package heuristics.",
 )
 @click.option(
-    "--scan-workflows",
-    is_flag=True,
-    default=False,
-    help="Scan GitHub Actions workflows for risky token, OIDC, and trust-boundary patterns.",
-)
-@click.option(
     "--allow-unhashed-downloads",
     is_flag=True,
     default=False,
@@ -328,7 +322,6 @@ def vet_cmd(
     internal_package_patterns: tuple[str, ...],
     malware_query: bool,
     scan_artifacts: bool,
-    scan_workflows: bool,
     allow_unhashed_downloads: bool,
     max_artifact_mb: int,
     denied_licenses: tuple[str, ...],
@@ -356,35 +349,25 @@ def vet_cmd(
     if malware_query:
         from ca9.scanner import query_osv_batch
 
-        malware_advisories = []
-        packages_by_ecosystem: dict[str, list[tuple[str, str]]] = {}
-        for package in inventory.packages:
-            ecosystem = package.ecosystem.lower()
-            if ecosystem not in {"pypi", "npm"} or not package.version:
-                continue
-            packages_by_ecosystem.setdefault(ecosystem, []).append((package.name, package.version))
-
-        should_refresh_cache = refresh_cache
-        for ecosystem, packages in sorted(packages_by_ecosystem.items()):
-            try:
-                malware_advisories.extend(
-                    query_osv_batch(
-                        packages,
-                        offline=offline,
-                        refresh_cache=should_refresh_cache,
-                        max_workers=max_osv_workers,
-                        ecosystem=ecosystem,
-                    )
-                )
-                should_refresh_cache = False
-            except (ConnectionError, ValueError) as e:
-                raise click.ClickException(str(e)) from None
+        packages = [
+            (package.name, package.version)
+            for package in inventory.packages
+            if package.ecosystem.lower() == "pypi" and package.version
+        ]
+        try:
+            malware_advisories = query_osv_batch(
+                packages,
+                offline=offline,
+                refresh_cache=refresh_cache,
+                max_workers=max_osv_workers,
+            )
+        except (ConnectionError, ValueError) as e:
+            raise click.ClickException(str(e)) from None
 
     artifact_findings = []
     artifact_warnings = []
     artifact_scans = 0
     skipped_artifacts = 0
-    workflow_findings = []
     artifact_scan_requested = scan_artifacts or bool(denied_licenses) or require_known_license
     if artifact_scan_requested:
         from ca9.analyzers.license_policy import LicensePolicy, analyze_license_policy
@@ -410,11 +393,6 @@ def vet_cmd(
         artifact_scans = artifact_result.scanned_artifacts
         skipped_artifacts = artifact_result.skipped_artifacts
 
-    if scan_workflows:
-        from ca9.analyzers.github_actions import analyze_github_actions_workflows
-
-        workflow_findings = analyze_github_actions_workflows(repo_path)
-
     policy = SupplyChainPolicy(
         trusted_indexes=trusted_indexes or DEFAULT_TRUSTED_INDEXES,
         private_indexes=private_indexes,
@@ -424,7 +402,7 @@ def vet_cmd(
         inventory,
         policy=policy,
         malware_advisories=malware_advisories,
-        extra_findings=[*artifact_findings, *workflow_findings],
+        extra_findings=artifact_findings,
         extra_warnings=artifact_warnings,
         artifact_scans=artifact_scans,
         skipped_artifacts=skipped_artifacts,

@@ -7,11 +7,7 @@ from unittest.mock import patch
 
 from click.testing import CliRunner
 
-from ca9.analyzers.supply_chain import (
-    analyze_supply_chain,
-    evaluate_supply_chain_findings,
-    findings_from_malware_advisories,
-)
+from ca9.analyzers.supply_chain import analyze_supply_chain, evaluate_supply_chain_findings
 from ca9.cli import main
 from ca9.core.models import Artifact, Inventory, Package, SourceEvidence
 from ca9.models import Vulnerability
@@ -221,56 +217,6 @@ def test_vet_cli_can_query_known_malware_advisories(tmp_path):
     data = json.loads(result.output)
     assert data["summary"]["blocking"] == 1
     assert data["findings"][0]["signal_type"] == "malware"
-
-
-def test_malware_advisory_classifier_blocks_ghsa_malicious_package():
-    vuln = Vulnerability(
-        id="GHSA-wx9m-wx4f-4cmg",
-        package_name="mistralai",
-        package_version="2.4.6",
-        severity="critical",
-        title="Malicious dropper in PyPI package",
-        ecosystem="pypi",
-        advisory_url="https://github.com/advisories/GHSA-wx9m-wx4f-4cmg",
-    )
-
-    findings = findings_from_malware_advisories([vuln])
-
-    assert len(findings) == 1
-    assert findings[0].signal_type == "malware"
-    assert findings[0].package_key == "pypi:mistralai@2.4.6"
-
-
-def test_malware_advisory_classifier_honors_explicit_vendor_malicious_flag():
-    vuln = Vulnerability(
-        id="MAI-2026-002",
-        package_name="@mistralai/mistralai",
-        package_version="2.2.4",
-        severity="critical",
-        title="Related supply-chain attack affecting npm SDK packages",
-        ecosystem="npm",
-        advisory_url="https://docs.mistral.ai/resources/security-advisories",
-        malicious=True,
-    )
-
-    findings = findings_from_malware_advisories([vuln])
-
-    assert len(findings) == 1
-    assert findings[0].signal_type == "malware"
-    assert findings[0].package_key == "npm:@mistralai/mistralai@2.2.4"
-
-
-def test_malware_advisory_classifier_does_not_block_regular_ghsa():
-    vuln = Vulnerability(
-        id="GHSA-xxxx-yyyy-zzzz",
-        package_name="requests",
-        package_version="2.31.0",
-        severity="medium",
-        title="Denial of service in requests",
-        ecosystem="pypi",
-    )
-
-    assert findings_from_malware_advisories([vuln]) == []
 
 
 def test_vet_cli_allows_default_npm_registry_from_package_lock(tmp_path):
