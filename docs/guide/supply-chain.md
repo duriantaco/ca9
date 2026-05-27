@@ -129,8 +129,30 @@ Query OSV for known malicious-package advisories:
 ca9 vet --repo . --malware-query
 ```
 
-ca9 treats OSV `MAL-*` and `PYSEC-MAL-*` advisories as blocking malware findings. Use
+ca9 treats OSV `MAL-*`, `PYSEC-MAL-*`, explicit malicious-package metadata, and
+malware-labeled GHSA/OSV advisories as blocking malware findings for PyPI and npm. Use
 `--offline` to restrict the query path to cached OSV data.
+
+## GitHub Actions Workflow Scanning
+
+Scan workflow files for risky token and trust-boundary patterns:
+
+```bash
+ca9 vet --repo . --scan-workflows
+```
+
+The workflow scanner flags:
+
+- `pull_request_target` workflows that check out pull request-controlled code
+- broad write-capable `GITHUB_TOKEN` permissions
+- `id-token: write` OIDC token minting
+- mutable action references such as `@main`
+- cache use across `pull_request_target` trust boundaries
+- source-clone commands such as `gh repo clone`
+
+High-risk combinations such as pull request-code checkout, broad write permissions, and
+source-clone commands with write-capable token scope are blocking by default.
+Lower-confidence cases such as OIDC write scope alone are marked for investigation.
 
 ## Dependency Confusion
 
@@ -202,6 +224,9 @@ Example signal types:
 - `untrusted_registry`
 - `dependency_confusion`
 - `malware`
+- `github_actions_pull_request_target_checkout`
+- `github_actions_oidc_write`
+- `github_actions_write_permissions`
 - `python-startup-pth-exec`
 - `python-startup-customize-exec`
 - `setup-install-exec`
@@ -226,8 +251,8 @@ default gate unless they are represented as blocking decisions.
 
 ca9 does not yet implement every dependency attack class. The current `vet` path covers
 the core local gates first: malicious package behavior, dependency confusion/internal
-source policy, artifact integrity basics, OSV malware advisory matching, and license
-policy.
+source policy, artifact integrity basics, OSV/GHSA malware advisory matching, GitHub
+Actions workflow risk patterns, and license policy.
 
 Still planned:
 
