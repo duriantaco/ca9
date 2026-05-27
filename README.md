@@ -175,6 +175,7 @@ falls back to native Python manifest readers for `pyproject.toml`, `requirements
 ca9 vet --repo .
 ca9 vet --repo . --malware-query
 ca9 vet --repo . --scan-artifacts
+ca9 vet --repo . --scan-workflows
 ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.acme.internal/simple
 ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
 ```
@@ -182,9 +183,12 @@ ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
 `ca9 vet` evaluates the normalized package inventory for local supply-chain risk signals:
 untrusted package indexes, missing artifact hashes, missing artifact metadata, source-only
 install risk, and mutable package sources. With `--malware-query`, ca9 also queries OSV
-for known malicious-package advisories such as `MAL-*` records. Direct dependencies from
-untrusted indexes and known malicious packages are blocking findings; weaker local signals
-are warnings by default.
+for known malicious-package advisories such as `MAL-*`, `PYSEC-MAL-*`, and malware-labeled
+GHSA/OSV records across PyPI and npm. With `--scan-workflows`, ca9 checks GitHub Actions
+workflows for risky token scopes, OIDC write access, `pull_request_target` trust-boundary
+patterns, mutable action refs, cache trust boundaries, and source-clone commands. Direct
+dependencies from untrusted indexes, known malicious packages, and high-risk workflow
+patterns are blocking findings; weaker local signals are warnings or investigation items.
 
 With `--scan-artifacts`, ca9 downloads only lockfile artifacts with hashes by default,
 verifies the hash, safely unpacks wheels/sdists without executing code, and runs
@@ -200,8 +204,8 @@ python scripts/incident_replay.py --strict --format table
 
 ca9 keeps real incident fixtures for npm package compromise, PyPI import-time malware,
 and GitHub-token compromise scenarios. The current matrix is intentionally honest:
-unsupported npm advisory, package-tarball, and GitHub Actions attack surfaces are reported
-as gaps instead of passing demo cases.
+malware advisories and workflow-risk patterns are covered where fixtures prove them, while
+package-tarball, import-time malware, and identity/audit-log surfaces remain partial.
 
 For dependency-confusion controls, use `--internal-package` with one or more private
 package name patterns and `--private-index` for the indexes those packages are allowed to
@@ -300,7 +304,6 @@ ca9 scan [OPTIONS]              Scan repository dependency versions via OSV.dev
 ca9 check SCA_REPORT [OPTIONS]  Analyze a Snyk/Dependabot/Trivy/pip-audit report
 ca9 inventory [PATH] [OPTIONS]  Show normalized package inventory
 ca9 vet [PATH] [OPTIONS]        Run package supply-chain risk checks
-ca9 hunt [OPTIONS]              Find local unknown-bug research targets
 
 Common options:
   -r, --repo PATH                  Path to the project repository  [default: .]
@@ -338,40 +341,18 @@ Vet-only options:
   --internal-package PATTERN        Internal package glob, e.g. acme-*; repeatable
   --malware-query                   Query OSV for known malicious packages
   --scan-artifacts                  Hash-verify, unpack, and statically inspect artifacts
+  --scan-workflows                  Scan GitHub Actions workflow risk patterns
   --allow-unhashed-downloads        Allow artifact downloads without lockfile hashes
   --max-artifact-mb N               Max artifact download size  [default: 100]
   --deny-license ID                 Denied license identifier; repeatable
   --require-known-license           Warn when artifact metadata has no known license
   --offline                         Use cached OSV data only for malware query
 
-Hunt options (all current flags):
-  -r, --repo PATH                   Path to the project repository  [default: .]
-  -f, --format [table|json]         Output format  [default: table]
-  -o, --output PATH                 Write output to file instead of stdout
-  --limit N                         Max targets to report  [default: 20]
-  --include-tests                   Include tests, docs examples, and demos
-  --generate-harnesses PATH         Write Atheris harness skeletons
-  --harness-limit N                 Max harness skeletons to generate  [default: 5]
-  --fuzz-introspector-summary PATH  Merge Fuzz Introspector summary.json evidence
-  --research-packet-dir PATH        Write private researcher handoff packets
-  --help                            Show command help
-
 Exit codes:
   0  Clean — no reachable CVEs
   1  Reachable CVEs found — action needed
   2  Inconclusive only — need more coverage data
 ```
-
-### Hunt containment
-
-`ca9 hunt` is designed for authorized local research on code you control. It does
-not publish findings, phone home, send crash inputs, or probe remote systems. The
-PyPI package contains the workflow code, not the user's private findings. Generated
-harness artifacts are written to a local directory with a `.gitignore` guard and
-best-effort private directory permissions. Researcher packets are also local
-private triage material for authorized validation and disclosure. Normal hunt
-reports include target metadata and recommendations, not raw fuzzing inputs or
-exploit payloads.
 
 ### Config file
 
@@ -458,7 +439,6 @@ Available tools:
 | `generate_vex` | Generate OpenVEX exploitability statements |
 | `generate_remediation_plan` | Generate prioritized remediation actions |
 | `scan_capabilities` | Scan AI capabilities and emit an AI-BOM |
-| `hunt_zero_days` | Find local unknown-bug research targets and optional fuzz harnesses |
 | `check_blast_radius` | Attach capability blast radius to reachable CVEs |
 | `trace_exploit_path` | Trace paths to vulnerable API call sites |
 | `lookup_threat_intel` | Look up EPSS and CISA KEV data |

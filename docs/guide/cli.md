@@ -145,6 +145,7 @@ Options:
 | `--internal-package PATTERN` | Internal package name or glob pattern, e.g. `acme-*`. Can be repeated. |
 | `--malware-query` | Query OSV for known malicious-package advisories. |
 | `--scan-artifacts` | Hash-verify, unpack, and statically inspect package artifacts. |
+| `--scan-workflows` | Scan GitHub Actions workflows for risky token, OIDC, and trust-boundary patterns. |
 | `--allow-unhashed-downloads` | Allow artifact scanning when the lockfile has no artifact hash. |
 | `--max-artifact-mb N` | Maximum artifact download size for `--scan-artifacts`. Defaults to `100`. |
 | `--deny-license ID` | Denied license identifier. Can be repeated. |
@@ -158,6 +159,7 @@ Examples:
 ```bash
 ca9 vet --repo .
 ca9 vet --repo . --scan-artifacts
+ca9 vet --repo . --scan-workflows
 ca9 vet --repo . --malware-query --offline
 ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.acme.internal/simple
 ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
@@ -257,46 +259,6 @@ Scan a repository for AI capabilities and emit an AI-BOM summary or JSON.
 ca9 capabilities --repo .
 ca9 capabilities --repo . -f json -o aibom.json
 ```
-
-### `ca9 hunt`
-
-Find local unknown-bug research targets by ranking parser-like functions, exposed
-handlers, risky sinks, and complexity. The command can also generate reviewable
-Atheris harness skeletons for targets with a single fuzzable input and private
-researcher handoff packets for human validation.
-
-```bash
-ca9 hunt --repo .
-ca9 hunt --repo . -f json -o hunt.json
-ca9 hunt --repo . --generate-harnesses fuzz_harnesses
-ca9 hunt --repo . --research-packet-dir research_packets
-ca9 hunt --repo . --fuzz-introspector-summary summary.json
-```
-
-Current flags:
-
-| Flag | Purpose |
-| --- | --- |
-| `-r, --repo PATH` | Path to the project repository. |
-| `-f, --format [table\|json]` | Output format. |
-| `-o, --output PATH` | Write output to file instead of stdout. |
-| `--limit N` | Maximum targets to report. |
-| `--include-tests` | Include tests, docs examples, and demo files in target discovery. |
-| `--generate-harnesses PATH` | Write Atheris harness skeletons for directly fuzzable targets. |
-| `--harness-limit N` | Maximum harness skeletons to generate. |
-| `--fuzz-introspector-summary PATH` | Merge Fuzz Introspector `summary.json` sink/reachability evidence. |
-| `--research-packet-dir PATH` | Write private researcher handoff packets for reported candidates. |
-| `--help` | Show command help. |
-
-Hunt output is local-only. The public package contains the workflow code, not the
-user's private findings. The command does not phone home, publish findings, or
-probe remote systems. Generated harness directories include a `.gitignore` guard
-and best-effort private permissions. Researcher packet directories use the same
-private artifact guard and are intended for authorized disclosure workflows.
-Reports and packets do not include raw fuzzing inputs or exploit payloads.
-
-When a Fuzz Introspector `summary.json` is available, ca9 can merge its sink and
-fuzzer reachability evidence into the hunt ranking.
 
 ### `ca9 cap-diff`
 

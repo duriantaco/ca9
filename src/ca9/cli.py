@@ -268,6 +268,12 @@ def inventory_cmd(
     help="Download/unpack package artifacts and run static malicious-package heuristics.",
 )
 @click.option(
+    "--scan-workflows",
+    is_flag=True,
+    default=False,
+    help="Scan GitHub Actions workflows for risky token, OIDC, and trust-boundary patterns.",
+)
+@click.option(
     "--allow-unhashed-downloads",
     is_flag=True,
     default=False,
@@ -322,6 +328,7 @@ def vet_cmd(
     internal_package_patterns: tuple[str, ...],
     malware_query: bool,
     scan_artifacts: bool,
+    scan_workflows: bool,
     allow_unhashed_downloads: bool,
     max_artifact_mb: int,
     denied_licenses: tuple[str, ...],
@@ -349,25 +356,35 @@ def vet_cmd(
     if malware_query:
         from ca9.scanner import query_osv_batch
 
-        packages = [
-            (package.name, package.version)
-            for package in inventory.packages
-            if package.ecosystem.lower() == "pypi" and package.version
-        ]
-        try:
-            malware_advisories = query_osv_batch(
-                packages,
-                offline=offline,
-                refresh_cache=refresh_cache,
-                max_workers=max_osv_workers,
-            )
-        except (ConnectionError, ValueError) as e:
-            raise click.ClickException(str(e)) from None
+        malware_advisories = []
+        packages_by_ecosystem: dict[str, list[tuple[str, str]]] = {}
+        for package in inventory.packages:
+            ecosystem = package.ecosystem.lower()
+            if ecosystem not in {"pypi", "npm"} or not package.version:
+                continue
+            packages_by_ecosystem.setdefault(ecosystem, []).append((package.name, package.version))
+
+        should_refresh_cache = refresh_cache
+        for ecosystem, packages in sorted(packages_by_ecosystem.items()):
+            try:
+                malware_advisories.extend(
+                    query_osv_batch(
+                        packages,
+                        offline=offline,
+                        refresh_cache=should_refresh_cache,
+                        max_workers=max_osv_workers,
+                        ecosystem=ecosystem,
+                    )
+                )
+                should_refresh_cache = False
+            except (ConnectionError, ValueError) as e:
+                raise click.ClickException(str(e)) from None
 
     artifact_findings = []
     artifact_warnings = []
     artifact_scans = 0
     skipped_artifacts = 0
+    workflow_findings = []
     artifact_scan_requested = scan_artifacts or bool(denied_licenses) or require_known_license
     if artifact_scan_requested:
         from ca9.analyzers.license_policy import LicensePolicy, analyze_license_policy
@@ -393,6 +410,11 @@ def vet_cmd(
         artifact_scans = artifact_result.scanned_artifacts
         skipped_artifacts = artifact_result.skipped_artifacts
 
+    if scan_workflows:
+        from ca9.analyzers.github_actions import analyze_github_actions_workflows
+
+        workflow_findings = analyze_github_actions_workflows(repo_path)
+
     policy = SupplyChainPolicy(
         trusted_indexes=trusted_indexes or DEFAULT_TRUSTED_INDEXES,
         private_indexes=private_indexes,
@@ -402,7 +424,7 @@ def vet_cmd(
         inventory,
         policy=policy,
         malware_advisories=malware_advisories,
-        extra_findings=artifact_findings,
+        extra_findings=[*artifact_findings, *workflow_findings],
         extra_warnings=artifact_warnings,
         artifact_scans=artifact_scans,
         skipped_artifacts=skipped_artifacts,
@@ -1034,107 +1056,6 @@ def capabilities_cmd(repo_path: Path, output_path: Path | None, output_format: s
                             lines.append(f"  {prop.value}")
         text = "\n".join(lines)
 
-    if output_path:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(text)
-        click.echo(f"Written to {output_path}", err=True)
-    else:
-        click.echo(text)
-
-
-@main.command(name="hunt")
-@click.option(
-    "-r",
-    "--repo",
-    "repo_path",
-    type=click.Path(exists=True, path_type=Path),
-    default=".",
-    help="Path to the project repository.",
-)
-@click.option(
-    "-f",
-    "--format",
-    "output_format",
-    type=click.Choice(["table", "json"]),
-    default="table",
-    help="Output format.",
-)
-@click.option(
-    "-o",
-    "--output",
-    "output_path",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Write output to file instead of stdout.",
-)
-@click.option("--limit", type=int, default=20, help="Maximum targets to report.")
-@click.option(
-    "--include-tests",
-    is_flag=True,
-    default=False,
-    help="Include tests, docs examples, and demo files in target discovery.",
-)
-@click.option(
-    "--generate-harnesses",
-    "harness_dir",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Write Atheris harness skeletons for directly fuzzable targets.",
-)
-@click.option(
-    "--harness-limit",
-    type=int,
-    default=5,
-    help="Maximum harness skeletons to generate.",
-)
-@click.option(
-    "--fuzz-introspector-summary",
-    "fuzz_introspector_summary",
-    type=click.Path(exists=True, path_type=Path),
-    default=None,
-    help="Merge Fuzz Introspector summary.json sink/reachability evidence.",
-)
-@click.option(
-    "--research-packet-dir",
-    "research_packet_dir",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Write private researcher handoff packets for top candidates.",
-)
-def hunt_cmd(
-    repo_path: Path,
-    output_format: str,
-    output_path: Path | None,
-    limit: int,
-    include_tests: bool,
-    harness_dir: Path | None,
-    harness_limit: int,
-    fuzz_introspector_summary: Path | None,
-    research_packet_dir: Path | None,
-) -> None:
-    """Find local unknown-bug research targets and optional private artifacts."""
-    from ca9.hunt import (
-        apply_fuzz_introspector_summary,
-        generate_atheris_harnesses,
-        generate_research_packets,
-        hunt_report_to_json,
-        hunt_report_to_table,
-        scan_hunt_targets,
-    )
-
-    report = scan_hunt_targets(repo_path, limit=limit, include_tests=include_tests)
-    if fuzz_introspector_summary:
-        report = apply_fuzz_introspector_summary(report, fuzz_introspector_summary)
-    if harness_dir:
-        report = generate_atheris_harnesses(report, harness_dir, limit=harness_limit)
-    if research_packet_dir:
-        report = generate_research_packets(
-            report,
-            research_packet_dir,
-            limit=None,
-        )
-
-    text = hunt_report_to_json(report) if output_format == "json" else hunt_report_to_table(report)
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(text)
