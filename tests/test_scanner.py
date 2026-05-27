@@ -98,6 +98,32 @@ class TestQueryOsvBatch:
         assert vulns[0].modified_at == "2023-01-02T00:00:00Z"
         assert vulns[0].fetched_at is not None
         assert vulns[0].cache_stale is False
+        assert vulns[0].malicious is False
+
+    @patch("ca9.scanner._fetch_vuln_details")
+    @patch("ca9.scanner.urllib.request.urlopen")
+    def test_npm_query_preserves_ecosystem_and_malware_classification(
+        self, mock_urlopen_fn, mock_fetch
+    ):
+        mock_urlopen_fn.return_value = _mock_urlopen(
+            {"results": [{"vulns": [{"id": "GHSA-g7cv-rxg3-hmpx"}]}]}
+        )
+        mock_fetch.return_value = {
+            "id": "GHSA-g7cv-rxg3-hmpx",
+            "summary": "Malware in npm packages exfiltrates cloud credentials",
+            "affected": [
+                {"package": {"ecosystem": "npm", "name": "@tanstack/history"}},
+            ],
+        }
+
+        vulns = query_osv_batch([("@tanstack/history", "1.161.9")], ecosystem="npm")
+
+        request = mock_urlopen_fn.call_args[0][0]
+        payload = json.loads(request.data.decode())
+        assert payload["queries"][0]["package"]["ecosystem"] == "npm"
+        assert vulns[0].ecosystem == "npm"
+        assert vulns[0].malicious is True
+        assert vulns[0].package_name == "@tanstack/history"
 
     @patch("ca9.scanner._fetch_vuln_details")
     @patch("ca9.scanner.urllib.request.urlopen")
@@ -323,6 +349,31 @@ class TestOfflineMode:
         assert vulns[0].aliases == ("CVE-2023-9999",)
         assert vulns[0].fetched_at is not None
         assert vulns[0].cache_stale is False
+
+    def test_offline_can_match_npm_cached_vulns(self, tmp_path, monkeypatch):
+        from ca9 import scanner
+
+        cache_dir = tmp_path / "osv_cache"
+        cache_dir.mkdir()
+        monkeypatch.setattr(scanner, "CACHE_DIR", cache_dir)
+
+        vuln_data = {
+            "id": "GHSA-g7cv-rxg3-hmpx",
+            "summary": "Malware in npm packages exfiltrates cloud credentials",
+            "affected": [
+                {"package": {"ecosystem": "npm", "name": "@tanstack/history"}},
+            ],
+        }
+        (cache_dir / "GHSA-g7cv-rxg3-hmpx.json").write_text(json.dumps(vuln_data))
+
+        vulns = scanner._query_from_cache_only(
+            [("@tanstack/history", "1.161.9")],
+            ecosystem="npm",
+        )
+
+        assert len(vulns) == 1
+        assert vulns[0].ecosystem == "npm"
+        assert vulns[0].malicious is True
 
     def test_offline_returns_stale_cached_vulns_with_freshness_flag(self, tmp_path, monkeypatch):
         from ca9 import scanner

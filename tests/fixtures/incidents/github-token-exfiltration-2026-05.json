@@ -23,14 +23,13 @@
     }
   ],
   "expected_current": {
-    "overall_status": "gap",
+    "overall_status": "partial",
     "inventory": "not_applicable",
     "malware_advisory": "not_applicable",
-    "workflow": "gap"
+    "workflow": "pass"
   },
   "known_gaps": [
     "ca9 does not currently scan GitHub token scopes, repository access grants, or audit-log events.",
-    "ca9 does not currently detect source-code exfiltration paths or GitHub environment compromise.",
-    "A future workflow scanner can catch risky permissions, but token theft response still needs audit-log and identity telemetry."
+    "Workflow scanning can catch risky token permissions and source clone commands, but token theft response still needs audit-log and identity telemetry."
   ]
 }
