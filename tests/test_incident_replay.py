@@ -42,9 +42,10 @@ def test_incident_replay_exposes_npm_inventory_and_remaining_gaps():
     assert npm_actions_checks["malware_advisory"]["status"] == "pass"
     assert npm_actions_checks["workflow"]["status"] == "pass"
     assert npm_actions_checks["workflow"]["missing_workflow_paths"] == []
-    assert "github_actions_pull_request_target_checkout" in npm_actions_checks["workflow"][
-        "finding_signal_types"
-    ]
+    assert (
+        "github_actions_pull_request_target_checkout"
+        in npm_actions_checks["workflow"]["finding_signal_types"]
+    )
     assert npm_actions_checks["inventory"]["expected_package_keys"] == [
         "npm:@tanstack/history@1.161.9",
         "npm:@tanstack/react-router@1.169.5",

@@ -652,7 +652,9 @@ def _query_from_cache_only(
                     modified_at=metadata.modified_at,
                     fetched_at=metadata.fetched_at,
                     cache_stale=metadata.cache_stale,
-                    affected_ranges=_extract_version_ranges(details, pkg_name, normalized_ecosystem),
+                    affected_ranges=_extract_version_ranges(
+                        details, pkg_name, normalized_ecosystem
+                    ),
                     references=_extract_references(details),
                     malicious=_is_malicious_osv(details, vuln_id),
                 )
