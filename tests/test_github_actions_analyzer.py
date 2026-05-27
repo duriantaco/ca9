@@ -29,8 +29,7 @@ jobs:
     findings = analyze_github_actions_workflows(tmp_path)
 
     assert any(
-        finding.signal_type == "github_actions_pull_request_target_checkout"
-        for finding in findings
+        finding.signal_type == "github_actions_pull_request_target_checkout" for finding in findings
     )
     checkout = next(
         finding

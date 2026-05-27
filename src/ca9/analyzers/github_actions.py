@@ -246,8 +246,14 @@ def _mutable_action_refs(content: str) -> list[tuple[str, int]]:
         ref = match.group(2)
         if action_name.startswith(("./", "docker://")):
             continue
-        if ref is None or ref.lower() in {"main", "master", "head"} or ref.startswith("refs/heads/"):
-            refs.append((f"{action_name}@{ref or '<missing>'}", _line_number(content, match.start())))
+        if (
+            ref is None
+            or ref.lower() in {"main", "master", "head"}
+            or ref.startswith("refs/heads/")
+        ):
+            refs.append(
+                (f"{action_name}@{ref or '<missing>'}", _line_number(content, match.start()))
+            )
     return refs
 
 
