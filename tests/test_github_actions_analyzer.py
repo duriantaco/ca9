@@ -123,8 +123,12 @@ jobs:
 
     table = supply_chain_report_to_table(report)
 
-    assert "Why: base64-decoded shell payloads are a common CI credential-stealing technique" in table
-    assert "Next: block the change and inspect recent workflow runs for credential exposure" in table
+    assert (
+        "Why: base64-decoded shell payloads are a common CI credential-stealing technique" in table
+    )
+    assert (
+        "Next: block the change and inspect recent workflow runs for credential exposure" in table
+    )
 
 
 def test_vet_cli_can_scan_workflows(tmp_path):
