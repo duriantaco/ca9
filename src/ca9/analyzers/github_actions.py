@@ -9,6 +9,24 @@ from ca9.core.models import Evidence, Finding, RiskSignal, SourceEvidence
 _WORKFLOW_SUFFIXES = {".yml", ".yaml"}
 _RISKY_WRITE_PERMISSIONS = {"actions", "checks", "contents", "deployments", "packages"}
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
+_CLOUD_METADATA_PATTERNS = (
+    r"169\.254\.169\.254",
+    r"metadata\.google\.internal",
+    r"\bmetadata\.azure\.com\b",
+    r"\bAWS_CONTAINER_CREDENTIALS_(?:FULL_URI|RELATIVE_URI)\b",
+    r"\bACTIONS_ID_TOKEN_REQUEST_(?:TOKEN|URL)\b",
+)
+_CREDENTIAL_FILE_PATTERNS = (
+    r"~/.ssh/(?:id_rsa|id_ed25519)",
+    r"\$HOME/.ssh/(?:id_rsa|id_ed25519)",
+    r"\.docker/config\.json",
+    r"\.kube/config",
+    r"\.vault-token",
+    r"\.terraform\.d/credentials\.tfrc\.json",
+    r"\.aws/credentials",
+    r"\.config/gcloud",
+    r"\.azure/accessTokens\.json",
+)
 
 
 @dataclass(frozen=True)
@@ -158,6 +176,48 @@ def _analyze_workflow_file(workflow_path: Path, repo_path: Path, content: str) -
             )
         )
 
+    for line in _encoded_shell_payload_lines(content):
+        specs.append(
+            _WorkflowFindingSpec(
+                signal_type="github_actions_encoded_shell_payload",
+                title="GitHub Actions workflow decodes and executes encoded shell payload",
+                severity="critical",
+                action="block",
+                reason="base64-decoded shell payloads are a common CI credential-stealing technique",
+                evidence_kind="github_actions_workflow",
+                line=line,
+                metadata={"encoded_shell_payload": True},
+            )
+        )
+
+    for line in _cloud_metadata_probe_lines(content):
+        specs.append(
+            _WorkflowFindingSpec(
+                signal_type="github_actions_cloud_metadata_probe",
+                title="GitHub Actions workflow probes cloud metadata or OIDC token endpoints",
+                severity="high",
+                action="block",
+                reason="workflow commands should not harvest runner cloud metadata or OIDC request tokens",
+                evidence_kind="github_actions_workflow",
+                line=line,
+                metadata={"cloud_metadata_probe": True},
+            )
+        )
+
+    for line in _credential_file_harvest_lines(content):
+        specs.append(
+            _WorkflowFindingSpec(
+                signal_type="github_actions_credential_file_harvest",
+                title="GitHub Actions workflow references local credential files",
+                severity="high",
+                action="block",
+                reason="workflow commands should not read broad local credential stores",
+                evidence_kind="github_actions_workflow",
+                line=line,
+                metadata={"credential_file_harvest": True},
+            )
+        )
+
     return [_finding_from_spec(workflow_path, repo_path, content, spec) for spec in specs]
 
 
@@ -255,6 +315,37 @@ def _mutable_action_refs(content: str) -> list[tuple[str, int]]:
                 (f"{action_name}@{ref or '<missing>'}", _line_number(content, match.start()))
             )
     return refs
+
+
+def _encoded_shell_payload_lines(content: str) -> list[int]:
+    lines: list[int] = []
+    for match in re.finditer(
+        r"(?mi)\bbase64\s+(?:-[A-Za-z]*d[A-Za-z]*|--decode)\b[^\n|;&]*[|;&]\s*(?:/bin/)?(?:ba)?sh\b",
+        content,
+    ):
+        lines.append(_line_number(content, match.start()))
+    for match in re.finditer(
+        r"(?mi)\b(?:ba)?sh\b[^\n]*\$\([^)]*\bbase64\s+(?:-[A-Za-z]*d[A-Za-z]*|--decode)\b",
+        content,
+    ):
+        lines.append(_line_number(content, match.start()))
+    return sorted(set(lines))
+
+
+def _cloud_metadata_probe_lines(content: str) -> list[int]:
+    return _matching_lines(content, _CLOUD_METADATA_PATTERNS)
+
+
+def _credential_file_harvest_lines(content: str) -> list[int]:
+    return _matching_lines(content, _CREDENTIAL_FILE_PATTERNS)
+
+
+def _matching_lines(content: str, patterns: tuple[str, ...]) -> list[int]:
+    lines: set[int] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, content, re.IGNORECASE):
+            lines.add(_line_number(content, match.start()))
+    return sorted(lines)
 
 
 def _find_line(content: str, pattern: str) -> int:
