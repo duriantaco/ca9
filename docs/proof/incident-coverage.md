@@ -24,8 +24,9 @@ claim.
 | npm SDK package compromise | partial | pass | pass | not applicable | fixture metadata |
 | npm package compromise through Actions/OIDC | partial | pass | pass | pass | fixture metadata |
 | GitHub token/codebase exfiltration | partial | not applicable | not applicable | pass | fixture metadata |
+| GitHub Actions workflow backdoor | partial | not applicable | not applicable | pass | fixture metadata |
 
-Summary for this commit: `0 covered`, `4 partial`, `0 gap`.
+Summary for this commit: `0 covered`, `5 partial`, `0 gap`.
 
 ## What The Results Mean
 
@@ -48,8 +49,13 @@ inventory and can classify malicious npm advisories, but it does not yet parse
 
 The Actions/OIDC compromise case now exercises the GitHub Actions workflow scanner for
 `pull_request_target`, OIDC token scope, broad write permissions, mutable action refs,
-cache trust boundaries, and source-clone commands. It remains partial because package
+cache trust boundaries, source-clone commands, encoded shell payloads, cloud metadata
+probing, and broad credential-file harvest patterns. It remains partial because package
 provenance and npm tarball/lifecycle analysis are separate surfaces.
+
+The workflow-backdoor case is partial because ca9 can flag malicious workflow payload
+patterns, but direct push prevention and compromised PAT/deploy-key response
+depend on GitHub branch rulesets, CODEOWNER review, token rotation, and audit logs.
 
 The GitHub token/codebase exfiltration case is partial because ca9 can now flag risky
 workflow permissions and source-clone commands, but the reported incident was a stolen

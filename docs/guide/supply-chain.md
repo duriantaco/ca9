@@ -149,9 +149,13 @@ The workflow scanner flags:
 - mutable action references such as `@main`
 - cache use across `pull_request_target` trust boundaries
 - source-clone commands such as `gh repo clone`
+- encoded shell payloads such as `base64 -d | bash`
+- cloud metadata, OIDC request token, and broad credential-file harvest patterns
 
 High-risk combinations such as pull request-code checkout, broad write permissions, and
 source-clone commands with write-capable token scope are blocking by default.
+Encoded shell execution, cloud metadata probing, and broad local credential-file access
+are also blocking because they match common CI/CD credential-stealing behavior.
 Lower-confidence cases such as OIDC write scope alone are marked for investigation.
 
 ## Dependency Confusion
