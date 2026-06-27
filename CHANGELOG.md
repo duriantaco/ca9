@@ -5,6 +5,14 @@ All notable changes to ca9 will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/duriantaco/ca9/compare/v0.4.0...v0.5.0) (2026-06-27)
+
+
+### Features
+
+* **supply-chain:** add package feed runtime protections ([#31](https://github.com/duriantaco/ca9/issues/31)) ([65dbdd4](https://github.com/duriantaco/ca9/commit/65dbdd4456be2c11e40668f4bc20f3864a601b21))
+* **vet:** flag workflow backdoor payloads ([#29](https://github.com/duriantaco/ca9/issues/29)) ([661b200](https://github.com/duriantaco/ca9/commit/661b200f5c7eeaece1fd7851912a1b7f3122f626))
+
 ## [0.4.0](https://github.com/duriantaco/ca9/compare/v0.3.1...v0.4.0) (2026-05-27)
 
 
