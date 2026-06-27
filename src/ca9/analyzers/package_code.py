@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 from dataclasses import dataclass
 
@@ -60,6 +61,39 @@ _DANGEROUS_TOP_LEVEL_CALLS = {
     "urllib.request.urlopen",
     "socket.socket",
 }
+
+_NPM_INSTALL_HOOKS = ("preinstall", "install", "postinstall")
+_NPM_SCRIPT_EXEC_RE = re.compile(
+    r"curl\s|wget\s|node\s+-e|node\s+--eval|\beval\b|\bbase64\b|"
+    r"bash\s+-c|sh\s+-c|/dev/tcp|\bchmod\b|powershell|\biex\b|"
+    r"\|\s*sh\b|\|\s*bash\b|python[0-9]?\s+-c|\$\(|`|>\s*/dev/|\bnc\s|\bncat\s",
+    re.I,
+)
+_JS_ENCODED_EXEC_RE = re.compile(
+    r"(?:Buffer\.from\([^)]{0,200}?['\"](?:base64|hex)['\"]|\batob\s*\()"
+    r"[\s\S]{0,400}?"
+    r"(?:\beval\s*\(|new\s+Function|child_process|\.exec(?:Sync)?\s*\(|"
+    r"require\(\s*['\"]child_process)",
+    re.I,
+)
+_JS_PROCESS_RE = re.compile(
+    r"require\(\s*['\"]child_process['\"]\s*\)|"
+    r"child_process\.(?:exec|execSync|spawn|spawnSync|fork)|"
+    r"\bexecSync\s*\(|\.exec\s*\(",
+    re.I,
+)
+_JS_NETWORK_RE = re.compile(
+    r"require\(\s*['\"](?:https?|net|dgram|dns|tls)['\"]\s*\)|"
+    r"\bfetch\s*\(|\baxios\b|XMLHttpRequest|https?\.(?:request|get)\s*\(",
+    re.I,
+)
+_JS_CREDENTIAL_RE = re.compile(
+    r"process\.env\.(?:NPM_TOKEN|GITHUB_TOKEN|GH_TOKEN|NODE_AUTH_TOKEN|"
+    r"AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|AWS_SESSION_TOKEN)|"
+    r"\.npmrc\b|\.ssh/id_(?:rsa|ed25519)|"
+    r"process\.env\.[A-Z_]*(?:TOKEN|SECRET|KEY|PASSWORD)",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -128,6 +162,38 @@ _IMPORT_TIME_RULE = PackageCodeRule(
     confidence="medium",
     description="top-level package code runs as soon as the module is imported",
 )
+_NPM_INSTALL_HOOK_RULE = PackageCodeRule(
+    id="npm-install-script",
+    title="npm package defines an install lifecycle script",
+    severity="medium",
+    action="investigate",
+    confidence="high",
+    description="preinstall/install/postinstall scripts run automatically during npm install",
+)
+_NPM_INSTALL_EXEC_RULE = PackageCodeRule(
+    id="npm-install-script-exec",
+    title="npm install script runs shell, network, or eval code",
+    severity="critical",
+    action="block",
+    confidence="medium",
+    description="install-time scripts that fetch or execute code are a primary supply-chain attack vector",
+)
+_NPM_ENCODED_RULE = PackageCodeRule(
+    id="npm-encoded-execution",
+    title="npm package decodes and executes an encoded payload",
+    severity="high",
+    action="block",
+    confidence="medium",
+    description="decoding base64/hex into eval, Function, or child_process is a common loader pattern",
+)
+_NPM_CREDENTIAL_EXFIL_RULE = PackageCodeRule(
+    id="npm-credential-exfiltration",
+    title="npm package code accesses credentials with process or network APIs",
+    severity="high",
+    action="block",
+    confidence="medium",
+    description="token/secret access near outbound network or process execution is a common exfiltration pattern",
+)
 
 
 def analyze_package_snapshots(snapshots: tuple[ArtifactSnapshot, ...]) -> list[Finding]:
@@ -182,7 +248,17 @@ def _analyze_file(
             if match:
                 findings.append(_finding(snapshot, file, text, _SILENT_PROCESS_RULE, match.start()))
 
+    if _is_npm_snapshot(snapshot) and lower_path.endswith("package.json"):
+        findings.extend(_analyze_npm_manifest(snapshot, file, text))
+
+    if _is_npm_snapshot(snapshot) and lower_path.endswith((".js", ".cjs", ".mjs")):
+        findings.extend(_analyze_npm_script(snapshot, file, text))
+
     return findings
+
+
+def _is_npm_snapshot(snapshot: ArtifactSnapshot) -> bool:
+    return snapshot.artifact.kind == "npm-tarball" or snapshot.package.ecosystem.lower() == "npm"
 
 
 def _finding(
@@ -285,6 +361,62 @@ def _credential_network_exfil_offset(text: str) -> int | None:
     if abs(credential_line - network_line) > 80:
         return None
     return min(credential.start(), network.start())
+
+
+def _analyze_npm_manifest(
+    snapshot: ArtifactSnapshot,
+    file: ArtifactFile,
+    text: str,
+) -> list[Finding]:
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    scripts = data.get("scripts")
+    if not isinstance(scripts, dict):
+        return []
+    findings: list[Finding] = []
+    for hook in _NPM_INSTALL_HOOKS:
+        command = scripts.get(hook)
+        if not isinstance(command, str) or not command.strip():
+            continue
+        offset = max(text.find(f'"{hook}"'), 0)
+        if _NPM_SCRIPT_EXEC_RE.search(command):
+            findings.append(_finding(snapshot, file, text, _NPM_INSTALL_EXEC_RULE, offset))
+        else:
+            findings.append(_finding(snapshot, file, text, _NPM_INSTALL_HOOK_RULE, offset))
+    return findings
+
+
+def _analyze_npm_script(
+    snapshot: ArtifactSnapshot,
+    file: ArtifactFile,
+    text: str,
+) -> list[Finding]:
+    findings: list[Finding] = []
+    encoded = _JS_ENCODED_EXEC_RE.search(text)
+    if encoded:
+        findings.append(_finding(snapshot, file, text, _NPM_ENCODED_RULE, encoded.start()))
+    exfil_offset = _npm_credential_exfil_offset(text)
+    if exfil_offset is not None:
+        findings.append(_finding(snapshot, file, text, _NPM_CREDENTIAL_EXFIL_RULE, exfil_offset))
+    return findings
+
+
+def _npm_credential_exfil_offset(text: str) -> int | None:
+    credential = _JS_CREDENTIAL_RE.search(text)
+    if credential is None:
+        return None
+    sink = _JS_NETWORK_RE.search(text) or _JS_PROCESS_RE.search(text)
+    if sink is None:
+        return None
+    credential_line, _snippet = _line_snippet(text, credential.start())
+    sink_line, _snippet = _line_snippet(text, sink.start())
+    if abs(credential_line - sink_line) > 80:
+        return None
+    return min(credential.start(), sink.start())
 
 
 def _top_level_risky_call_offset(text: str) -> int | None:

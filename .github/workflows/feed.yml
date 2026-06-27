@@ -1,0 +1,69 @@
+name: Publish package feed
+
+# Builds the default ca9 malware feed daily and publishes it to the `feed`
+# branch as latest.json. `ca9 feed update` (zero-arg) points at:
+#   https://raw.githubusercontent.com/duriantaco/ca9/feed/latest.json
+#
+# Review before enabling. To use GitHub Pages instead, serve the `feed` branch
+# and set DEFAULT_FEED_URL / CA9_FEED_URL accordingly.
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily, 06:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-feed
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      # Recommendation: pin these to commit SHAs (see tj-actions/CVE-2025-30066).
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ca9 (provides the `packaging` dependency)
+        run: pip install -e .
+
+      - name: Fetch previous manifest (collapse-guard input)
+        run: |
+          set -eu
+          mkdir -p feed_build
+          git fetch origin feed || true
+          git show origin/feed:manifest.json > feed_build/prev-manifest.json 2>/dev/null \
+            || echo '{}' > feed_build/prev-manifest.json
+
+      - name: Build feed bundle
+        run: |
+          set -euo pipefail
+          python scripts/build_feed.py \
+            -o feed_build/latest.json \
+            --manifest feed_build/manifest.json \
+            --min-malware 100 \
+            --compare-manifest feed_build/prev-manifest.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish to the feed branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Publish a fresh single-commit `feed` branch (data branch; history not kept).
+          workdir="$(mktemp -d)"
+          cp feed_build/latest.json feed_build/manifest.json "$workdir/"
+          cd "$workdir"
+          git init -q
+          git checkout -q -b feed
+          git add latest.json manifest.json
+          git -c user.name="ca9-feed-bot" \
+              -c user.email="ca9-feed-bot@users.noreply.github.com" \
+              commit -qm "feed: update $(date -u +%FT%TZ)"
+          git push -f \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            HEAD:feed

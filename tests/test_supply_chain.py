@@ -287,6 +287,106 @@ def test_vet_cli_allows_default_npm_registry_from_package_lock(tmp_path):
     assert not any(finding["signal_type"] == "untrusted_registry" for finding in data["findings"])
 
 
+def test_vet_cli_blocks_http_artifact_url(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "fyn.lock").write_text(
+        """
+version = 1
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "badlib" }]
+
+[[package]]
+name = "badlib"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "http://files.example/badlib-1.0.0.tar.gz", hash = "sha256:abc" }
+"""
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["vet", "--repo", str(repo), "-f", "json"])
+
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert any(finding["signal_type"] == "http_artifact_url" for finding in data["findings"])
+    assert any(decision["policy_id"] == "ca9.http_artifact_url" for decision in data["decisions"])
+
+
+def test_vet_cli_flags_direct_url_requirement(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "requirements.txt").write_text(
+        "badlib @ https://files.example/badlib-1.0.0-py3-none-any.whl\n"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["vet", "--repo", str(repo), "-f", "json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert any(finding["signal_type"] == "direct_url_dependency" for finding in data["findings"])
+    assert any(finding["signal_type"] == "missing_artifact_hash" for finding in data["findings"])
+
+
+def test_vet_cli_flags_git_requirement(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "requirements.txt").write_text(
+        "-e git+https://github.example/acme/badlib.git@abc123#egg=badlib\n"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["vet", "--repo", str(repo), "-f", "json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert any(finding["signal_type"] == "git_dependency" for finding in data["findings"])
+    assert data["inventory"]["summary"]["packages"] == 1
+
+
+def test_vet_cli_flags_untrusted_requirements_index_url(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "requirements.txt").write_text(
+        "--index-url https://packages.example/simple\nbadlib==1.0.0\n"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["vet", "--repo", str(repo), "-f", "json"])
+
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert any(finding["signal_type"] == "untrusted_registry" for finding in data["findings"])
+
+
+def test_vet_cli_flags_untrusted_pipfile_source(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "Pipfile").write_text(
+        """
+[[source]]
+name = "internal"
+url = "https://packages.example/simple"
+verify_ssl = true
+
+[packages]
+badlib = { version = "==1.0.0", index = "internal" }
+"""
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["vet", "--repo", str(repo), "-f", "json"])
+
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert any(finding["signal_type"] == "untrusted_registry" for finding in data["findings"])
+
+
 def test_vet_cli_scan_artifacts_blocks_malicious_pth(tmp_path):
     artifact = tmp_path / "badlib-1.0.0-py3-none-any.whl"
     with zipfile.ZipFile(artifact, "w") as zf:

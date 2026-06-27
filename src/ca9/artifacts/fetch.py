@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
+import re
 import shutil
 import urllib.error
 import urllib.parse
@@ -65,7 +67,7 @@ def collect_artifact_snapshots(
 
     for package in inventory.packages:
         for artifact in package.artifacts:
-            if artifact.kind not in {"wheel", "sdist"}:
+            if artifact.kind not in {"wheel", "sdist", "npm-tarball"}:
                 continue
             _collect_one(package, artifact, active_config, state)
 
@@ -213,19 +215,51 @@ def _download_artifact(url: str, archive_path: Path, max_bytes: int) -> None:
 
 
 def _verify_hash(path: Path, expected: str) -> tuple[bool, str]:
-    algorithm, expected_value = _parse_hash(expected)
-    if algorithm not in hashlib.algorithms_available:
-        return False, f"unsupported artifact hash algorithm: {algorithm}"
+    candidates = _parse_hash_candidates(expected)
+    if not candidates:
+        return False, f"unsupported artifact hash format: {expected}"
 
-    digest = hashlib.new(algorithm)
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            digest.update(chunk)
+    last_reason = ""
+    for algorithm, expected_value, encoding in candidates:
+        if algorithm not in hashlib.algorithms_available:
+            last_reason = f"unsupported artifact hash algorithm: {algorithm}"
+            continue
+        digest = hashlib.new(algorithm)
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if encoding == "base64":
+            actual = base64.b64encode(digest.digest()).decode("ascii")
+            if actual == expected_value:
+                return True, "hash verified"
+            last_reason = f"expected {algorithm}-{expected_value}, got {algorithm}-{actual}"
+        else:
+            actual = digest.hexdigest()
+            if actual.lower() == expected_value.lower():
+                return True, "hash verified"
+            last_reason = f"expected {algorithm}:{expected_value}, got {algorithm}:{actual}"
+    return False, last_reason or f"unsupported artifact hash format: {expected}"
 
-    actual = digest.hexdigest()
-    if actual.lower() != expected_value.lower():
-        return False, f"expected {algorithm}:{expected_value}, got {algorithm}:{actual}"
-    return True, "hash verified"
+
+_SRI_HASH_RE = re.compile(r"^(sha(?:256|384|512))-([A-Za-z0-9+/]+={0,2})$")
+
+
+def _parse_hash_candidates(value: str) -> list[tuple[str, str, str]]:
+    """Parse a hash spec into (algorithm, expected, encoding) candidates.
+
+    Supports npm Subresource-Integrity (``sha512-<base64>``, possibly multiple
+    space-separated) alongside the existing ``algo:hexdigest`` / bare-hex forms.
+    """
+    candidates: list[tuple[str, str, str]] = []
+    for token in value.split():
+        sri = _SRI_HASH_RE.match(token)
+        if sri:
+            candidates.append((sri.group(1), sri.group(2), "base64"))
+            continue
+        algorithm, digest = _parse_hash(token)
+        if digest:
+            candidates.append((algorithm, digest, "hex"))
+    return candidates
 
 
 def _parse_hash(value: str) -> tuple[str, str]:

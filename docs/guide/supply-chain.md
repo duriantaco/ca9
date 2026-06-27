@@ -14,6 +14,7 @@ The current implementation is intentionally local-first:
 - npm projects can be inventoried from `package-lock.json`.
 - package code is never installed, imported, or executed.
 - artifact downloads are explicit and hash-verified by default.
+- installed package-intelligence feeds are used locally for malware and package-age policy.
 - OSV malware advisory queries are opt-in.
 - Real incident replay fixtures track current coverage and gaps.
 
@@ -82,9 +83,14 @@ This checks:
 - missing artifact metadata
 - source-only install risk
 - mutable package sources
+- malware entries from the installed `ca9.feed.v1` feed
+- package-age policy when enabled in `ca9.toml`
 
-Direct dependencies from untrusted indexes are blocking findings by default. Weaker local
-metadata signals are warnings unless policy support is expanded.
+Direct dependencies from untrusted indexes, feed-backed malware matches, and
+too-new package versions are blocking findings by default. Missing package-age
+release times warn by default and block when `[mode].offline` is `block` or
+`strict`. Weaker local metadata signals are warnings unless policy support is
+expanded.
 
 ## Artifact Static Analysis
 
@@ -95,8 +101,8 @@ ca9 vet --repo . --scan-artifacts
 ```
 
 By default, ca9 only downloads artifacts that have hashes in the inventory. It verifies the
-hash, safely unpacks wheels/sdists, rejects path traversal or unsafe archive links, and
-scans files statically.
+hash, safely unpacks Python wheels/sdists and npm tarballs, rejects path traversal or
+unsafe archive links, and scans files statically.
 
 Current blocking rules include:
 
@@ -106,6 +112,10 @@ Current blocking rules include:
 - encoded payload decode plus execution
 - credential access near outbound network code
 - top-level import-time risky behavior
+- npm install lifecycle hooks
+- npm install hooks that shell out, fetch, decode, or eval
+- npm encoded payload execution, including base64 and hex decoding
+- npm credential access near network or process execution
 
 Suspicious process execution outside setup/import startup paths is marked for investigation.
 
@@ -121,6 +131,39 @@ Artifacts without hashes are skipped unless you explicitly opt in:
 ca9 vet --repo . --scan-artifacts --allow-unhashed-downloads
 ```
 
+## Package Feeds and Package Age
+
+Install a package-intelligence feed before relying on deterministic offline malware or
+package-age decisions:
+
+```bash
+ca9 feed update
+ca9 feed update --from ./ca9-feed.json
+ca9 feed status
+```
+
+`ca9 feed update` with no `--from` uses `CA9_FEED_URL` when set, otherwise the built-in
+default feed URL. The default URL points at the project feed branch; until that branch has
+been published, use `--from` or `CA9_FEED_URL`.
+
+Feed bundles use schema `ca9.feed.v1` and contain `npm-malware`, `pypi-malware`,
+`npm-releases`, and `pypi-releases`. Feed snapshots are stored under
+`~/.cache/ca9/feed/` and verified with SHA-256 content hashes before use. Tampered feeds
+always block.
+
+Enable package-age policy in `ca9.toml`:
+
+```toml
+[package_age]
+enabled = true
+minimum_hours = 48
+```
+
+If a release timestamp is present and younger than `minimum_hours`, ca9 blocks. If a
+release dataset declares `covers_since`, a missing version can pass when it is provably
+older than the configured minimum. Otherwise the release time is unknown; the default
+offline mode warns, and `[mode].offline = "block"` blocks.
+
 ## Malicious Advisory Query
 
 Query OSV for known malicious-package advisories:
@@ -130,8 +173,10 @@ ca9 vet --repo . --malware-query
 ```
 
 ca9 treats OSV `MAL-*`, `PYSEC-MAL-*`, explicit malicious-package metadata, and
-malware-labeled GHSA/OSV advisories as blocking malware findings for PyPI and npm. Use
-`--offline` to restrict the query path to cached OSV data.
+malware-labeled GHSA/OSV advisories as blocking malware findings for PyPI and npm. This
+is separate from the installed local feed: the feed path is deterministic and local,
+while `--malware-query` asks OSV or uses the OSV cache. Use `--offline` to restrict the
+query path to cached OSV data.
 
 ## GitHub Actions Workflow Scanning
 
@@ -228,6 +273,8 @@ Example signal types:
 - `untrusted_registry`
 - `dependency_confusion`
 - `malware`
+- `new_package_version`
+- `package_age_unknown`
 - `github_actions_pull_request_target_checkout`
 - `github_actions_oidc_write`
 - `github_actions_write_permissions`
@@ -238,6 +285,10 @@ Example signal types:
 - `credential-network-exfiltration`
 - `import-time-risky-behavior`
 - `silent-process-execution`
+- `npm-install-script`
+- `npm-install-script-exec`
+- `npm-encoded-execution`
+- `npm-credential-exfiltration`
 - `denied_license`
 - `unknown_license`
 
@@ -254,15 +305,20 @@ default gate unless they are represented as blocking decisions.
 ## Current Limits
 
 ca9 does not yet implement every dependency attack class. The current `vet` path covers
-the core local gates first: malicious package behavior, dependency confusion/internal
-source policy, artifact integrity basics, OSV/GHSA malware advisory matching, GitHub
-Actions workflow risk patterns, and license policy.
+the core local gates first: feed-backed malware, optional OSV/GHSA malware advisory
+matching, package-age policy, dependency confusion/internal source policy, artifact
+integrity basics, Python/npm artifact heuristics, GitHub Actions workflow risk patterns,
+and license policy.
 
 Still planned:
 
 - typosquatting and namespace confusion
 - lockfile poisoning diffs
-- PyPI release-age/yanked/project metadata
+- hosted complete recent-release datasets for package-age feeds
+- PyPI yanked/project metadata
 - maintainer or repository hijack signals
 - provenance/Sigstore/SLSA checks
-- richer policy files
+- signed feed snapshots
+- range-aware feed matching for bounded OSV malware advisories
+- yarn, pnpm, uv, poetry, pipx, npx, requirements-file, direct URL, local path, and
+  alternate pip-source runtime mediation

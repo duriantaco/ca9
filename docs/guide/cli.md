@@ -5,7 +5,11 @@ description: Complete ca9 CLI reference for Python CVE reachability analysis, pa
 
 # CLI Reference
 
-ca9 provides reachability-aware CVE triage and local Python package security checks. The core commands are `check` for existing SCA reports, `scan` for direct OSV.dev scanning, `inventory` for normalized package evidence, `vet` for supply-chain risk checks, and `ingest-sarif` for normalizing static-analysis evidence from other tools.
+ca9 provides reachability-aware CVE triage and local package security checks. The core
+commands are `check` for existing SCA reports, `scan` for direct OSV.dev scanning,
+`inventory` for normalized package evidence, `vet` for supply-chain risk checks, `feed`
+for local package-intelligence snapshots, `run` for supported npm/pip install
+preflight, and `ingest-sarif` for normalizing static-analysis evidence from other tools.
 
 ## Global options
 
@@ -140,6 +144,7 @@ Options:
 | `-r, --repo PATH` | Project repository path. Defaults to `.`. |
 | `-f, --format table\|json` | Output format. Defaults to `table`. |
 | `-o, --output PATH` | Write output to a file. |
+| `--policy PATH` | ca9 package policy TOML. |
 | `--trusted-index URL` | Trusted package index. Can be repeated. Defaults to PyPI and npmjs. |
 | `--private-index URL` | Private package index allowed for internal package names. Can be repeated. |
 | `--internal-package PATTERN` | Internal package name or glob pattern, e.g. `acme-*`. Can be repeated. |
@@ -165,7 +170,105 @@ ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.ac
 ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
 ```
 
-See [Supply-Chain Vetting](supply-chain.md) for details on current findings and limits.
+`vet` uses an installed `ca9.feed.v1` feed for local malware and package-age decisions
+when policy enables those checks. `--malware-query` is an additional OSV query path, not
+the feed path. See [Supply-Chain Vetting](supply-chain.md) for details on current
+findings and limits.
+
+## `ca9 policy`
+
+Validate or explain the effective package policy.
+
+```bash
+ca9 policy validate [OPTIONS]
+ca9 policy explain [OPTIONS]
+```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `--policy PATH` | ca9 package policy TOML. |
+| `-f, --format table\|json` | Output format for `explain`. Defaults to `table`. |
+
+Examples:
+
+```bash
+ca9 policy validate --policy ca9.toml
+ca9 policy explain --policy ca9.toml
+```
+
+## `ca9 feed`
+
+Manage local package-intelligence feed snapshots.
+
+```bash
+ca9 feed update [OPTIONS]
+ca9 feed status [OPTIONS]
+```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `--from PATH_OR_URL` | Feed bundle URL, JSON file, or directory containing `snapshot.json`. Optional for `update`. |
+| `--policy PATH` | ca9 package policy TOML for `status` offline/stale behavior. |
+| `-f, --format table\|json` | Output format. Defaults to `table`. |
+
+`ca9 feed update` resolves the source in this order: `--from`, `CA9_FEED_URL`, then the
+built-in default feed URL. The default feed URL points at the project feed branch; until
+that branch has been published, use `--from` or `CA9_FEED_URL`.
+
+Feed bundles use schema `ca9.feed.v1` with `npm-malware`, `pypi-malware`,
+`npm-releases`, and `pypi-releases`. ca9 stores snapshots under `~/.cache/ca9/feed/` and
+verifies per-dataset SHA-256 hashes before use.
+
+Examples:
+
+```bash
+ca9 feed update
+ca9 feed update --from ./ca9-feed.json
+ca9 feed status --policy ca9.toml -f json
+```
+
+## `ca9 run`
+
+Preflight and run supported package-manager install commands.
+
+```bash
+ca9 run [OPTIONS] -- COMMAND
+```
+
+Supported command families:
+
+- `npm install <direct package spec>`
+- `npm i <direct package spec>`
+- `pip install <direct package spec>`
+- `python -m pip install <direct package spec>`
+
+Options:
+
+| Option | Description |
+|---|---|
+| `--policy PATH` | ca9 package policy TOML. |
+| `--dry-run` | Run preflight only; do not execute the child command. |
+| `--audit-log PATH` | Runtime audit JSONL path. Defaults to `~/.cache/ca9/audit.jsonl`. |
+| `-f, --format table\|json` | Output format. Use `--dry-run` with JSON pass decisions. |
+
+`run` checks registry policy, local feed malware, package-age policy, install scripts with
+secret-bearing environment variables, and unsupported sources before executing the child
+command. When a feed is available, npm and PyPI loopback gateways can hide denied
+versions or links from the package manager and record those gateway decisions in the
+runtime audit log.
+
+Examples:
+
+```bash
+ca9 run --dry-run -- npm install express@4.18.2
+ca9 run -- npm i @scope/pkg@1.2.3
+ca9 run -- python -m pip install requests==2.31.0
+ca9 run -- pip install requests==2.31.0
+```
 
 ## `ca9 ingest-sarif`
 

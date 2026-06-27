@@ -39,19 +39,22 @@ Summary for this commit: `0 covered`, `5 partial`, `0 gap`.
 ## Known Gaps
 
 The PyPI import-time dropper case is partial because ca9 can inventory the pinned PyPI
-package from `fyn.lock` and classify the GHSA malicious-package advisory as blocking
-malware. ca9 still needs import-time Python malware analysis to prove whether importing
-the package could execute the dropper.
+package from `fyn.lock`, classify the GHSA malicious-package advisory as blocking
+malware, and run static artifact heuristics when a hash-pinned artifact is available.
+It still does not execute packages in a sandbox, so dynamic import-time behavior remains
+outside the proof.
 
 The npm package compromise cases are partial because ca9 now parses `package-lock.json`
-inventory and can classify malicious npm advisories, but it does not yet parse
-`pnpm-lock.yaml` or `yarn.lock` and does not inspect npm lifecycle/install-time malware.
+inventory, can classify feed/OSV malicious npm advisories, verifies npm SRI tarballs, and
+statically inspects npm lifecycle/install-time malware patterns. It does not yet parse
+`pnpm-lock.yaml` or `yarn.lock`, and the npm analyzer is still heuristic rather than
+dynamic sandbox execution.
 
 The Actions/OIDC compromise case now exercises the GitHub Actions workflow scanner for
 `pull_request_target`, OIDC token scope, broad write permissions, mutable action refs,
 cache trust boundaries, source-clone commands, encoded shell payloads, cloud metadata
 probing, and broad credential-file harvest patterns. It remains partial because package
-provenance and npm tarball/lifecycle analysis are separate surfaces.
+provenance, maintainer compromise, and dynamic npm tarball behavior are separate surfaces.
 
 The workflow-backdoor case is partial because ca9 can flag malicious workflow payload
 patterns, but direct push prevention and compromised PAT/deploy-key response
