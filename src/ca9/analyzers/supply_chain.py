@@ -18,6 +18,7 @@ from ca9.core.models import (
     package_key as normalized_package_key,
 )
 from ca9.models import Vulnerability
+from ca9.package_policy import action_for_mode
 
 DEFAULT_TRUSTED_INDEXES = ("https://pypi.org/simple", "https://registry.npmjs.org")
 BLOCKING_SIGNALS = {"malware", "untrusted_registry"}
@@ -34,8 +35,10 @@ _MALWARE_TEXT_RE = re.compile(
 @dataclass(frozen=True)
 class SupplyChainPolicy:
     trusted_indexes: tuple[str, ...] = DEFAULT_TRUSTED_INDEXES
+    denied_indexes: tuple[str, ...] = ()
     private_indexes: tuple[str, ...] = ()
     internal_package_patterns: tuple[str, ...] = ()
+    mode: str = "block"
     block_untrusted_direct: bool = True
     warn_on_missing_artifact_hash: bool = True
     warn_on_missing_artifact_metadata: bool = True
@@ -116,12 +119,18 @@ def findings_from_malware_advisories(vulnerabilities: list[Vulnerability]) -> li
     return _sort_findings(findings)
 
 
-def evaluate_supply_chain_findings(findings: list[Finding]) -> list[Decision]:
+def evaluate_supply_chain_findings(
+    findings: list[Finding],
+    policy: SupplyChainPolicy | None = None,
+) -> list[Decision]:
+    active_policy = policy or SupplyChainPolicy()
     decisions: list[Decision] = []
     for finding in findings:
         action = str(finding.metadata.get("action") or "")
         if action not in {"block", "warn", "pass", "investigate"}:
             action = "block" if finding.signal_type in BLOCKING_SIGNALS else "warn"
+        if not finding.metadata.get("mode_applied"):
+            action = action_for_mode(action, active_policy.mode)
         decisions.append(
             Decision(
                 action=action,
@@ -136,6 +145,31 @@ def evaluate_supply_chain_findings(findings: list[Finding]) -> list[Decision]:
 def _artifact_source_findings(package: Package, policy: SupplyChainPolicy) -> list[Finding]:
     findings: list[Finding] = []
     source = _package_evidence(package, "package inventory")
+
+    if package.source_registry and _is_denied_index(package.source_registry, policy):
+        direct = package.dependency_kind in {"direct", "project"}
+        evidence = Evidence(
+            kind="artifact_source",
+            description=f"{package.name} resolves from denied registry {package.source_registry}",
+            source=source,
+            metadata={
+                "registry": package.source_registry,
+                "denied_indexes": list(policy.denied_indexes),
+                "dependency_kind": package.dependency_kind,
+            },
+        )
+        findings.append(
+            _finding(
+                package,
+                title=f"Denied package registry for {package.name}",
+                signal_type="denied_registry",
+                severity="high" if direct else "medium",
+                action="block",
+                evidence=evidence,
+                reason="package resolves from a denied registry",
+            )
+        )
+        return findings
 
     if package.source_registry and not _is_trusted_index(package.source_registry, policy):
         direct = package.dependency_kind in {"direct", "project"}
@@ -210,6 +244,31 @@ def _artifact_source_findings(package: Package, policy: SupplyChainPolicy) -> li
                 )
             )
 
+    for artifact in package.artifacts:
+        if not artifact.url or not artifact.url.lower().startswith("http://"):
+            continue
+        evidence = Evidence(
+            kind="artifact_transport",
+            description=f"{package.name} artifact uses insecure HTTP URL {artifact.url}",
+            source=artifact.evidence[0] if artifact.evidence else source,
+            metadata={
+                "artifact_kind": artifact.kind,
+                "url": artifact.url,
+                "dependency_kind": package.dependency_kind,
+            },
+        )
+        findings.append(
+            _finding(
+                package,
+                title=f"Insecure artifact URL for {package.name}",
+                signal_type="http_artifact_url",
+                severity=_kind_weighted_severity(package, direct="high", transitive="medium"),
+                action="block" if package.dependency_kind in {"direct", "project"} else "warn",
+                evidence=evidence,
+                reason="package artifact is fetched over unauthenticated HTTP",
+            )
+        )
+
     return findings
 
 
@@ -238,7 +297,53 @@ def _install_risk_findings(package: Package, policy: SupplyChainPolicy) -> list[
         )
 
     source_kind = str(package.metadata.get("source_kind") or "")
-    if policy.warn_on_mutable_source and source_kind in {"git", "url", "path"}:
+    source_url = str(package.metadata.get("source_url") or "")
+    if source_kind == "git":
+        evidence = Evidence(
+            kind="artifact_source",
+            description=f"{package.name} resolves from a Git dependency",
+            source=source,
+            metadata={
+                "source_kind": source_kind,
+                "source_url": source_url or None,
+                "dependency_kind": package.dependency_kind,
+            },
+        )
+        findings.append(
+            _finding(
+                package,
+                title=f"Git dependency for {package.name}",
+                signal_type="git_dependency",
+                severity=_kind_weighted_severity(package, direct="medium", transitive="low"),
+                action="warn",
+                evidence=evidence,
+                reason="Git dependencies bypass normal registry release and artifact controls",
+            )
+        )
+    elif source_kind in {"url", "direct_url"}:
+        evidence = Evidence(
+            kind="artifact_source",
+            description=f"{package.name} resolves from a direct URL dependency",
+            source=source,
+            metadata={
+                "source_kind": source_kind,
+                "source_url": source_url or None,
+                "dependency_kind": package.dependency_kind,
+            },
+        )
+        findings.append(
+            _finding(
+                package,
+                title=f"Direct URL dependency for {package.name}",
+                signal_type="direct_url_dependency",
+                severity=_kind_weighted_severity(package, direct="medium", transitive="low"),
+                action="warn",
+                evidence=evidence,
+                reason="direct URL dependencies bypass normal registry release and provenance controls",
+            )
+        )
+
+    if policy.warn_on_mutable_source and source_kind in {"path"}:
         evidence = Evidence(
             kind="artifact_source",
             description=f"{package.name} resolves from mutable source kind {source_kind}",
@@ -355,15 +460,15 @@ def _package_evidence(package: Package, default_source: str) -> SourceEvidence:
 
 
 def _is_trusted_index(registry: str, policy: SupplyChainPolicy) -> bool:
-    normalized_registry = _normalize_index_url(registry)
-    trusted = {_normalize_index_url(item) for item in policy.trusted_indexes}
-    return normalized_registry in trusted
+    return _registry_matches(registry, policy.trusted_indexes)
+
+
+def _is_denied_index(registry: str, policy: SupplyChainPolicy) -> bool:
+    return _registry_matches(registry, policy.denied_indexes)
 
 
 def _is_private_index(registry: str, policy: SupplyChainPolicy) -> bool:
-    normalized_registry = _normalize_index_url(registry)
-    private_indexes = {_normalize_index_url(item) for item in policy.private_indexes}
-    return normalized_registry in private_indexes
+    return _registry_matches(registry, policy.private_indexes)
 
 
 def _matched_internal_pattern(name: str, patterns: tuple[str, ...]) -> str | None:
@@ -385,6 +490,33 @@ def _normalize_index_url(value: str) -> str:
         return value.strip().rstrip("/").lower()
     path = parsed.path.rstrip("/")
     return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+
+
+def _registry_matches(registry: str, candidates: tuple[str, ...]) -> bool:
+    normalized_registry = _normalize_index_url(registry)
+    registry_host = _index_host(registry)
+    for candidate in candidates:
+        if normalized_registry == _normalize_index_url(candidate):
+            return True
+        candidate_host = _index_host(candidate)
+        parsed_candidate = urlparse(candidate.strip())
+        candidate_path = parsed_candidate.path.rstrip("/") if parsed_candidate.netloc else ""
+        if (
+            candidate_host
+            and registry_host
+            and candidate_host == registry_host
+            and not candidate_path
+        ):
+            return True
+    return False
+
+
+def _index_host(value: str) -> str:
+    raw = value.strip()
+    parsed = urlparse(raw)
+    if parsed.netloc:
+        return parsed.netloc.lower()
+    return raw.split("/", 1)[0].lower()
 
 
 def _kind_weighted_severity(package: Package, *, direct: str, transitive: str) -> str:

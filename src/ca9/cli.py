@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 try:
     import click
@@ -156,6 +157,572 @@ def _resolve_option(ctx: click.Context, option_name: str, current_value):
     return current_value
 
 
+@main.group(name="setup")
+def setup_group() -> None:
+    """Install opt-in ca9 integrations."""
+
+
+@setup_group.group(name="ci")
+def setup_ci_group() -> None:
+    """Set up ca9 CI package-manager shims."""
+
+
+@setup_ci_group.command(name="print")
+def setup_ci_print_cmd() -> None:
+    """Print deterministic CI setup commands."""
+    from ca9.runtime.ci import ci_setup_print_snippet
+
+    click.echo(ci_setup_print_snippet())
+
+
+@setup_ci_group.command(name="install")
+@click.option(
+    "--shim-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Directory where ca9 CI shims should be written.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+def setup_ci_install_cmd(shim_dir: Path | None, output_format: str) -> None:
+    """Install ca9 CI package-manager shims."""
+    from ca9.runtime.ci import format_ci_setup, install_ci_shims
+
+    result = install_ci_shims(shim_dir=shim_dir)
+    if output_format == "json":
+        click.echo(json.dumps(result.to_dict(), indent=2))
+    else:
+        click.echo(format_ci_setup(result))
+
+
+@setup_group.command(name="shell")
+@click.option(
+    "--print",
+    "print_only",
+    is_flag=True,
+    default=False,
+    help="Print the shell setup block without editing profile files.",
+)
+@click.option(
+    "--install",
+    "install",
+    is_flag=True,
+    default=False,
+    help="Install shims and add the ca9-managed block to the shell profile.",
+)
+@click.option(
+    "--profile",
+    "profile_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Shell profile file to update.",
+)
+@click.option(
+    "--shim-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Directory where ca9 shell shims should be written.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+def setup_shell_cmd(
+    print_only: bool,
+    install: bool,
+    profile_path: Path | None,
+    shim_dir: Path | None,
+    output_format: str,
+) -> None:
+    """Print or install reversible local shell setup."""
+    from ca9.runtime.shell import (
+        format_shell_setup,
+        install_shell_setup,
+        shell_setup_print_snippet,
+    )
+
+    if print_only == install:
+        raise click.ClickException("choose exactly one of --print or --install")
+
+    if print_only:
+        snippet = shell_setup_print_snippet(shim_dir=shim_dir)
+        if output_format == "json":
+            click.echo(
+                json.dumps(
+                    {
+                        "schema_version": "ca9.shell.print.v1",
+                        "snippet": snippet,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            click.echo(snippet)
+        return
+
+    result = install_shell_setup(profile_path=profile_path, shim_dir=shim_dir)
+    if output_format == "json":
+        click.echo(json.dumps(result.to_dict(), indent=2))
+    else:
+        click.echo(format_shell_setup(result))
+
+
+@main.group(name="teardown")
+def teardown_group() -> None:
+    """Remove ca9-owned integrations."""
+
+
+@teardown_group.command(name="shell")
+@click.option(
+    "--profile",
+    "profile_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Shell profile file to update.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+def teardown_shell_cmd(profile_path: Path | None, output_format: str) -> None:
+    """Remove the ca9-managed shell profile block."""
+    from ca9.runtime.shell import format_shell_teardown, teardown_shell_setup
+
+    result = teardown_shell_setup(profile_path=profile_path)
+    if output_format == "json":
+        click.echo(json.dumps(result.to_dict(), indent=2))
+    else:
+        click.echo(format_shell_teardown(result))
+
+
+@main.group(name="doctor")
+def doctor_group() -> None:
+    """Check ca9 environment integrations."""
+
+
+@doctor_group.command(name="ci")
+@click.option(
+    "--shim-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Directory where ca9 CI shims should be checked.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+def doctor_ci_cmd(shim_dir: Path | None, output_format: str) -> None:
+    """Check ca9 CI shim installation."""
+    from ca9.runtime.ci import doctor_ci, format_ci_doctor
+
+    result = doctor_ci(shim_dir=shim_dir)
+    if output_format == "json":
+        click.echo(json.dumps(result.to_dict(), indent=2))
+    else:
+        click.echo(format_ci_doctor(result))
+    sys.exit(result.exit_code)
+
+
+@doctor_group.command(name="shell")
+@click.option(
+    "--profile",
+    "profile_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Shell profile file to check.",
+)
+@click.option(
+    "--shim-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Directory where ca9 shell shims should be checked.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+def doctor_shell_cmd(
+    profile_path: Path | None,
+    shim_dir: Path | None,
+    output_format: str,
+) -> None:
+    """Check ca9 shell setup."""
+    from ca9.runtime.shell import doctor_shell, format_shell_doctor
+
+    result = doctor_shell(profile_path=profile_path, shim_dir=shim_dir)
+    if output_format == "json":
+        click.echo(json.dumps(result.to_dict(), indent=2))
+    else:
+        click.echo(format_shell_doctor(result))
+    sys.exit(result.exit_code)
+
+
+@main.group(name="policy")
+def policy_group() -> None:
+    """Validate and explain ca9 package policy."""
+
+
+@policy_group.command(name="validate")
+@click.option(
+    "--policy",
+    "policy_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to ca9 package policy TOML.",
+)
+def policy_validate_cmd(policy_path: Path | None) -> None:
+    """Validate ca9 package policy."""
+    from ca9.package_policy import validate_package_policy
+
+    try:
+        policy = validate_package_policy(policy_path)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from None
+
+    source = ", ".join(policy.sources) if policy.sources else "built-in defaults"
+    click.echo(f"Policy valid: {source}")
+
+
+@policy_group.command(name="explain")
+@click.option(
+    "--policy",
+    "policy_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to ca9 package policy TOML.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+def policy_explain_cmd(policy_path: Path | None, output_format: str) -> None:
+    """Show the effective ca9 package policy."""
+    from ca9.package_policy import load_package_policy, package_policy_explain
+
+    try:
+        policy = load_package_policy(policy_path)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from None
+
+    if output_format == "json":
+        click.echo(policy.to_json())
+    else:
+        click.echo(package_policy_explain(policy))
+
+
+@main.group(name="feed")
+def feed_group() -> None:
+    """Manage ca9 package intelligence feeds."""
+
+
+@feed_group.command(name="update")
+@click.option(
+    "--from",
+    "source",
+    default=None,
+    help=(
+        "Feed bundle URL, JSON file, or directory containing snapshot.json. "
+        "Defaults to the ca9 hosted feed (override with CA9_FEED_URL)."
+    ),
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+def feed_update_cmd(source: str | None, output_format: str) -> None:
+    """Install a package intelligence feed snapshot into the local ca9 cache."""
+    import os
+
+    from ca9.package_feed import DEFAULT_FEED_URL, FeedError, update_feed_from_source
+
+    resolved_source = source or os.environ.get("CA9_FEED_URL") or DEFAULT_FEED_URL
+
+    try:
+        snapshot = update_feed_from_source(resolved_source)
+    except FeedError as exc:
+        raise click.ClickException(str(exc)) from None
+
+    if output_format == "json":
+        click.echo(
+            json.dumps(
+                {
+                    "schema_version": "ca9.feed.update.v1",
+                    "cache_dir": str(snapshot.cache_dir),
+                    "source": resolved_source,
+                    "snapshot": snapshot.to_dict(),
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo(f"Feed updated: {snapshot.snapshot_id}")
+        click.echo(f"Source: {resolved_source}")
+        click.echo(f"Cache: {snapshot.cache_dir}")
+        click.echo(f"Expires: {snapshot.expires_at}")
+
+
+@feed_group.command(name="status")
+@click.option(
+    "--policy",
+    "policy_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to ca9 package policy TOML.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+def feed_status_cmd(policy_path: Path | None, output_format: str) -> None:
+    """Show local package feed cache status."""
+    from ca9.package_feed import feed_status, format_feed_status
+    from ca9.package_policy import load_effective_package_policy, load_package_policy
+
+    try:
+        package_policy = (
+            load_package_policy(policy_path)
+            if policy_path is not None
+            else load_effective_package_policy()
+        )
+        status = feed_status(policy=package_policy)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from None
+
+    if output_format == "json":
+        click.echo(json.dumps(status.to_dict(), indent=2))
+    else:
+        click.echo(format_feed_status(status))
+    sys.exit(status.exit_code)
+
+
+@main.command(
+    name="run",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.option(
+    "--policy",
+    "policy_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to ca9 package policy TOML.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Run ca9 preflight only; do not execute the package-manager command.",
+)
+@click.option(
+    "--audit-log",
+    "audit_log_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write runtime audit JSONL to this path.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+@click.argument("command", nargs=-1, type=click.UNPROCESSED)
+def run_cmd(
+    policy_path: Path | None,
+    dry_run: bool,
+    audit_log_path: Path | None,
+    output_format: str,
+    command: tuple[str, ...],
+) -> None:
+    """Preflight and run supported package-manager install commands."""
+    import os
+    import subprocess
+
+    from ca9.package_policy import load_effective_package_policy, validate_package_policy
+    from ca9.runtime.npm_gateway import (
+        DEFAULT_NPM_REGISTRY,
+        NpmMetadataGateway,
+        npm_gateway_child_env,
+        should_start_npm_gateway,
+    )
+    from ca9.runtime.preflight import (
+        LedgerEvent,
+        append_ledger_events,
+        child_environment,
+        child_process_exited_event,
+        child_process_started_event,
+        evaluate_runtime_preflight,
+        format_preflight,
+        gateway_child_command,
+        new_ledger_session_id,
+        preflight_ledger_events,
+        primary_registry_url,
+        session_ended_event,
+    )
+    from ca9.runtime.pypi_gateway import (
+        DEFAULT_PYPI_UPSTREAM,
+        PyPISimpleGateway,
+        pypi_gateway_child_env,
+        should_start_pypi_gateway,
+    )
+
+    if not command:
+        raise click.ClickException("ca9 run needs a command after --")
+
+    try:
+        package_policy = (
+            validate_package_policy(policy_path)
+            if policy_path is not None
+            else load_effective_package_policy(cwd=Path.cwd())
+        )
+        preflight = evaluate_runtime_preflight(
+            command,
+            package_policy,
+            env=dict(os.environ),
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from None
+
+    if output_format == "json" and not dry_run and not preflight.blocked:
+        raise click.ClickException("use --dry-run with -f json, or omit -f json to execute")
+
+    executed = False
+    child_exit_code = None
+    exit_code = 1 if preflight.blocked else 0
+    session_id = new_ledger_session_id()
+    gateway_events: list[LedgerEvent] = []
+    ledger_path = append_ledger_events(
+        preflight_ledger_events(preflight, session_id=session_id, dry_run=dry_run),
+        ledger_path=audit_log_path,
+    )
+
+    if not dry_run and not preflight.blocked:
+        click.echo(format_preflight(preflight), err=True)
+        append_ledger_events(
+            [child_process_started_event(preflight, session_id=session_id)],
+            ledger_path=ledger_path,
+        )
+        child_env = child_environment(dict(os.environ), preflight)
+        if should_start_npm_gateway(preflight.command.family, package_policy, preflight.feed):
+            upstream_registry = (
+                os.environ.get("CA9_NPM_UPSTREAM_REGISTRY")
+                or primary_registry_url(preflight.command)
+                or DEFAULT_NPM_REGISTRY
+            )
+            with NpmMetadataGateway(
+                upstream_registry=upstream_registry,
+                policy=package_policy,
+            ) as gateway:
+                completed = subprocess.run(
+                    list(gateway_child_command(preflight.command)),
+                    env=npm_gateway_child_env(child_env, gateway.registry_url),
+                )
+                gateway_events = _gateway_ledger_events(gateway.to_dict(), session_id=session_id)
+        elif should_start_pypi_gateway(preflight.command.family, package_policy, preflight.feed):
+            upstream_base = (
+                os.environ.get("CA9_PYPI_UPSTREAM_INDEX")
+                or primary_registry_url(preflight.command)
+                or DEFAULT_PYPI_UPSTREAM
+            )
+            with PyPISimpleGateway(
+                upstream_base=upstream_base,
+                policy=package_policy,
+            ) as gateway:
+                completed = subprocess.run(
+                    list(gateway_child_command(preflight.command)),
+                    env=pypi_gateway_child_env(child_env, gateway.index_url),
+                )
+                gateway_events = _gateway_ledger_events(gateway.to_dict(), session_id=session_id)
+        else:
+            completed = subprocess.run(
+                list(command),
+                env=child_env,
+            )
+        executed = True
+        child_exit_code = completed.returncode
+        exit_code = completed.returncode
+        if gateway_events:
+            append_ledger_events(gateway_events, ledger_path=ledger_path)
+        append_ledger_events(
+            [child_process_exited_event(session_id=session_id, child_exit_code=child_exit_code)],
+            ledger_path=ledger_path,
+        )
+
+    append_ledger_events(
+        [
+            session_ended_event(
+                preflight,
+                session_id=session_id,
+                executed=executed,
+                child_exit_code=child_exit_code,
+            )
+        ],
+        ledger_path=ledger_path,
+    )
+
+    if output_format == "json":
+        click.echo(
+            json.dumps(
+                preflight.to_dict(
+                    executed=executed,
+                    child_exit_code=child_exit_code,
+                    ledger_path=ledger_path,
+                ),
+                indent=2,
+            )
+        )
+    elif dry_run or preflight.blocked:
+        click.echo(format_preflight(preflight))
+
+    sys.exit(exit_code)
+
+
+def _gateway_ledger_events(gateway_payload: dict[str, Any], *, session_id: str):
+    from ca9.runtime.preflight import LedgerEvent
+
+    events = [LedgerEvent("gateway_used", gateway_payload, session_id)]
+    for key in ("removed_versions", "removed_links"):
+        for decision in gateway_payload.get(key) or []:
+            payload = {"action": "block", **decision}
+            events.append(LedgerEvent("decision_emitted", payload, session_id))
+    return events
+
+
 @main.command(name="inventory")
 @click.argument("path", required=False, type=click.Path(exists=True, path_type=Path))
 @click.option(
@@ -236,6 +803,13 @@ def inventory_cmd(
     type=click.Path(path_type=Path),
     default=None,
     help="Write output to file instead of stdout.",
+)
+@click.option(
+    "--policy",
+    "policy_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to ca9 package policy TOML.",
 )
 @click.option(
     "--trusted-index",
@@ -323,6 +897,7 @@ def vet_cmd(
     repo_path: Path,
     output_format: str,
     output_path: Path | None,
+    policy_path: Path | None,
     trusted_indexes: tuple[str, ...],
     private_indexes: tuple[str, ...],
     internal_package_patterns: tuple[str, ...],
@@ -351,8 +926,47 @@ def vet_cmd(
     else:
         repo_path = path
 
+    from ca9.package_policy import load_effective_package_policy, validate_package_policy
+
+    policy_warnings: list[str] = []
+    try:
+        if policy_path is not None:
+            package_policy = validate_package_policy(policy_path)
+        else:
+            package_policy = load_effective_package_policy(cwd=repo_path)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from None
+
     inventory = build_inventory(repo_path)
+    policy_findings = []
+    feed_warnings = []
+    if package_policy.package_age.enabled:
+        from ca9.package_feed import FeedError, package_age_findings
+
+        try:
+            policy_findings, feed_warnings = package_age_findings(
+                inventory.packages,
+                package_policy,
+            )
+        except FeedError as exc:
+            raise click.ClickException(str(exc)) from None
+    if package_policy.malware.enabled:
+        from ca9.package_feed import FeedError, package_malware_findings
+
+        try:
+            malware_findings, malware_feed_warnings = package_malware_findings(
+                inventory.packages,
+                package_policy,
+            )
+            policy_findings.extend(malware_findings)
+            feed_warnings.extend(malware_feed_warnings)
+        except FeedError as exc:
+            raise click.ClickException(str(exc)) from None
+
     malware_advisories = []
+    if malware_query and package_policy is not None and not package_policy.malware.enabled:
+        policy_warnings.append("policy: malware queries are disabled by package policy")
+        malware_query = False
     if malware_query:
         from ca9.scanner import query_osv_batch
 
@@ -381,7 +995,7 @@ def vet_cmd(
                 raise click.ClickException(str(e)) from None
 
     artifact_findings = []
-    artifact_warnings = []
+    artifact_warnings = [*policy_warnings, *feed_warnings]
     artifact_scans = 0
     skipped_artifacts = 0
     workflow_findings = []
@@ -406,7 +1020,7 @@ def vet_cmd(
             require_known_license=require_known_license,
         )
         artifact_findings.extend(analyze_license_policy(artifact_result.snapshots, license_policy))
-        artifact_warnings = list(artifact_result.warnings)
+        artifact_warnings = [*policy_warnings, *feed_warnings, *artifact_result.warnings]
         artifact_scans = artifact_result.scanned_artifacts
         skipped_artifacts = artifact_result.skipped_artifacts
 
@@ -416,15 +1030,21 @@ def vet_cmd(
         workflow_findings = analyze_github_actions_workflows(repo_path)
 
     policy = SupplyChainPolicy(
-        trusted_indexes=trusted_indexes or DEFAULT_TRUSTED_INDEXES,
+        trusted_indexes=trusted_indexes
+        or (package_policy.registries.allow if package_policy else DEFAULT_TRUSTED_INDEXES),
+        denied_indexes=package_policy.registries.deny if package_policy else (),
         private_indexes=private_indexes,
         internal_package_patterns=internal_package_patterns,
+        mode=package_policy.mode.default if package_policy else "block",
+        block_untrusted_direct=package_policy.registries.custom_requires_approval
+        if package_policy
+        else True,
     )
     report = build_supply_chain_report(
         inventory,
         policy=policy,
         malware_advisories=malware_advisories,
-        extra_findings=[*artifact_findings, *workflow_findings],
+        extra_findings=[*policy_findings, *artifact_findings, *workflow_findings],
         extra_warnings=artifact_warnings,
         artifact_scans=artifact_scans,
         skipped_artifacts=skipped_artifacts,

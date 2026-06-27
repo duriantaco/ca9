@@ -162,6 +162,22 @@ def test_build_inventory_prefers_package_lock_when_no_fyn_lock(tmp_path):
     assert any(package.key == "npm:@scope/cli@1.2.3" for package in inventory.packages)
 
 
+def test_build_inventory_merges_package_lock_and_declared_python_dependencies(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text(json.dumps(PACKAGE_LOCK))
+    (repo / "requirements.txt").write_text("requests==2.31.0\n")
+
+    inventory = build_inventory(repo)
+
+    assert any(package.key == "npm:@scope/cli@1.2.3" for package in inventory.packages)
+    assert any(package.key == "pypi:requests@2.31.0" for package in inventory.packages)
+    assert {source.source for source in inventory.source_inputs} == {
+        "package-lock.json",
+        "ca9 native manifest readers",
+    }
+
+
 def test_inventory_cli_outputs_json_for_fyn_lock(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
