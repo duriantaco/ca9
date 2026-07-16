@@ -74,7 +74,7 @@ Baseline:
 
 - Confirm `site_url` and canonical repository links are correct in `mkdocs.yml`.
 - Confirm the homepage title and description include "Python CVE reachability analysis" naturally.
-- Confirm integration pages exist for Snyk, Dependabot, Trivy, pip-audit, OSV, SARIF, OpenVEX, SBOM, MCP, and CI/CD.
+- Confirm integration pages exist for Snyk, Dependabot, Trivy, Grype, OSV-Scanner, pip-audit, OSV, SARIF, OpenVEX, SBOM, MCP, and CI/CD.
 - Build docs and submit the generated sitemap in Google Search Console after deployment.
 
 ## GitHub

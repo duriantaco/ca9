@@ -57,3 +57,38 @@ Returns `True` if the data is a list of objects with `security_advisory` and `de
 ### `parse(data) -> list[Vulnerability]`
 
 Extracts vulnerabilities from Dependabot alert objects. Uses GHSA ID, CVE ID, or alert number as the vulnerability ID.
+
+---
+
+## TrivyParser
+
+**Module:** `ca9.parsers.trivy`
+
+Parses native Trivy JSON result sections and preserves dependency and advisory metadata
+when present.
+
+---
+
+## GrypeParser
+
+**Module:** `ca9.parsers.grype`
+
+Parses native Grype JSON `matches`, including vulnerability, artifact, ecosystem,
+severity, alias, and reference data.
+
+---
+
+## OsvScannerParser
+
+**Module:** `ca9.parsers.osv_scanner`
+
+Parses OSV-Scanner's native `results[].packages[]` JSON and maps nested full OSV
+records into ca9 vulnerabilities.
+
+---
+
+## PipAuditParser
+
+**Module:** `ca9.parsers.pip_audit`
+
+Parses pip-audit dependency and vulnerability entries.

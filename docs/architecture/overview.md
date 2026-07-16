@@ -78,6 +78,8 @@ src/ca9/
     ├── snyk.py               # Snyk JSON parser
     ├── dependabot.py         # Dependabot alerts parser
     ├── trivy.py              # Trivy JSON parser
+    ├── grype.py              # Native Grype JSON parser
+    ├── osv_scanner.py        # Native OSV-Scanner JSON parser
     └── pip_audit.py          # pip-audit JSON parser
 ```
 

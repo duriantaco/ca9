@@ -13,7 +13,7 @@ Each benchmark should record:
 
 - Repository or fixture name.
 - Dependency manifest and lockfile state.
-- SCA source: OSV scan, Snyk, Dependabot, Trivy, or pip-audit.
+- SCA source: OSV scan, Snyk, Dependabot, Trivy, Grype, OSV-Scanner, or pip-audit.
 - Coverage command and coverage percentage.
 - ca9 command and version.
 - Total, reachable, unreachable, and inconclusive counts.

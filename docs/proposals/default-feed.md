@@ -1,12 +1,13 @@
 # Proposal: a default, OSV-backed package feed
 
-**Status:** partially implemented; hosted feed data still pending.
+**Status:** partially implemented; the hosted malware feed is live, while complete
+release-window data is still pending.
 
 **Problem it solves:** ca9's runtime prevention layer (`ca9 run`, the npm/PyPI gateways,
-`ca9 vet` package-age and feed-backed malware checks) is fully built but still needs hosted
-data. `ca9 feed update` now has a default URL, but that URL 404s until the `feed` branch is
-published by the scheduled workflow. Out of the box, the malware blocker has nothing to
-block against until a feed is installed from the default URL, `CA9_FEED_URL`, or `--from`.
+`ca9 vet` package-age and feed-backed malware checks) needs current hosted intelligence.
+`ca9 feed update` now installs the published default malware feed; `CA9_FEED_URL` and
+`--from` remain available for alternate bundles. Complete recent-release datasets for
+package-age enforcement are not populated yet.
 
 **Goal:** `ca9 feed update` with **no arguments** installs a current, integrity-verified
 malware feed from a hosted default source, so malware blocking works immediately after
@@ -135,12 +136,13 @@ a `lookup_release_window_start(snapshot, ecosystem)` helper in `package_feed.py`
 
 ### v1 — MVP: malware blocking works out of the box  ← closes the headline gap
 
-- Build a bundle with **complete** npm + PyPI malware from OpenSSF; ship releases datasets as
+- [x] Build a bundle with npm + PyPI malware from OSV; ship releases datasets as
   `{"packages": {}}` (empty but present, so `REQUIRED_DATASETS` validation passes unchanged).
-- Host it; point a new `DEFAULT_FEED_URL` at it.
+- [x] Host it and point `DEFAULT_FEED_URL` at it.
 - [x] Make `--from` optional: `ca9 feed update` with no arg uses `DEFAULT_FEED_URL`.
-- [ ] Publish the `feed` branch so zero-arg `ca9 feed update` succeeds without `CA9_FEED_URL`.
-- Result once hosted: after `pip install ca9 && ca9 feed update`, `ca9 run -- npm install <malware>` blocks.
+- [x] Publish the `feed` branch so zero-arg `ca9 feed update` succeeds without `CA9_FEED_URL`.
+- Result: after `pip install ca9 && ca9 feed update`, `ca9 run -- npm ci` blocks a locked
+  malware version, and direct supported installs use the same feed.
   Package-age stays opt-in/BYO (it's already `enabled=False` by default), so empty releases data
   changes nothing for default users.
 
@@ -181,8 +183,7 @@ New `scripts/build_feed.py` (+ `tests/test_build_feed.py`), pure-stdlib where po
 ## 6. Hosting & refresh (zero infra cost)
 
 - A scheduled GitHub Actions workflow (`.github/workflows/feed.yml`, daily) runs the builder and
-  publishes the bundle to **GitHub Pages** (repo already deploys to `duriantaco.github.io/ca9`) or
-  a **release asset** / dedicated `feed` branch.
+  publishes the bundle to the dedicated `feed` branch.
 - `DEFAULT_FEED_URL` points at that stable URL; `expires_at = now + 7d` gives a 6-day grace
   window before `feed status` reports `stale`.
 - Consider a sibling `ca9-feed` repo so feed publish cadence is decoupled from code releases.

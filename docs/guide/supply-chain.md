@@ -143,8 +143,8 @@ ca9 feed status
 ```
 
 `ca9 feed update` with no `--from` uses `CA9_FEED_URL` when set, otherwise the built-in
-default feed URL. The default URL points at the project feed branch; until that branch has
-been published, use `--from` or `CA9_FEED_URL`.
+default feed URL on the project's published `feed` branch. Use `--from` or
+`CA9_FEED_URL` to select a local or alternate hosted bundle.
 
 Feed bundles use schema `ca9.feed.v1` and contain `npm-malware`, `pypi-malware`,
 `npm-releases`, and `pypi-releases`. Feed snapshots are stored under

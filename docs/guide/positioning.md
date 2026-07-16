@@ -5,7 +5,7 @@ description: How ca9 compares with SCA reports, hosted reachability platforms, S
 
 # Where ca9 Fits
 
-ca9 is an open, local reachability layer for Python vulnerability triage. It works with Snyk, Dependabot, Trivy, pip-audit, OSV.dev, SARIF, OpenVEX, CycloneDX, and SPDX workflows.
+ca9 is an open, local reachability layer for Python vulnerability triage. It works with Snyk, Dependabot, Trivy, Grype, OSV-Scanner, pip-audit, OSV.dev, SARIF, OpenVEX, CycloneDX, and SPDX workflows.
 
 Some commercial security platforms also provide reachability analysis. ca9 is different in where it runs and what it emits: it runs locally in your repo or CI job and produces open artifacts you can inspect, diff, upload, or archive.
 
