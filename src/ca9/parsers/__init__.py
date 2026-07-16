@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .dependabot import DependabotParser
+from .grype import GrypeParser
+from .osv_scanner import OsvScannerParser
 from .pip_audit import PipAuditParser
 from .snyk import SnykParser
 from .trivy import TrivyParser
@@ -12,7 +14,14 @@ from .trivy import TrivyParser
 if TYPE_CHECKING:
     from .base import SCAParser
 
-_PARSERS: list[type[SCAParser]] = [SnykParser, DependabotParser, TrivyParser, PipAuditParser]
+_PARSERS: list[type[SCAParser]] = [
+    SnykParser,
+    DependabotParser,
+    TrivyParser,
+    GrypeParser,
+    OsvScannerParser,
+    PipAuditParser,
+]
 
 
 def detect_parser(path: Path) -> SCAParser:

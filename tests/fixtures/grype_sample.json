@@ -1,0 +1,85 @@
+{
+  "matches": [
+    {
+      "vulnerability": {
+        "id": "CVE-2023-32681",
+        "dataSource": "https://github.com/advisories/GHSA-j8r2-6x86-q33q",
+        "namespace": "github:language:python",
+        "severity": "High",
+        "description": "Requests may leak a Proxy-Authorization header to a destination host during redirects.",
+        "urls": [
+          "https://nvd.nist.gov/vuln/detail/CVE-2023-32681",
+          "https://github.com/psf/requests/security/advisories/GHSA-j8r2-6x86-q33q"
+        ],
+        "aliases": ["GHSA-j8r2-6x86-q33q"],
+        "advisories": [
+          {
+            "id": "PYSEC-2023-74",
+            "link": "https://osv.dev/vulnerability/PYSEC-2023-74"
+          }
+        ],
+        "cwes": ["CWE-200"],
+        "publishedDate": "2023-05-26T18:15:00Z",
+        "lastModifiedDate": "2023-06-06T20:15:00Z"
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "GHSA-j8r2-6x86-q33q",
+          "urls": ["https://github.com/advisories/GHSA-j8r2-6x86-q33q"]
+        }
+      ],
+      "matchDetails": [
+        {
+          "type": "exact-direct-match",
+          "matcher": "python-matcher"
+        }
+      ],
+      "artifact": {
+        "name": "requests",
+        "version": "2.28.0",
+        "type": "python",
+        "language": "python",
+        "purl": "pkg:pypi/requests@2.28.0",
+        "cpes": ["cpe:2.3:a:python-requests:requests:2.28.0:*:*:*:*:*:*:*"]
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "GHSA-35jh-r3h4-6jhm",
+        "severity": "Medium",
+        "summary": "Example vulnerability with package identity supplied by purl",
+        "urls": ["https://github.com/advisories/GHSA-35jh-r3h4-6jhm"]
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "CVE-2024-0001"
+        }
+      ],
+      "artifact": {
+        "type": "UnknownPackage",
+        "purl": "pkg:pypi/example-lib@1.2.3?repository_url=https%3A%2F%2Fpypi.org"
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "CVE-2021-23337",
+        "severity": "LOW",
+        "description": "Example npm finding"
+      },
+      "artifact": {
+        "name": "lodash",
+        "version": "4.17.20",
+        "type": "npm",
+        "purl": "pkg:npm/lodash@4.17.20"
+      }
+    }
+  ],
+  "source": {
+    "type": "directory",
+    "target": "."
+  },
+  "descriptor": {
+    "name": "grype",
+    "version": "0.110.0"
+  }
+}

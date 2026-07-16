@@ -16,6 +16,7 @@ from ca9 import __version__
 from ca9.config import find_config, load_config
 from ca9.coverage_provider import resolve_coverage
 from ca9.engine import analyze
+from ca9.models import Report
 from ca9.parsers import detect_parser
 from ca9.policy import apply_policy
 from ca9.report import write_html, write_json, write_markdown, write_sarif, write_table
@@ -1289,7 +1290,28 @@ def check(
     vulnerabilities = parser.parse(data)
 
     if not vulnerabilities:
-        click.echo("No vulnerabilities found in the report.")
+        if output_format == "table":
+            message = "No vulnerabilities found in the report.\n"
+            if output_path:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(message)
+            else:
+                click.echo(message, nl=False)
+        else:
+            empty_report = Report(
+                results=[],
+                repo_path=str(repo_path),
+                coverage_path=str(coverage_path) if coverage_path else None,
+                proof_standard=proof_standard,
+            )
+            _output_report(
+                empty_report,
+                output_format,
+                output_path,
+                verbose=verbose,
+                show_confidence=show_confidence,
+                show_evidence_source=show_evidence_source,
+            )
         return
 
     report = analyze(

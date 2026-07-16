@@ -38,6 +38,102 @@ class TestCLI:
         assert "summary" in data
         assert data["summary"]["total"] == 4
 
+    def test_grype_json_runs_through_auto_detection_and_analysis(self, sample_repo):
+        report_path = Path(__file__).parent / "fixtures" / "grype_sample.json"
+        result = CliRunner().invoke(
+            main,
+            [
+                str(report_path),
+                "--repo",
+                str(sample_repo),
+                "-f",
+                "json",
+                "--no-auto-coverage",
+            ],
+        )
+
+        assert result.exit_code in (0, 1, 2)
+        data = json.loads(result.output)
+        assert data["summary"]["total"] == 3
+        lodash = next(item for item in data["results"] if item["package"] == "lodash")
+        assert lodash["verdict"] == "inconclusive"
+        assert "npm package reachability was not evaluated" in lodash["reason"]
+
+    def test_empty_grype_report_honors_json_output(self, tmp_path, sample_repo):
+        report_path = tmp_path / "clean-grype.json"
+        report_path.write_text(
+            json.dumps({"matches": [], "descriptor": {"name": "grype", "version": "0.110.0"}})
+        )
+
+        result = CliRunner().invoke(
+            main,
+            [
+                str(report_path),
+                "--repo",
+                str(sample_repo),
+                "-f",
+                "json",
+                "--no-auto-coverage",
+            ],
+        )
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["summary"] == {
+            "total": 0,
+            "reachable": 0,
+            "unreachable": 0,
+            "inconclusive": 0,
+            "ignored": 0,
+        }
+        assert data["results"] == []
+
+    def test_empty_grype_report_writes_requested_json_file(self, tmp_path, sample_repo):
+        report_path = tmp_path / "clean-grype.json"
+        output_path = tmp_path / "reports" / "clean.json"
+        report_path.write_text(
+            json.dumps({"matches": [], "descriptor": {"name": "grype", "version": "0.110.0"}})
+        )
+
+        result = CliRunner().invoke(
+            main,
+            [
+                str(report_path),
+                "--repo",
+                str(sample_repo),
+                "-f",
+                "json",
+                "-o",
+                str(output_path),
+                "--no-auto-coverage",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert result.output == ""
+        assert json.loads(output_path.read_text())["summary"]["total"] == 0
+
+    def test_osv_scanner_json_runs_through_auto_detection_and_analysis(self, sample_repo):
+        report_path = Path(__file__).parent / "fixtures" / "osv_scanner_sample.json"
+        result = CliRunner().invoke(
+            main,
+            [
+                str(report_path),
+                "--repo",
+                str(sample_repo),
+                "-f",
+                "json",
+                "--no-auto-coverage",
+            ],
+        )
+
+        assert result.exit_code in (0, 1, 2)
+        data = json.loads(result.output)
+        assert data["summary"]["total"] == 2
+        left_pad = next(item for item in data["results"] if item["package"] == "left-pad")
+        assert left_pad["verdict"] == "inconclusive"
+        assert "npm package reachability was not evaluated" in left_pad["reason"]
+
     def test_with_coverage(self, snyk_path, sample_repo, coverage_path):
         runner = CliRunner()
         result = runner.invoke(

@@ -117,6 +117,40 @@ class TestAnalyze:
         report = analyze(vulns, empty_repo)
         assert report.results[0].verdict == Verdict.INCONCLUSIVE
 
+    def test_non_python_ecosystem_is_not_given_python_reachability_verdict(self, sample_repo):
+        vuln = Vulnerability(
+            id="CVE-2026-1000",
+            package_name="express",
+            package_version="4.18.2",
+            severity="high",
+            title="Express vulnerability",
+            ecosystem="npm",
+        )
+
+        report = analyze([vuln], sample_repo)
+
+        result = report.results[0]
+        assert result.verdict == Verdict.INCONCLUSIVE
+        assert result.evidence is None
+        assert "supports Python/PyPI packages" in result.reason
+        assert "npm package reachability was not evaluated" in result.reason
+
+    def test_unknown_ecosystem_is_not_assumed_to_be_python(self, sample_repo):
+        vuln = Vulnerability(
+            id="CUSTOM-2026-1",
+            package_name="requests",
+            package_version="2.31.0",
+            severity="high",
+            title="Unknown-ecosystem finding",
+            ecosystem="",
+        )
+
+        result = analyze([vuln], sample_repo).results[0]
+
+        assert result.verdict == Verdict.INCONCLUSIVE
+        assert result.evidence is None
+        assert "unknown package reachability was not evaluated" in result.reason
+
     def test_verdict_result_fields(self, sample_repo, coverage_path):
         vulns = [_make_vuln("requests")]
         report = analyze(vulns, sample_repo, coverage_path)
