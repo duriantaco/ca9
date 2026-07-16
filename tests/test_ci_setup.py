@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 
+import pytest
 from click.testing import CliRunner
 
 from ca9.cli import main
@@ -95,6 +96,31 @@ def test_npm_shim_routes_to_ca9_run_without_recursion(tmp_path):
 
     assert completed.returncode == 0
     assert record.read_text().strip() == "1|run -- npm install left-pad@1.3.0"
+
+
+@pytest.mark.parametrize(
+    "subcommand",
+    ["ci", "clean-install", "ic", "install-clean", "isntall-clean"],
+)
+def test_npm_shim_routes_clean_install_commands_to_ca9(tmp_path, subcommand):
+    shim_dir = tmp_path / "shims"
+    bin_dir = tmp_path / "bin"
+    record = tmp_path / "record.txt"
+    install_ci_shims(shim_dir=shim_dir, env={})
+    _write_fake_command(
+        bin_dir,
+        "ca9",
+        f'#!/bin/sh\necho "$CA9_SHIM_BYPASS|$*" > {record}\nexit 0\n',
+    )
+
+    completed = subprocess.run(
+        [str(shim_dir / "npm"), subcommand],
+        env={"PATH": f"{shim_dir}:{bin_dir}"},
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert record.read_text().strip() == f"1|run -- npm {subcommand}"
 
 
 def test_npm_shim_bypass_execs_real_npm(tmp_path):

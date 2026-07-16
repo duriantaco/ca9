@@ -6,7 +6,7 @@ import re
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
@@ -23,6 +23,7 @@ from ca9.package_feed import (
     release_window_covers,
 )
 from ca9.package_policy import PackagePolicy, action_for_mode
+from ca9.readers.package_lock import read_package_lock
 
 RUN_SCHEMA = "ca9.run.v1"
 LEDGER_SCHEMA = "ca9.run.ledger.v1"
@@ -71,6 +72,9 @@ SUPPORTED_NPM_FLAGS_WITH_VALUE = {
     "--prefix",
     "--omit",
     "--include",
+    "--install-strategy",
+    "--workspace",
+    "-w",
 }
 SUPPORTED_NPM_BOOL_FLAGS = {
     "--save",
@@ -83,7 +87,26 @@ SUPPORTED_NPM_BOOL_FLAGS = {
     "--ignore-scripts",
     "--global",
     "-g",
+    "--legacy-bundling",
+    "--global-style",
+    "--strict-peer-deps",
+    "--foreground-scripts",
+    "--audit",
+    "--no-audit",
+    "--bin-links",
+    "--no-bin-links",
+    "--fund",
+    "--no-fund",
+    "--dry-run",
+    "--workspaces",
+    "--include-workspace-root",
+    "--install-links",
+    "--legacy-peer-deps",
 }
+NPM_INSTALL_SUBCOMMANDS = frozenset({"install", "i"})
+NPM_CLEAN_INSTALL_SUBCOMMANDS = frozenset(
+    {"ci", "clean-install", "ic", "install-clean", "isntall-clean"}
+)
 NPM_REGISTRY_ENV_NAMES = ("NPM_CONFIG_REGISTRY", "npm_config_registry")
 NPM_CONFIG_FILE_ENV_NAMES = (
     "NPM_CONFIG_USERCONFIG",
@@ -252,16 +275,27 @@ class LedgerEvent:
 
 
 class RuntimePreflightError(ValueError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        policy_id: str = "ca9.runtime.unsupported_command",
+    ) -> None:
+        super().__init__(message)
+        self.policy_id = policy_id
 
 
-def parse_install_command(command: tuple[str, ...] | list[str]) -> RuntimeCommand:
+def parse_install_command(
+    command: tuple[str, ...] | list[str],
+    *,
+    cwd: Path | None = None,
+) -> RuntimeCommand:
     args = tuple(command)
     if not args:
         raise RuntimePreflightError("ca9 run needs a package-manager command after --")
 
     if _is_npm_install(args):
-        requests, registry_sources = _parse_npm_install(args)
+        requests, registry_sources = _parse_npm_install(args, cwd=cwd or Path.cwd())
         return RuntimeCommand(
             family="npm",
             command=args,
@@ -280,7 +314,7 @@ def parse_install_command(command: tuple[str, ...] | list[str]) -> RuntimeComman
         )
 
     raise RuntimePreflightError(
-        "unsupported command family; phase 4 supports only npm install, npm i, "
+        "unsupported command family; ca9 run supports npm install, npm i, npm ci, "
         "python -m pip install, and pip install"
     )
 
@@ -292,10 +326,11 @@ def evaluate_runtime_preflight(
     env: dict[str, str] | None = None,
     feed_cache_dir: Path | None = None,
     now: datetime | None = None,
+    cwd: Path | None = None,
 ) -> RuntimePreflight:
     active_env = env if env is not None else dict(os.environ)
     try:
-        parsed = parse_install_command(command)
+        parsed = parse_install_command(command, cwd=cwd)
     except RuntimePreflightError as exc:
         parsed = RuntimeCommand(
             family="unsupported",
@@ -308,7 +343,7 @@ def evaluate_runtime_preflight(
             decisions=(
                 RuntimeDecision(
                     action="block",
-                    policy_id="ca9.runtime.unsupported_command",
+                    policy_id=exc.policy_id,
                     reason=str(exc),
                 ),
             ),
@@ -346,6 +381,11 @@ def child_environment(env: dict[str, str], preflight: RuntimePreflight) -> dict[
 
 
 def primary_registry_url(command: RuntimeCommand) -> str | None:
+    for source in command.registry_sources:
+        if source.kind in {"npm-registry", "pypi-index"} and not source.option.startswith(
+            "package-lock.json:"
+        ):
+            return source.url
     for source in command.registry_sources:
         if source.kind in {"npm-registry", "pypi-index"}:
             return source.url
@@ -530,7 +570,11 @@ def _redact_authorization_match(match: re.Match[str]) -> str:
 
 
 def _is_npm_install(args: tuple[str, ...]) -> bool:
-    return len(args) >= 3 and args[0] == "npm" and args[1] in {"install", "i"}
+    return (
+        len(args) >= 2
+        and args[0] == "npm"
+        and args[1] in NPM_INSTALL_SUBCOMMANDS | NPM_CLEAN_INSTALL_SUBCOMMANDS
+    )
 
 
 def _is_pip_install(args: tuple[str, ...]) -> bool:
@@ -539,7 +583,17 @@ def _is_pip_install(args: tuple[str, ...]) -> bool:
     return len(args) >= 5 and args[0] == "python" and args[1:4] == ("-m", "pip", "install")
 
 
-def _parse_npm_install(args: tuple[str, ...]) -> tuple[list[PackageRequest], list[RegistrySource]]:
+def _parse_npm_install(
+    args: tuple[str, ...],
+    *,
+    cwd: Path,
+) -> tuple[list[PackageRequest], list[RegistrySource]]:
+    subcommand = args[1]
+    clean_install = subcommand in NPM_CLEAN_INSTALL_SUBCOMMANDS
+    if clean_install and any(arg.split("=", 1)[0] == "--prefix" for arg in args[2:]):
+        raise RuntimePreflightError(
+            "npm ci --prefix is unsupported because it can select a different lockfile"
+        )
     specs, registry_sources = _collect_specs(
         args[2:],
         bool_flags=SUPPORTED_NPM_BOOL_FLAGS,
@@ -547,7 +601,13 @@ def _parse_npm_install(args: tuple[str, ...]) -> tuple[list[PackageRequest], lis
         registry_flags={"--registry"},
         manager="npm",
         ecosystem="npm",
+        require_specs=not clean_install,
     )
+    if clean_install and specs:
+        raise RuntimePreflightError("npm ci does not accept direct package specs")
+    if clean_install:
+        locked_requests, locked_sources = _npm_lock_requests(cwd)
+        return locked_requests, [*registry_sources, *locked_sources]
     return [_parse_npm_spec(spec) for spec in specs], registry_sources
 
 
@@ -574,6 +634,7 @@ def _collect_specs(
     manager: str,
     ecosystem: str,
     unsupported_source_flags: set[str] | None = None,
+    require_specs: bool = True,
 ) -> tuple[list[str], list[RegistrySource]]:
     specs: list[str] = []
     registry_sources: list[RegistrySource] = []
@@ -620,11 +681,259 @@ def _collect_specs(
             continue
         specs.append(arg)
         index += 1
-    if not specs:
+    if require_specs and not specs:
         raise RuntimePreflightError(
             f"{manager} install command did not include a direct package spec"
         )
     return specs, registry_sources
+
+
+def _npm_lock_requests(cwd: Path) -> tuple[list[PackageRequest], list[RegistrySource]]:
+    repo_path = cwd.resolve()
+    lock_path = repo_path / "package-lock.json"
+    if not lock_path.is_file():
+        raise RuntimePreflightError(
+            f"npm lock-backed install requires package-lock.json at {lock_path}",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+
+    expected_keys = _validated_external_npm_lock_keys(lock_path, repo_path)
+    inventory = read_package_lock(repo_path)
+    if inventory.warnings:
+        raise RuntimePreflightError(
+            "cannot safely preflight package-lock.json: " + "; ".join(inventory.warnings),
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+
+    requests: list[PackageRequest] = []
+    registry_sources: list[RegistrySource] = []
+    seen_requests: set[str] = set()
+    seen_registries: set[str] = set()
+    for package in inventory.packages:
+        if package.ecosystem.lower() != "npm" or package.dependency_kind == "project":
+            continue
+        if not package.version:
+            raise RuntimePreflightError(
+                f"package-lock.json entry for {package.name} does not have an exact version",
+                policy_id="ca9.runtime.lockfile_unavailable",
+            )
+        request = PackageRequest(
+            ecosystem="npm",
+            name=package.normalized_name,
+            raw_spec=f"{package.name}@{package.version}",
+            version_spec=package.version,
+            exact_version=package.version,
+        )
+        if request.key not in expected_keys:
+            continue
+        if request.key not in seen_requests:
+            seen_requests.add(request.key)
+            requests.append(request)
+        if package.source_registry and package.source_registry not in seen_registries:
+            seen_registries.add(package.source_registry)
+            registry_sources.append(
+                RegistrySource(
+                    ecosystem="npm",
+                    kind="npm-registry",
+                    url=package.source_registry,
+                    option=f"package-lock.json:{package.name}@{package.version}",
+                )
+            )
+    missing_keys = expected_keys - seen_requests
+    if missing_keys:
+        raise RuntimePreflightError(
+            "package-lock.json entries were not represented in the package inventory: "
+            + ", ".join(sorted(missing_keys)),
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    return requests, registry_sources
+
+
+def _validated_external_npm_lock_keys(lock_path: Path, repo_path: Path) -> set[str]:
+    data = _load_npm_lock_data(lock_path)
+    lockfile_version = data.get("lockfileVersion")
+    if type(lockfile_version) is not int or lockfile_version not in {2, 3}:
+        rendered = repr(lockfile_version) if lockfile_version is not None else "missing"
+        raise RuntimePreflightError(
+            f"unsupported package-lock.json lockfileVersion: {rendered}; expected 2 or 3",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    if "packages" not in data:
+        raise RuntimePreflightError(
+            "package-lock.json is missing the packages table",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    raw_packages = data["packages"]
+    if not isinstance(raw_packages, dict):
+        raise RuntimePreflightError(
+            "package-lock.json packages table is not an object",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+
+    expected_keys: set[str] = set()
+    for path, entry in raw_packages.items():
+        if not isinstance(entry, dict):
+            raise RuntimePreflightError(
+                f"package-lock.json entry {path!r} is not an object",
+                policy_id="ca9.runtime.lockfile_unavailable",
+            )
+        if path == "":
+            _validate_root_lock_dependencies(entry, raw_packages)
+            continue
+        if not _safe_relative_lock_path(path):
+            raise RuntimePreflightError(
+                f"package-lock.json entry has an unsafe path: {path!r}",
+                policy_id="ca9.runtime.lockfile_unavailable",
+            )
+        if entry.get("link") is True:
+            _validate_workspace_link(path, entry, raw_packages, repo_path)
+            continue
+        if not _is_node_modules_lock_path(path):
+            # npm records workspace source packages alongside their node_modules links.
+            # These are local project code, not registry packages.
+            continue
+
+        name = _npm_lock_entry_name(path, entry)
+        version = entry.get("version")
+        if (
+            not _valid_npm_lock_name(name)
+            or not isinstance(version, str)
+            or not _is_exact_npm_version(version.strip())
+        ):
+            raise RuntimePreflightError(
+                f"package-lock.json dependency entry {path!r} is missing a name or exact version",
+                policy_id="ca9.runtime.lockfile_unavailable",
+            )
+        _validate_external_lock_source(path, entry.get("resolved"))
+        expected_keys.add(
+            PackageRequest(
+                ecosystem="npm",
+                name=name.lower(),
+                raw_spec="",
+                version_spec=version,
+                exact_version=version,
+            ).key
+        )
+    return expected_keys
+
+
+def _load_npm_lock_data(lock_path: Path) -> dict[str, Any]:
+    try:
+        with lock_path.open() as handle:
+            data = json.load(handle)
+    except OSError as exc:
+        raise RuntimePreflightError(
+            f"cannot read package-lock.json: {exc}",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        ) from exc
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise RuntimePreflightError(
+            f"cannot parse package-lock.json: {exc}",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimePreflightError(
+            "package-lock.json did not parse to an object",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    return data
+
+
+def _validate_root_lock_dependencies(
+    root: dict[str, Any],
+    raw_packages: dict[str, Any],
+) -> None:
+    for field in ("dependencies", "devDependencies", "optionalDependencies"):
+        dependencies = root.get(field, {})
+        if not isinstance(dependencies, dict):
+            raise RuntimePreflightError(
+                f"package-lock.json root {field} is not an object",
+                policy_id="ca9.runtime.lockfile_unavailable",
+            )
+        for name in dependencies:
+            if not isinstance(name, str) or not name.strip():
+                raise RuntimePreflightError(
+                    f"package-lock.json root {field} contains an invalid package name",
+                    policy_id="ca9.runtime.lockfile_unavailable",
+                )
+            if f"node_modules/{name}" not in raw_packages:
+                raise RuntimePreflightError(
+                    f"package-lock.json root dependency {name!r} has no locked package entry",
+                    policy_id="ca9.runtime.lockfile_unavailable",
+                )
+
+
+def _validate_workspace_link(
+    path: str,
+    entry: dict[str, Any],
+    raw_packages: dict[str, Any],
+    repo_path: Path,
+) -> None:
+    resolved = entry.get("resolved")
+    if not isinstance(resolved, str) or not resolved.strip():
+        raise RuntimePreflightError(
+            f"package-lock.json workspace link {path!r} has no local target",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    target_key = resolved.removeprefix("file:").rstrip("/")
+    if not _safe_relative_lock_path(target_key):
+        raise RuntimePreflightError(
+            f"package-lock.json workspace link {path!r} has an unsafe target",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    target_path = (repo_path / target_key).resolve()
+    if not target_path.is_relative_to(repo_path) or target_key not in raw_packages:
+        raise RuntimePreflightError(
+            f"package-lock.json workspace link {path!r} has no in-repository target entry",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+
+
+def _validate_external_lock_source(path: str, resolved: object) -> None:
+    if resolved is None:
+        return
+    if not isinstance(resolved, str) or not resolved.strip():
+        raise RuntimePreflightError(
+            f"package-lock.json dependency entry {path!r} has an invalid resolved source",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    parsed = urlparse(resolved)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise RuntimePreflightError(
+            f"package-lock.json dependency entry {path!r} uses an unsupported source",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+
+
+def _safe_relative_lock_path(path: str) -> bool:
+    if not path or "\\" in path or "\x00" in path:
+        return False
+    parsed = PurePosixPath(path)
+    return not parsed.is_absolute() and ".." not in parsed.parts
+
+
+def _is_node_modules_lock_path(path: str) -> bool:
+    return path.startswith("node_modules/") or "/node_modules/" in path
+
+
+def _npm_lock_entry_name(path: str, entry: dict[str, Any]) -> str | None:
+    raw_name = entry.get("name")
+    if isinstance(raw_name, str) and raw_name.strip():
+        return raw_name.strip()
+    segment = path.rsplit("node_modules/", 1)[-1]
+    parts = segment.split("/")
+    if parts[0].startswith("@") and len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return parts[0] or None
+
+
+def _valid_npm_lock_name(name: str | None) -> bool:
+    if not name or name != name.strip():
+        return False
+    if name.startswith("@"):
+        parts = name.split("/")
+        return len(parts) == 2 and all(part for part in parts) and parts[0] != "@"
+    return "/" not in name
 
 
 def _registry_source_kind(manager: str, flag_name: str) -> str:

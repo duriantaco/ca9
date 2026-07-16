@@ -190,10 +190,12 @@ def _shim_script(name: str, shim_dir: Path, ca9_command: str) -> str:
         )
     elif name == "npm":
         route_condition = (
-            'if [ "${1:-}" = "install" ] || [ "${1:-}" = "i" ]; then\n'
+            'case "${1:-}" in\n'
+            "  install|i|ci|clean-install|ic|install-clean|isntall-clean)\n"
             "  export CA9_SHIM_BYPASS=1\n"
             f'  exec "$CA9_COMMAND" run -- {name} "$@"\n'
-            "fi\n"
+            "  ;;\n"
+            "esac\n"
             'real_cmd="$(find_real)" || exit 127\n'
             'exec "$real_cmd" "$@"\n'
         )

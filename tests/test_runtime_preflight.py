@@ -35,6 +35,324 @@ def test_parse_npm_install_direct_specs():
     assert [request.exact_version for request in command.package_requests] == ["1.3.0", "2.0.0"]
 
 
+def test_parse_npm_ci_loads_direct_and_transitive_lock_packages(tmp_path):
+    _write_package_lock(tmp_path)
+
+    command = parse_install_command(("npm", "ci"), cwd=tmp_path)
+
+    assert command.family == "npm"
+    assert [request.key for request in command.package_requests] == [
+        "npm:left-pad@1.3.0",
+        "npm:nested-lib@2.0.0",
+    ]
+    assert command.registry_sources[0].url == "https://registry.npmjs.org"
+
+
+def test_parse_npm_clean_install_aliases_use_the_same_lock_preflight(tmp_path):
+    _write_package_lock(tmp_path)
+
+    for subcommand in ("clean-install", "ic", "install-clean", "isntall-clean"):
+        command = parse_install_command(("npm", subcommand), cwd=tmp_path)
+
+        assert [request.key for request in command.package_requests] == [
+            "npm:left-pad@1.3.0",
+            "npm:nested-lib@2.0.0",
+        ]
+
+
+def test_npm_ci_prefers_configured_registry_over_lockfile_source(tmp_path):
+    _write_package_lock(tmp_path)
+
+    preflight = evaluate_runtime_preflight(
+        ("npm", "ci"),
+        PackagePolicy(
+            malware=MalwarePolicy(enabled=False),
+            registries=RegistriesPolicy(
+                allow=("registry.npmjs.org", "packages.example"),
+            ),
+        ),
+        env={"NPM_CONFIG_REGISTRY": "https://packages.example"},
+        cwd=tmp_path,
+    )
+
+    assert primary_registry_url(preflight.command) == "https://packages.example"
+
+
+def test_runtime_preflight_blocks_npm_ci_without_lockfile(tmp_path):
+    preflight = evaluate_runtime_preflight(
+        ("npm", "ci"),
+        PackagePolicy(),
+        env={},
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.lockfile_unavailable"
+    assert "requires package-lock.json" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_unreadable_npm_lockfile(tmp_path):
+    (tmp_path / "package-lock.json").write_text("{not-json")
+
+    preflight = evaluate_runtime_preflight(
+        ("npm", "ci"),
+        PackagePolicy(),
+        env={},
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.lockfile_unavailable"
+    assert "cannot parse package-lock.json" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_non_utf8_npm_lockfile(tmp_path):
+    (tmp_path / "package-lock.json").write_bytes(b"\xff\xfe\x00")
+
+    preflight = evaluate_runtime_preflight(
+        ("npm", "ci"),
+        PackagePolicy(),
+        env={},
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.lockfile_unavailable"
+    assert "cannot parse package-lock.json" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_missing_or_future_lockfile_version(tmp_path):
+    for lockfile_version in (None, 4):
+        lock = {"packages": {}}
+        if lockfile_version is not None:
+            lock["lockfileVersion"] = lockfile_version
+        (tmp_path / "package-lock.json").write_text(json.dumps(lock))
+
+        preflight = evaluate_runtime_preflight(
+            ("npm", "ci"),
+            PackagePolicy(),
+            env={},
+            cwd=tmp_path,
+        )
+
+        assert preflight.action == "block"
+        assert preflight.decisions[0].policy_id == "ca9.runtime.lockfile_unavailable"
+        assert "lockfileVersion" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_missing_or_non_object_packages_table(tmp_path):
+    for lock in (
+        {"lockfileVersion": 3},
+        {"lockfileVersion": 3, "packages": []},
+    ):
+        (tmp_path / "package-lock.json").write_text(json.dumps(lock))
+
+        preflight = evaluate_runtime_preflight(
+            ("npm", "ci"),
+            PackagePolicy(),
+            env={},
+            cwd=tmp_path,
+        )
+
+        assert preflight.action == "block"
+        assert preflight.decisions[0].policy_id == "ca9.runtime.lockfile_unavailable"
+        assert "packages" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_external_lock_entry_without_version(tmp_path):
+    lock = {
+        "lockfileVersion": 3,
+        "packages": {
+            "": {"dependencies": {"left-pad": "1.3.0"}},
+            "node_modules/left-pad": {
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+            },
+        },
+    }
+    (tmp_path / "package-lock.json").write_text(json.dumps(lock))
+
+    preflight = evaluate_runtime_preflight(
+        ("npm", "ci"),
+        PackagePolicy(),
+        env={},
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.lockfile_unavailable"
+    assert "missing a name or exact version" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_root_dependency_missing_from_lock_table(tmp_path):
+    lock = {
+        "lockfileVersion": 3,
+        "packages": {"": {"dependencies": {"left-pad": "1.3.0"}}},
+    }
+    (tmp_path / "package-lock.json").write_text(json.dumps(lock))
+
+    preflight = evaluate_runtime_preflight(
+        ("npm", "ci"),
+        PackagePolicy(),
+        env={},
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "block"
+    assert "has no locked package entry" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_malformed_or_unsafe_lock_entries(tmp_path):
+    invalid_entries = (
+        {"node_modules/left-pad": "not-an-object"},
+        {
+            "../node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+            }
+        },
+    )
+
+    for entries in invalid_entries:
+        lock = {"lockfileVersion": 3, "packages": {"": {}, **entries}}
+        (tmp_path / "package-lock.json").write_text(json.dumps(lock))
+
+        preflight = evaluate_runtime_preflight(
+            ("npm", "ci"),
+            PackagePolicy(),
+            env={},
+            cwd=tmp_path,
+        )
+
+        assert preflight.action == "block"
+        assert preflight.decisions[0].policy_id == "ca9.runtime.lockfile_unavailable"
+
+
+def test_runtime_preflight_blocks_unsupported_or_malformed_locked_sources(tmp_path):
+    for resolved in ("file:../left-pad", "git+https://example.test/left-pad.git", "https:///x"):
+        lock = {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"dependencies": {"left-pad": "1.3.0"}},
+                "node_modules/left-pad": {"version": "1.3.0", "resolved": resolved},
+            },
+        }
+        (tmp_path / "package-lock.json").write_text(json.dumps(lock))
+
+        preflight = evaluate_runtime_preflight(
+            ("npm", "ci"),
+            PackagePolicy(),
+            env={},
+            cwd=tmp_path,
+        )
+
+        assert preflight.action == "block"
+        assert preflight.decisions[0].policy_id == "ca9.runtime.lockfile_unavailable"
+        assert "unsupported source" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_workspace_link_outside_repository(tmp_path):
+    lock = {
+        "lockfileVersion": 3,
+        "packages": {
+            "": {"dependencies": {"workspace-tool": "workspace:*"}},
+            "node_modules/workspace-tool": {"resolved": "../workspace-tool", "link": True},
+        },
+    }
+    (tmp_path / "package-lock.json").write_text(json.dumps(lock))
+
+    preflight = evaluate_runtime_preflight(
+        ("npm", "ci"),
+        PackagePolicy(),
+        env={},
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.lockfile_unavailable"
+    assert "unsafe target" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_zero_argument_npm_install_even_with_lock(tmp_path):
+    _write_package_lock(tmp_path)
+
+    for subcommand in ("install", "i"):
+        preflight = evaluate_runtime_preflight(
+            ("npm", subcommand),
+            PackagePolicy(),
+            env={},
+            cwd=tmp_path,
+        )
+
+        assert preflight.action == "block"
+        assert preflight.decisions[0].policy_id == "ca9.runtime.unsupported_command"
+        assert "did not include a direct package spec" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_npm_ci_prefix_lockfile_switch(tmp_path):
+    _write_package_lock(tmp_path)
+
+    for prefix_args in (("--prefix", "other-project"), ("--prefix=other-project",)):
+        preflight = evaluate_runtime_preflight(
+            ("npm", "ci", *prefix_args),
+            PackagePolicy(),
+            env={},
+            cwd=tmp_path,
+        )
+
+        assert preflight.action == "block"
+        assert preflight.decisions[0].policy_id == "ca9.runtime.unsupported_command"
+        assert "select a different lockfile" in preflight.decisions[0].reason
+
+
+def test_parse_npm_ci_preserves_workspace_links_without_treating_them_as_registry_packages(
+    tmp_path,
+):
+    lock = {
+        "name": "workspace-app",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "workspace-app",
+                "version": "1.0.0",
+                "dependencies": {"workspace-tool": "workspace:*"},
+            },
+            "node_modules/workspace-tool": {
+                "resolved": "packages/workspace-tool",
+                "link": True,
+            },
+            "packages/workspace-tool": {
+                "name": "workspace-tool",
+                "version": "2.0.0",
+                "dependencies": {"left-pad": "1.3.0"},
+            },
+            "node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+            },
+        },
+    }
+    (tmp_path / "package-lock.json").write_text(json.dumps(lock))
+
+    command = parse_install_command(("npm", "ci"), cwd=tmp_path)
+
+    assert [request.key for request in command.package_requests] == ["npm:left-pad@1.3.0"]
+
+
+def test_parse_npm_ci_allows_valid_empty_lock(tmp_path):
+    lock = {
+        "name": "empty-app",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {"": {"name": "empty-app", "version": "1.0.0"}},
+    }
+    (tmp_path / "package-lock.json").write_text(json.dumps(lock))
+
+    command = parse_install_command(("npm", "ci"), cwd=tmp_path)
+
+    assert command.package_requests == ()
+
+
 def test_parse_pip_install_direct_specs():
     command = parse_install_command(("python", "-m", "pip", "install", "Requests==2.31.0"))
 
@@ -171,6 +489,29 @@ def test_runtime_preflight_blocks_known_malware_from_feed(tmp_path):
     assert preflight.action == "block"
     assert any(decision.policy_id == "ca9.malware" for decision in preflight.decisions)
     assert any(decision.package == "left-pad" for decision in preflight.decisions)
+
+
+def test_runtime_preflight_checks_npm_ci_lock_packages_against_malware_feed(tmp_path):
+    cache_root = tmp_path / "cache"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_package_lock(repo)
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+
+    preflight = evaluate_runtime_preflight(
+        ("npm", "ci"),
+        PackagePolicy(),
+        env={},
+        feed_cache_dir=cache_root / "feed",
+        cwd=repo,
+    )
+
+    assert preflight.action == "block"
+    malware = next(
+        decision for decision in preflight.decisions if decision.policy_id == "ca9.malware"
+    )
+    assert malware.package == "left-pad"
+    assert malware.version == "1.3.0"
 
 
 def test_runtime_preflight_blocks_new_package_version_from_feed(tmp_path):
@@ -391,6 +732,34 @@ def test_ca9_run_blocks_malware_and_does_not_execute_child(tmp_path):
     data = json.loads(result.output)
     assert data["action"] == "block"
     assert any(decision["policy_id"] == "ca9.malware" for decision in data["decisions"])
+    assert not marker.exists()
+
+
+def test_ca9_run_npm_ci_blocks_locked_malware_before_child_executes(tmp_path, monkeypatch):
+    cache_root = tmp_path / "cache"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_package_lock(repo)
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+    bin_dir = tmp_path / "bin"
+    marker = tmp_path / "ran.txt"
+    _write_fake_command(bin_dir, "npm", f"#!/bin/sh\necho ran > {marker}\nexit 0\n")
+    monkeypatch.chdir(repo)
+
+    result = CliRunner().invoke(
+        main,
+        ["run", "-f", "json", "--", "npm", "ci"],
+        env={"CA9_CACHE_DIR": str(cache_root), "PATH": str(bin_dir)},
+    )
+
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert any(
+        decision["policy_id"] == "ca9.malware"
+        and decision["package"] == "left-pad"
+        and decision["version"] == "1.3.0"
+        for decision in data["decisions"]
+    )
     assert not marker.exists()
 
 
@@ -626,6 +995,35 @@ def _write_feed_bundle(
     }
     path = tmp_path / "feed.json"
     path.write_text(json.dumps(bundle))
+    return path
+
+
+def _write_package_lock(repo):
+    lock = {
+        "name": "demo-app",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "demo-app",
+                "version": "1.0.0",
+                "dependencies": {"left-pad": "1.3.0"},
+            },
+            "node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                "integrity": "sha512-test",
+                "dependencies": {"nested-lib": "2.0.0"},
+            },
+            "node_modules/nested-lib": {
+                "version": "2.0.0",
+                "resolved": "https://registry.npmjs.org/nested-lib/-/nested-lib-2.0.0.tgz",
+                "integrity": "sha512-test",
+            },
+        },
+    }
+    path = repo / "package-lock.json"
+    path.write_text(json.dumps(lock))
     return path
 
 
