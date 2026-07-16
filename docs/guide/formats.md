@@ -1,13 +1,14 @@
 ---
 title: Supported Formats
-description: Input and output formats supported by ca9 for Python CVE reachability analysis, including Snyk, Dependabot, Trivy, pip-audit, OSV, SARIF, OpenVEX, CycloneDX, and SPDX.
+description: Input and output formats supported by ca9 for Python CVE reachability analysis, including Snyk, Dependabot, Trivy, Grype, OSV-Scanner, pip-audit, SARIF, OpenVEX, CycloneDX, and SPDX.
 ---
 
 # Supported Formats
 
 ca9 supports two kinds of input:
 
-- Existing SCA reports from tools such as Snyk, Dependabot, Trivy, and pip-audit.
+- Existing SCA reports from tools such as Snyk, Dependabot, Trivy, Grype,
+  OSV-Scanner, and pip-audit.
 - Repository or environment dependency inventory scanned directly against OSV.dev with `ca9 scan`.
 - Package inventory from manifests, `fyn.lock`, and npm `package-lock.json` with `ca9 inventory` and `ca9 vet`.
 
@@ -50,6 +51,34 @@ ca9 check trivy.json --repo .
 ```
 
 ca9 reads package vulnerability findings from Trivy result entries and preserves dependency metadata when the report contains it.
+
+### Grype
+
+Generate native Grype JSON, then use ca9 as a conservative Python reachability layer:
+
+```bash
+grype dir:. --output json > grype.json
+ca9 check grype.json --repo .
+```
+
+ca9 reads Grype's `matches` entries, preserving the matched package identity,
+ecosystem, severity, aliases, references, and advisory source. Python/PyPI matches
+enter ca9 reachability analysis. Matches from other ecosystems are retained but
+reported as `INCONCLUSIVE`; ca9 does not apply Python import evidence to them.
+
+### OSV-Scanner
+
+Analyze OSV-Scanner's native JSON output without querying OSV again:
+
+```bash
+osv-scanner scan --format json . > osv-scanner.json
+ca9 check osv-scanner.json --repo .
+```
+
+ca9 reads the official `results[].packages[]` layout and preserves key OSV
+advisory metadata, including aliases, affected ranges, references, timestamps,
+and severity. This path is useful when OSV-Scanner already owns dependency
+discovery or when its report must be retained as the source artifact.
 
 ### pip-audit
 

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from packaging.utils import canonicalize_name
 
+from ca9.advisory import normalize_ecosystem
 from ca9.analysis.api_usage import find_api_usage
 from ca9.analysis.ast_scanner import (
     collect_imports_from_repo,
@@ -534,6 +535,21 @@ def analyze(
     results: list[VerdictResult] = []
 
     for vuln in vulnerabilities:
+        normalized_ecosystem = normalize_ecosystem(vuln.ecosystem)
+        if normalized_ecosystem != "pypi":
+            rendered_ecosystem = normalized_ecosystem or "unknown"
+            results.append(
+                VerdictResult(
+                    vulnerability=vuln,
+                    verdict=Verdict.INCONCLUSIVE,
+                    reason=(
+                        "ca9 reachability analysis currently supports Python/PyPI packages; "
+                        f"{rendered_ecosystem} package reachability was not evaluated"
+                    ),
+                )
+            )
+            continue
+
         import_name = pypi_to_import_name(vuln.package_name)
         component = extract_affected_component(vuln)
 

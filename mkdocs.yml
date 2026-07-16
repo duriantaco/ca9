@@ -78,6 +78,8 @@ nav:
       - Snyk: integrations/snyk.md
       - Dependabot: integrations/dependabot.md
       - Trivy: integrations/trivy.md
+      - Grype: integrations/grype.md
+      - OSV-Scanner: integrations/osv-scanner.md
       - pip-audit: integrations/pip-audit.md
       - SARIF: integrations/sarif.md
       - OpenVEX: integrations/openvex.md

@@ -92,6 +92,23 @@ jobs:
 Keep `--scan-artifacts` off if the CI environment should not download package artifacts.
 Without it, `ca9 vet` still performs lockfile and metadata checks from local inventory.
 
+## Block a risky `npm ci`
+
+Install ca9's opt-in CI shims before the project's normal install step. The npm shim
+routes `npm ci` through lockfile-backed preflight, checks direct and transitive locked
+versions, and starts npm only if policy allows the install.
+
+```yaml
+- run: pip install ca9[cli]
+- run: ca9 feed update
+- run: ca9 setup ci install
+- run: ca9 doctor ci
+- run: npm ci
+```
+
+A missing, unreadable, or unsupported `package-lock.json` fails closed. Non-install npm
+commands pass through the shim unchanged.
+
 ## New findings only
 
 Save a baseline on `main`, then gate pull requests only on new reachable or inconclusive findings:

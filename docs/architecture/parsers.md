@@ -14,11 +14,15 @@ classDiagram
     class SnykParser
     class DependabotParser
     class TrivyParser
+    class GrypeParser
+    class OsvScannerParser
     class PipAuditParser
 
     SCAParser <|.. SnykParser
     SCAParser <|.. DependabotParser
     SCAParser <|.. TrivyParser
+    SCAParser <|.. GrypeParser
+    SCAParser <|.. OsvScannerParser
     SCAParser <|.. PipAuditParser
 ```
 
@@ -45,7 +49,14 @@ vulnerabilities = parser.parse(json.loads(report_path.read_text()))
 Current registry:
 
 ```python
-_PARSERS = [SnykParser, DependabotParser, TrivyParser, PipAuditParser]
+_PARSERS = [
+    SnykParser,
+    DependabotParser,
+    TrivyParser,
+    GrypeParser,
+    OsvScannerParser,
+    PipAuditParser,
+]
 ```
 
 ## Built-in parsers
@@ -61,6 +72,16 @@ Detects GitHub Dependabot alert exports by checking for alert objects with `secu
 ### Trivy
 
 Detects Trivy JSON reports and extracts vulnerability entries from result sections.
+
+### Grype
+
+Detects native Grype JSON reports by their match structure and tool descriptor. Extracts
+the vulnerability, artifact, ecosystem, advisory, and reference metadata from each match.
+
+### OSV-Scanner
+
+Detects OSV-Scanner JSON reports by the official `results[].packages[]` structure and
+maps the nested full OSV records into ca9's shared advisory model.
 
 ### pip-audit
 

@@ -37,6 +37,8 @@ Supported input reports are auto-detected:
 - Snyk JSON
 - Dependabot alerts JSON
 - Trivy JSON
+- Grype JSON
+- OSV-Scanner JSON
 - pip-audit JSON
 
 Common options:
@@ -216,8 +218,8 @@ Options:
 | `-f, --format table\|json` | Output format. Defaults to `table`. |
 
 `ca9 feed update` resolves the source in this order: `--from`, `CA9_FEED_URL`, then the
-built-in default feed URL. The default feed URL points at the project feed branch; until
-that branch has been published, use `--from` or `CA9_FEED_URL`.
+built-in default feed URL on the project's published `feed` branch. Use `--from` or
+`CA9_FEED_URL` to select a local or alternate hosted bundle.
 
 Feed bundles use schema `ca9.feed.v1` with `npm-malware`, `pypi-malware`,
 `npm-releases`, and `pypi-releases`. ca9 stores snapshots under `~/.cache/ca9/feed/` and
@@ -241,6 +243,7 @@ ca9 run [OPTIONS] -- COMMAND
 
 Supported command families:
 
+- `npm ci` and its clean-install aliases
 - `npm install <direct package spec>`
 - `npm i <direct package spec>`
 - `pip install <direct package spec>`
@@ -261,9 +264,17 @@ command. When a feed is available, npm and PyPI loopback gateways can hide denie
 versions or links from the package manager and record those gateway decisions in the
 runtime audit log.
 
+For `npm ci` and its aliases, every exact non-project package in
+`package-lock.json` is checked, including transitives. Missing, unreadable, or
+unsupported lockfiles block before npm starts. Lockfile versions 2 and 3 are
+supported; `npm-shrinkwrap.json` is not yet supported. Zero-argument `npm install` /
+`npm i` is intentionally unsupported because npm may update an out-of-sync lockfile;
+use `npm ci` when ca9 must prove the installed set matches the checked lock.
+
 Examples:
 
 ```bash
+ca9 run --dry-run -- npm ci
 ca9 run --dry-run -- npm install express@4.18.2
 ca9 run -- npm i @scope/pkg@1.2.3
 ca9 run -- python -m pip install requests==2.31.0

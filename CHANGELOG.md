@@ -37,8 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Lockfile-backed runtime preflight for `npm ci` and its clean-install aliases, including direct and transitive package policy checks before npm starts.
+- Native Grype and OSV-Scanner JSON report parsers with auto-detection, advisory metadata, mixed-ecosystem handling, fixtures, and integration documentation.
 - `ca9 vet --malware-query` now treats explicit malicious-package advisories and malware-labeled GHSA/OSV records as blocking malware findings, including npm packages.
 - `ca9 vet --scan-workflows` scans GitHub Actions workflow files for risky `pull_request_target`, OIDC token, broad write-permission, mutable action-ref, cache trust-boundary, and source-clone patterns.
+
+### Changed
+
+- Unknown and non-Python scanner findings remain explicitly inconclusive instead of receiving Python reachability reasoning, and OSV multi-interval affected ranges are preserved.
 
 ## [0.3.0] - 2026-05-13
 

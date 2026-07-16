@@ -33,7 +33,7 @@ ca9 scan --coverage coverage.json
 
 ## Option B: Analyze an existing SCA report
 
-If you already have a Snyk, Dependabot, Trivy, or pip-audit report:
+If you already have a Snyk, Dependabot, Trivy, Grype, OSV-Scanner, or pip-audit report:
 
 === "Snyk"
 
@@ -60,6 +60,20 @@ If you already have a Snyk, Dependabot, Trivy, or pip-audit report:
     ```bash
     trivy fs --format json --output trivy.json .
     ca9 check trivy.json
+    ```
+
+=== "Grype"
+
+    ```bash
+    grype dir:. --output json > grype.json
+    ca9 check grype.json --repo .
+    ```
+
+=== "OSV-Scanner"
+
+    ```bash
+    osv-scanner scan --format json . > osv-scanner.json
+    ca9 check osv-scanner.json --repo .
     ```
 
 === "pip-audit"

@@ -284,23 +284,29 @@ def _extract_version_ranges(
             if r.get("type") != "ECOSYSTEM":
                 continue
             introduced = ""
-            fixed = ""
-            last_affected = ""
             for event in r.get("events", []):
                 if "introduced" in event:
                     introduced = event["introduced"]
                 elif "fixed" in event:
-                    fixed = event["fixed"]
+                    if introduced:
+                        ranges.append(
+                            VersionRange(
+                                introduced=introduced,
+                                fixed=event["fixed"],
+                            )
+                        )
+                        introduced = ""
                 elif "last_affected" in event:
-                    last_affected = event["last_affected"]
+                    if introduced:
+                        ranges.append(
+                            VersionRange(
+                                introduced=introduced,
+                                last_affected=event["last_affected"],
+                            )
+                        )
+                        introduced = ""
             if introduced:
-                ranges.append(
-                    VersionRange(
-                        introduced=introduced,
-                        fixed=fixed,
-                        last_affected=last_affected,
-                    )
-                )
+                ranges.append(VersionRange(introduced=introduced))
     return tuple(ranges)
 
 

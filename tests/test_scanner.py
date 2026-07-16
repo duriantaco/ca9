@@ -7,10 +7,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ca9.models import VersionRange
 from ca9.scanner import (
     ScanInventory,
     _cvss_to_level,
     _extract_severity,
+    _extract_version_ranges,
     _parse_cvss_score,
     get_installed_packages,
     query_osv_batch,
@@ -237,6 +239,35 @@ class TestExtractSeverity:
     def test_unknown_fallback(self):
         assert _extract_severity({}) == "unknown"
         assert _extract_severity({"severity": []}) == "unknown"
+
+
+class TestExtractVersionRanges:
+    def test_preserves_multiple_intervals_in_one_osv_range(self):
+        vulnerability = {
+            "affected": [
+                {
+                    "package": {"ecosystem": "PyPI", "name": "requests"},
+                    "ranges": [
+                        {
+                            "type": "ECOSYSTEM",
+                            "events": [
+                                {"introduced": "0"},
+                                {"fixed": "1.0"},
+                                {"introduced": "1.5"},
+                                {"fixed": "1.9"},
+                                {"introduced": "2.1"},
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+
+        assert _extract_version_ranges(vulnerability, "requests", "pypi") == (
+            VersionRange(introduced="0", fixed="1.0"),
+            VersionRange(introduced="1.5", fixed="1.9"),
+            VersionRange(introduced="2.1"),
+        )
 
 
 class TestParseCvssScore:
