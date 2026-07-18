@@ -5,9 +5,13 @@ import hashlib
 import os
 import re
 import shutil
+import stat
+import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +42,8 @@ class ArtifactScanConfig:
     max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES
     max_extracted_bytes: int = DEFAULT_MAX_EXTRACTED_BYTES
     max_extracted_files: int = DEFAULT_MAX_EXTRACTED_FILES
+    url_validator: Callable[[str], bool] | None = None
+    allowed_local_roots: tuple[Path, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -102,7 +108,7 @@ def _collect_one(
     archive_path = _cache_path(package, artifact, config)
     try:
         _fetch_to_cache(artifact, archive_path, config)
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         state.skipped_artifacts += 1
         state.findings.append(
             _artifact_finding(
@@ -146,7 +152,14 @@ def _collect_one(
                 max_total_bytes=config.max_extracted_bytes,
             ),
         )
-    except ValueError as exc:
+    except (
+        OSError,
+        ValueError,
+        tarfile.TarError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as exc:
+        shutil.rmtree(unpack_dir, ignore_errors=True)
         state.skipped_artifacts += 1
         state.findings.append(
             _artifact_finding(
@@ -166,34 +179,119 @@ def _collect_one(
 
 
 def _fetch_to_cache(artifact: Artifact, archive_path: Path, config: ArtifactScanConfig) -> None:
+    artifact_url = artifact.url or ""
+    if config.url_validator is not None and not config.url_validator(artifact_url):
+        raise ValueError(f"artifact URL blocked by policy: {artifact_url}")
+    source_path = _local_artifact_path(artifact_url)
+    validated_source = (
+        _validate_local_artifact_source(source_path, config.allowed_local_roots)
+        if source_path is not None
+        else None
+    )
     if archive_path.is_file():
         if archive_path.stat().st_size <= config.max_artifact_bytes:
             return
         archive_path.unlink(missing_ok=True)
 
     archive_path.parent.mkdir(parents=True, exist_ok=True)
-    source_path = _local_artifact_path(artifact.url or "")
-    if source_path is not None:
-        _copy_local_artifact(source_path, archive_path, config.max_artifact_bytes)
+    if validated_source is not None:
+        _copy_local_artifact(
+            validated_source,
+            archive_path,
+            config.max_artifact_bytes,
+            config.allowed_local_roots,
+        )
         return
 
-    _download_artifact(artifact.url or "", archive_path, config.max_artifact_bytes)
+    _download_artifact(
+        artifact.url or "",
+        archive_path,
+        config.max_artifact_bytes,
+        config.url_validator,
+    )
 
 
-def _copy_local_artifact(source_path: Path, archive_path: Path, max_bytes: int) -> None:
+def _copy_local_artifact(
+    source_path: Path,
+    archive_path: Path,
+    max_bytes: int,
+    allowed_roots: tuple[Path, ...] | None,
+) -> None:
     try:
-        size = source_path.stat().st_size
+        resolved_source = _validate_local_artifact_source(source_path, allowed_roots)
+        open_flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(resolved_source, open_flags)
+        with os.fdopen(descriptor, "rb") as source:
+            source_stat = os.fstat(source.fileno())
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise ValueError(f"local artifact is not a regular file: {source_path}")
+            if source_stat.st_size > max_bytes:
+                raise ValueError(
+                    f"artifact is too large: {source_stat.st_size} bytes exceeds {max_bytes}"
+                )
+            total = 0
+            with archive_path.open("wb") as destination:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f"artifact is too large: exceeds {max_bytes} bytes")
+                    destination.write(chunk)
+    except ValueError:
+        archive_path.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        archive_path.unlink(missing_ok=True)
+        raise ValueError(f"cannot copy local artifact {source_path}: {exc}") from exc
+
+
+def _validate_local_artifact_source(
+    source_path: Path,
+    allowed_roots: tuple[Path, ...] | None,
+) -> Path:
+    try:
+        resolved_source = source_path.resolve(strict=True)
+        source_stat = resolved_source.stat()
     except OSError as exc:
         raise ValueError(f"cannot read local artifact {source_path}: {exc}") from exc
-    if size > max_bytes:
-        raise ValueError(f"artifact is too large: {size} bytes exceeds {max_bytes}")
-    shutil.copyfile(source_path, archive_path)
+    if allowed_roots is not None and not any(
+        resolved_source.is_relative_to(root.resolve()) for root in allowed_roots
+    ):
+        raise ValueError(f"local artifact is outside the allowed roots: {source_path}")
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise ValueError(f"local artifact is not a regular file: {source_path}")
+    return resolved_source
 
 
-def _download_artifact(url: str, archive_path: Path, max_bytes: int) -> None:
+class _ValidatedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, validator: Callable[[str], bool]) -> None:
+        super().__init__()
+        self._validator = validator
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        if not self._validator(newurl):
+            raise urllib.error.URLError(f"artifact redirect blocked by URL policy: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _download_artifact(
+    url: str,
+    archive_path: Path,
+    max_bytes: int,
+    url_validator: Callable[[str], bool] | None = None,
+) -> None:
+    if url_validator is not None and not url_validator(url):
+        raise ValueError(f"artifact URL blocked by policy: {url}")
     request = urllib.request.Request(url, headers={"User-Agent": "ca9-artifact-scanner"})
+    opener = (
+        urllib.request.build_opener(_ValidatedRedirectHandler(url_validator))
+        if url_validator is not None
+        else urllib.request.build_opener()
+    )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with opener.open(request, timeout=30) as response:
             content_length = response.headers.get("Content-Length")
             if content_length and int(content_length) > max_bytes:
                 raise ValueError(
@@ -209,6 +307,9 @@ def _download_artifact(url: str, archive_path: Path, max_bytes: int) -> None:
                     if total > max_bytes:
                         raise ValueError(f"artifact is too large: exceeds {max_bytes} bytes")
                     out.write(chunk)
+    except ValueError:
+        archive_path.unlink(missing_ok=True)
+        raise
     except (urllib.error.URLError, OSError) as exc:
         archive_path.unlink(missing_ok=True)
         raise ValueError(f"cannot download artifact {url}: {exc}") from exc
@@ -296,15 +397,14 @@ def _artifact_suffix(artifact: Artifact) -> str:
 
 
 def _local_artifact_path(url: str) -> Path | None:
+    if url.startswith(("//", "\\")):
+        return None
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme == "file":
         return Path(urllib.parse.unquote(parsed.path))
     if parsed.scheme:
         return None
-    path = Path(url)
-    if path.exists():
-        return path
-    return None
+    return Path(url)
 
 
 def _artifact_finding(

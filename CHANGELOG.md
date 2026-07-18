@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ca9 scripts audit` (for npm v12, `latest`/GA July 8, 2026) strictly audits every script-bearing npm v2/v3 lockfile occurrence, including non-registry `prepare` hooks, while excluding workspaces and keeping external file sources in review. Malformed or unmaterializable entries hard-error; registry and command identity comes from trusted lock-source evidence. v1 is deny/review-oriented: even hash-verified native-build shapes remain review until executable/GYP provenance is established. Its command emitter requires an exact installed-tree match and trusted identity/version, uses `--allow-scripts-pin` for approvals, and otherwise emits POSIX/PowerShell-compatible comments instead of commands.
+
 - Lockfile-backed runtime preflight for `npm ci` and its clean-install aliases, including direct and transitive package policy checks before npm starts.
 - Native Grype and OSV-Scanner JSON report parsers with auto-detection, advisory metadata, mixed-ecosystem handling, fixtures, and integration documentation.
 - `ca9 vet --malware-query` now treats explicit malicious-package advisories and malware-labeled GHSA/OSV records as blocking malware findings, including npm packages.

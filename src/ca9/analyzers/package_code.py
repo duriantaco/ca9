@@ -62,11 +62,14 @@ _DANGEROUS_TOP_LEVEL_CALLS = {
     "socket.socket",
 }
 
-_NPM_INSTALL_HOOKS = ("preinstall", "install", "postinstall")
-_NPM_SCRIPT_EXEC_RE = re.compile(
-    r"curl\s|wget\s|node\s+-e|node\s+--eval|\beval\b|\bbase64\b|"
-    r"bash\s+-c|sh\s+-c|/dev/tcp|\bchmod\b|powershell|\biex\b|"
-    r"\|\s*sh\b|\|\s*bash\b|python[0-9]?\s+-c|\$\(|`|>\s*/dev/|\bnc\s|\bncat\s",
+NPM_INSTALL_HOOKS = ("preinstall", "install", "postinstall")
+NPM_PREPARE_HOOK = "prepare"
+NPM_SCRIPT_EXEC_RE = re.compile(
+    r"\b(?:curl|wget)(?:\.exe)?(?=\s|$)|\bnode\s+(?:-e|--eval)\b|"
+    r"\beval\b|\bbase64\b|"
+    r"\b(?:bash|sh)\s+-c\b|/dev/tcp|\bchmod\b|\bpowershell\b|\biex\b|"
+    r"\|\s*(?:sh|bash)\b|\bpython(?:[0-9]+(?:\.[0-9]+)?)?\s+-c\b|"
+    r"\$\(|`|>\s*/dev/|\b(?:nc|ncat)(?=\s|$)",
     re.I,
 )
 _JS_ENCODED_EXEC_RE = re.compile(
@@ -378,12 +381,12 @@ def _analyze_npm_manifest(
     if not isinstance(scripts, dict):
         return []
     findings: list[Finding] = []
-    for hook in _NPM_INSTALL_HOOKS:
+    for hook in NPM_INSTALL_HOOKS:
         command = scripts.get(hook)
         if not isinstance(command, str) or not command.strip():
             continue
         offset = max(text.find(f'"{hook}"'), 0)
-        if _NPM_SCRIPT_EXEC_RE.search(command):
+        if NPM_SCRIPT_EXEC_RE.search(command):
             findings.append(_finding(snapshot, file, text, _NPM_INSTALL_EXEC_RULE, offset))
         else:
             findings.append(_finding(snapshot, file, text, _NPM_INSTALL_HOOK_RULE, offset))

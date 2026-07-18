@@ -312,6 +312,68 @@ ca9 feed status --policy ca9.toml
 the built-in default feed URL on the project's published `feed` branch. Use
 `--from` or `CA9_FEED_URL` to select a local or alternate hosted bundle.
 
+### Audit install scripts for npm v12 allowlists
+
+npm v12 became the `latest`/GA release on July 8, 2026. It skips dependency
+lifecycle scripts unless the package is approved in your project's `allowScripts`
+allowlist (pnpm ≥10 has a similar model). Instead of `npm approve-scripts --all`,
+audit the script-bearing packages with evidence first:
+
+```bash
+ca9 scripts audit .
+ca9 scripts audit . --emit commands
+```
+
+The audit requires a readable npm v2/v3 `package-lock.json`. Missing, malformed,
+unsupported, or unmaterializable script-bearing lock entries are hard errors, not
+empty results. Each lockfile occurrence is audited independently, including two
+occurrences with the same name and version at different install paths. Local
+workspace packages are excluded; external or out-of-root file sources remain visible
+as `review` findings.
+
+ca9 checks `preinstall`, `install`, and `postinstall`, plus `prepare` for
+non-registry dependencies. A version-matched `node_modules` manifest can supply hook
+text, but the package's registry policy identity comes from trusted lockfile source
+evidence, not package-controlled manifest fields. Offline or incomplete evidence
+remains `review`.
+
+Malware findings and explicitly denied registries produce `deny`; custom
+registries requiring approval are not fetched and remain `review`. If a malware
+feed configured as fail-closed is unavailable, the audit suppresses approvals and
+exits `1`. Whole-command native-build shapes such as `node-gyp rebuild` remain
+`review` even after clean analysis of a hash-verified artifact: the package artifact
+alone cannot prove which executable will run or fully establish GYP/build provenance.
+`--allow-unhashed-downloads` permits investigation of an unhashed artifact, but does
+not make that artifact verified approval evidence. v1 is intentionally
+deny/review-oriented and does not promise a reachable automatic approval path.
+
+`--emit commands` accounts for npm applying a package-name command to every installed
+occurrence of that name. A deny in any occurrence wins; otherwise, any reviewed
+occurrence suppresses approval. Before emitting a command, ca9 requires trusted npm
+policy identity and version evidence and an exact match between every audited locked
+occurrence and the installed `node_modules` tree. Approval commands use the explicit
+pinning form `npm approve-scripts <name> --allow-scripts-pin`. Missing or mismatched
+evidence produces a comment instead of a command. The generated `#` comments work in
+POSIX shells and PowerShell. ca9 never edits the allowlist or executes a generated
+command. Exit codes are `1` for a denial or global blocker, `2` when review findings
+remain, and `0` when neither is present.
+
+Scripts-audit options:
+
+```
+-r, --repo DIRECTORY            Project directory (alternative to DIRECTORY)
+-f, --format [table|json]       Report format  [default: table]
+--emit [report|commands]        Audit report or guarded npm command lines
+-o, --output PATH               Write output to a file instead of stdout
+--policy PATH                   ca9 package, registry, and malware policy TOML
+--offline                       Skip downloads; unverified packages remain review
+--allow-unhashed-downloads      Allow tarball fetch without lockfile integrity
+--max-artifact-mb N             Positive max artifact download size  [default: 100]
+```
+
+The positional `DIRECTORY` and `--repo` accept directories only. `--emit commands`
+uses comment-and-command text output and cannot be combined with `--format json`.
+
 ### Run installs through ca9
 
 Use `ca9 run` when you want ca9 to preflight an install before package code can
@@ -507,6 +569,7 @@ ca9 check SCA_REPORT [OPTIONS]  Analyze a supported SCA JSON report
 ca9 inventory [PATH] [OPTIONS]  Show normalized package inventory
 ca9 vet [PATH] [OPTIONS]        Run package supply-chain risk checks
 ca9 run [OPTIONS] -- COMMAND    Preflight and run supported package-manager installs
+ca9 scripts audit [DIRECTORY]   Audit dependency install scripts for npm allowlists
 ca9 policy validate [OPTIONS]   Validate ca9 package policy
 ca9 policy explain [OPTIONS]    Show effective ca9 package policy
 ca9 feed status [OPTIONS]       Show local package feed cache status
