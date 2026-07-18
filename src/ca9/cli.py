@@ -1065,6 +1065,144 @@ def vet_cmd(
     sys.exit(report.exit_code)
 
 
+@main.group(name="scripts")
+def scripts_group() -> None:
+    """Audit dependency install scripts."""
+
+
+@scripts_group.command(name="audit")
+@click.argument(
+    "path",
+    required=False,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    metavar="[DIRECTORY]",
+)
+@click.option(
+    "-r",
+    "--repo",
+    "repo_path",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+    help="Path to the project repository.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format.",
+)
+@click.option(
+    "--emit",
+    "emit",
+    type=click.Choice(["report", "commands"]),
+    default="report",
+    help="Emit the audit report or npm approve-scripts/deny-scripts command lines.",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write output to file instead of stdout.",
+)
+@click.option(
+    "--policy",
+    "policy_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to ca9 package, registry, and malware policy TOML.",
+)
+@click.option(
+    "--allow-unhashed-downloads",
+    is_flag=True,
+    default=False,
+    help="Allow artifact downloads when the lockfile has no artifact hash.",
+)
+@click.option(
+    "--max-artifact-mb",
+    type=click.IntRange(min=1),
+    default=100,
+    show_default=True,
+    help="Maximum artifact download size for script resolution.",
+)
+@click.option(
+    "--offline",
+    is_flag=True,
+    default=False,
+    help="Do not download artifacts; unverified packages remain review findings.",
+)
+@click.pass_context
+def scripts_audit_cmd(
+    ctx: click.Context,
+    path: Path | None,
+    repo_path: Path,
+    output_format: str,
+    emit: str,
+    output_path: Path | None,
+    policy_path: Path | None,
+    allow_unhashed_downloads: bool,
+    max_artifact_mb: int,
+    offline: bool,
+) -> None:
+    """Audit dependency install scripts and classify npm allowlist candidates."""
+    from ca9.artifacts.fetch import ArtifactScanConfig
+    from ca9.package_policy import load_effective_package_policy, validate_package_policy
+    from ca9.scripts_audit import (
+        ScriptsAuditError,
+        build_scripts_audit_report,
+        scripts_audit_report_to_commands,
+        scripts_audit_report_to_json,
+        scripts_audit_report_to_table,
+    )
+
+    if path is None:
+        repo_path = _resolve_option(ctx, "repo_path", repo_path)
+    else:
+        repo_path = path
+
+    if emit == "commands" and output_format != "table":
+        raise click.UsageError("--emit commands cannot be combined with --format json")
+
+    try:
+        if policy_path is not None:
+            package_policy = validate_package_policy(policy_path)
+        else:
+            package_policy = load_effective_package_policy(cwd=repo_path)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from None
+
+    try:
+        report = build_scripts_audit_report(
+            repo_path,
+            package_policy=package_policy,
+            artifact_config=ArtifactScanConfig(
+                allow_unhashed_downloads=allow_unhashed_downloads,
+                max_artifact_bytes=max_artifact_mb * 1024 * 1024,
+            ),
+            fetch_artifacts=not offline,
+        )
+    except ScriptsAuditError as exc:
+        raise click.ClickException(str(exc)) from None
+
+    if emit == "commands":
+        text = scripts_audit_report_to_commands(report)
+    elif output_format == "json":
+        text = scripts_audit_report_to_json(report)
+    else:
+        text = scripts_audit_report_to_table(report)
+
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text)
+    else:
+        click.echo(text)
+
+    sys.exit(report.exit_code)
+
+
 @main.command(name="ingest-sarif")
 @click.argument("sarif_input", type=click.Path(exists=True, path_type=Path))
 @click.option(
