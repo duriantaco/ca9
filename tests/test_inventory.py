@@ -140,6 +140,10 @@ def test_package_lock_inventory_includes_npm_packages_edges_and_artifacts(tmp_pa
     assert packages["@scope/cli"].artifacts[0].hash == "sha512-cli"
     assert packages["@scope/cli"].source_registry == "https://registry.npmjs.org"
     assert packages["@scope/cli"].metadata["has_install_script"] is True
+    assert packages["@scope/cli"].metadata["lock_path"] == "node_modules/@scope/cli"
+    assert packages["@scope/cli"].metadata["requested_specifiers"] == ["^1.2.3"]
+    assert packages["@scope/cli"].metadata["requested_source_kind"] == "registry"
+    assert packages["lodash"].metadata["requested_specifiers"] == ["^4.17.21"]
 
     eslint_edge = next(edge for edge in inventory.dependency_edges if edge.child_name == "eslint")
     assert eslint_edge.dependency_kind == "direct"
@@ -160,6 +164,204 @@ def test_build_inventory_prefers_package_lock_when_no_fyn_lock(tmp_path):
     assert inventory.source_inputs[0].source == "package-lock.json"
     assert inventory.summary()["dependency_kinds"]["direct"] == 3
     assert any(package.key == "npm:@scope/cli@1.2.3" for package in inventory.packages)
+
+
+def test_package_lock_marks_local_workspace_targets(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lock = {
+        "name": "workspace-root",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "workspace-root",
+                "version": "1.0.0",
+                "workspaces": ["packages/*"],
+                "dependencies": {"workspace-tool": "file:packages/workspace-tool"},
+            },
+            "packages/workspace-tool": {
+                "name": "workspace-tool",
+                "version": "1.2.3",
+                "hasInstallScript": True,
+            },
+            "vendor/not-a-workspace": {
+                "name": "not-a-workspace",
+                "version": "2.0.0",
+                "hasInstallScript": True,
+            },
+            "node_modules/workspace-tool": {
+                "resolved": "packages/workspace-tool",
+                "link": True,
+            },
+        },
+    }
+    (repo / "package-lock.json").write_text(json.dumps(lock))
+
+    inventory = read_package_lock(repo)
+
+    workspace = next(package for package in inventory.packages if package.name == "workspace-tool")
+    assert workspace.metadata["lock_path"] == "packages/workspace-tool"
+    assert workspace.metadata["local_workspace"] is True
+    assert workspace.metadata["requested_source_kind"] == "workspace"
+    vendor = next(package for package in inventory.packages if package.name == "not-a-workspace")
+    assert "local_workspace" not in vendor.metadata
+    assert vendor.metadata["requested_source_kind"] == "unknown"
+
+
+def test_package_lock_preserves_requested_sources_and_installed_identity(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lock = {
+        "name": "source-root",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "source-root",
+                "version": "1.0.0",
+                "dependencies": {
+                    "registry-lib": "^1.0.0",
+                    "tilde-lib": "~1.2.0",
+                    "remote-lib": "https://cdn.example.test/remote-lib.tgz",
+                    "git-lib": "git+https://git.example.test/owner/git-lib.git#abc123",
+                    "local-lib": "file:../local-lib.tgz",
+                    "local-archive": "local-archive.tgz",
+                    "windows-dir": "C:\\packages\\windows-dir",
+                    "deep-local-dir": "vendor/packages/deep-local-dir",
+                    "dot-local-dir": ".",
+                    "scoped-local-dir": "@scope/pkg",
+                },
+            },
+            "node_modules/registry-lib": {
+                "version": "1.0.1",
+                "resolved": "https://registry.npmjs.org/registry-lib/-/registry-lib-1.0.1.tgz",
+            },
+            "node_modules/tilde-lib": {
+                "version": "1.2.1",
+                "resolved": "https://registry.npmjs.org/tilde-lib/-/tilde-lib-1.2.1.tgz",
+            },
+            "node_modules/remote-lib": {
+                "name": "self-reported-name",
+                "version": "2.0.0",
+                "resolved": "https://cdn.example.test/remote-lib.tgz",
+            },
+            "node_modules/git-lib": {
+                "version": "3.0.0",
+                "resolved": "git+https://git.example.test/owner/git-lib.git#abc123",
+            },
+            "node_modules/local-lib": {
+                "version": "4.0.0",
+                "resolved": "file:../local-lib.tgz",
+            },
+            "node_modules/local-archive": {"version": "4.1.0"},
+            "node_modules/windows-dir": {"version": "4.2.0"},
+            "node_modules/deep-local-dir": {"version": "4.3.0"},
+            "node_modules/dot-local-dir": {"version": "4.4.0"},
+            "node_modules/scoped-local-dir": {"version": "4.5.0"},
+            "node_modules/orphan-lib": {
+                "version": "5.0.0",
+                "resolved": "https://registry.npmjs.org/orphan-lib/-/orphan-lib-5.0.0.tgz",
+            },
+        },
+    }
+    (repo / "package-lock.json").write_text(json.dumps(lock))
+
+    inventory = read_package_lock(repo)
+    packages = {package.name: package for package in inventory.packages}
+
+    assert packages["registry-lib"].metadata["requested_source_kind"] == "registry"
+    assert packages["tilde-lib"].metadata["requested_source_kind"] == "registry"
+    remote = packages["self-reported-name"]
+    assert remote.metadata["requested_source_kind"] == "remote"
+    assert remote.metadata["installed_names"] == ["remote-lib"]
+    assert remote.metadata["self_name"] == "self-reported-name"
+    assert remote.metadata["source_kind"] == "remote"
+    assert packages["git-lib"].metadata["requested_source_kind"] == "git"
+    assert packages["git-lib"].source_registry is None
+    assert packages["local-lib"].metadata["requested_source_kind"] == "file"
+    assert packages["local-archive"].metadata["requested_source_kind"] == "file"
+    assert packages["windows-dir"].metadata["requested_source_kind"] == "file"
+    assert packages["deep-local-dir"].metadata["requested_source_kind"] == "file"
+    assert packages["dot-local-dir"].metadata["requested_source_kind"] == "file"
+    assert packages["scoped-local-dir"].metadata["requested_source_kind"] == "file"
+    assert packages["local-lib"].artifacts[0].url == (tmp_path / "local-lib.tgz").as_uri()
+    assert packages["orphan-lib"].metadata["requested_source_kind"] == "unknown"
+    assert packages["orphan-lib"].metadata["source_kind"] == "unknown"
+
+
+def test_package_lock_follows_external_file_link_identity_and_version(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lock = {
+        "name": "external-root",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "external-root",
+                "version": "1.0.0",
+                "dependencies": {"installed-alias": "file:../external-package"},
+            },
+            "../external-package": {
+                "name": "self-reported-name",
+                "version": "6.0.0",
+                "hasInstallScript": True,
+            },
+            "node_modules/installed-alias": {
+                "resolved": "../external-package",
+                "link": True,
+            },
+        },
+    }
+    (repo / "package-lock.json").write_text(json.dumps(lock))
+
+    inventory = read_package_lock(repo)
+    package = next(
+        package for package in inventory.packages if package.name == "self-reported-name"
+    )
+
+    assert package.version == "6.0.0"
+    assert package.dependency_kind == "direct"
+    assert package.metadata["self_name"] == "self-reported-name"
+    assert package.metadata["installed_names"] == ["installed-alias"]
+    assert package.metadata["requested_specifiers"] == ["file:../external-package"]
+    assert package.metadata["requested_source_kind"] == "file"
+    assert "local_workspace" not in package.metadata
+    edge = next(
+        edge for edge in inventory.dependency_edges if edge.child_name == "self-reported-name"
+    )
+    assert edge.child_version == "6.0.0"
+    assert edge.child_key == "npm:self-reported-name@6.0.0"
+
+
+def test_package_lock_keeps_scripted_non_link_entry_without_version(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lock = {
+        "name": "missing-version-root",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "missing-version-root",
+                "version": "1.0.0",
+                "dependencies": {"unversioned-lib": "https://example.test/unversioned.tgz"},
+            },
+            "node_modules/unversioned-lib": {
+                "resolved": "https://example.test/unversioned.tgz",
+                "hasInstallScript": True,
+            },
+        },
+    }
+    (repo / "package-lock.json").write_text(json.dumps(lock))
+
+    inventory = read_package_lock(repo)
+    package = next(package for package in inventory.packages if package.name == "unversioned-lib")
+
+    assert package.version is None
+    assert package.metadata["has_install_script"] is True
+    assert package.metadata["requested_source_kind"] == "remote"
 
 
 def test_build_inventory_merges_package_lock_and_declared_python_dependencies(tmp_path):
