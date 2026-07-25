@@ -126,7 +126,7 @@ def supply_chain_report_to_table(report: SupplyChainReport) -> str:
             lines.append(f"    {finding.title}")
             if decision and decision.reason:
                 lines.append(f"    Why: {decision.reason}")
-            hint = _remediation_hint(finding)
+            hint = remediation_hint(finding)
             if hint:
                 lines.append(f"    Next: {hint}")
     else:
@@ -136,7 +136,7 @@ def supply_chain_report_to_table(report: SupplyChainReport) -> str:
     return "\n".join(lines)
 
 
-def _remediation_hint(finding: Finding) -> str:
+def remediation_hint(finding: Finding) -> str:
     hints = {
         "malware": "remove the package version, rotate exposed credentials if it ran, and upgrade to a clean release",
         "untrusted_registry": "pin the dependency to a trusted index or add an explicit private-index policy",

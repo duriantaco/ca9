@@ -14,6 +14,7 @@ from ca9.package_policy import (
     ModePolicy,
     PackageAgePolicy,
     PackagePolicy,
+    PolicyException,
     RegistriesPolicy,
 )
 from ca9.runtime.preflight import (
@@ -361,6 +362,101 @@ def test_parse_pip_install_direct_specs():
     assert command.package_requests[0].exact_version == "2.31.0"
 
 
+def test_parse_pip_requirement_files_applies_nested_constraints_and_hashes(tmp_path):
+    extras = tmp_path / "requirements"
+    extras.mkdir()
+    (tmp_path / "requirements.txt").write_text(
+        "--index-url https://pypi.org/simple\n"
+        "Requests>=2\n"
+        "-r requirements/extras.txt\n"
+        "-c constraints.txt\n"
+        "urllib3==2.2.2 \\\n"
+        "  --hash=sha256:" + ("a" * 64) + "\n"
+    )
+    (extras / "extras.txt").write_text("httpx\n")
+    (tmp_path / "constraints.txt").write_text(
+        "requests==2.31.0\nhttpx==0.27.2\nconstraint-only==1.0.0\n"
+    )
+
+    command = parse_install_command(
+        ("python", "-m", "pip", "install", "-r", "requirements.txt"),
+        cwd=tmp_path,
+    )
+
+    requests = {request.name: request for request in command.package_requests}
+    assert set(requests) == {"requests", "httpx", "urllib3"}
+    assert requests["requests"].exact_version == "2.31.0"
+    assert requests["requests"].source_path == "requirements.txt"
+    assert requests["httpx"].exact_version == "0.27.2"
+    assert requests["httpx"].source_path == "requirements/extras.txt"
+    assert requests["urllib3"].hashes == (f"sha256:{'a' * 64}",)
+    assert command.registry_sources[0].url == "https://pypi.org/simple"
+    assert command.registry_sources[0].option.startswith("requirements.txt:1:")
+
+
+def test_parse_pip_requirement_file_rejects_include_cycle(tmp_path):
+    (tmp_path / "requirements.txt").write_text("-r nested.txt\n")
+    (tmp_path / "nested.txt").write_text("-r requirements.txt\n")
+
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "-r", "requirements.txt"),
+        PackagePolicy(),
+        env={},
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.requirements_unavailable"
+    assert "cycle" in preflight.decisions[0].reason
+
+
+def test_parse_pip_requirement_file_rejects_repository_escape(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "requirements.txt").write_text("-r ../outside.txt\n")
+    (tmp_path / "outside.txt").write_text("requests==2.31.0\n")
+
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "-r", "requirements.txt"),
+        PackagePolicy(),
+        env={},
+        cwd=repo,
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.requirements_unavailable"
+    assert "escapes the repository" in preflight.decisions[0].reason
+
+
+def test_parse_pip_requirement_file_rejects_unsupported_source_option(tmp_path):
+    (tmp_path / "requirements.txt").write_text(
+        "--extra-index-url https://packages.example/simple\nrequests==2.31.0\n"
+    )
+
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "-r", "requirements.txt"),
+        PackagePolicy(),
+        env={},
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.requirements_unavailable"
+    assert "--extra-index-url" in preflight.decisions[0].reason
+
+
+def test_parse_pip_rejects_argument_terminator_that_could_bypass_gateway():
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "requests==2.31.0", "--"),
+        PackagePolicy(),
+        env={},
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.unsupported_command"
+    assert "argument terminator" in preflight.decisions[0].reason
+
+
 def test_parse_install_records_primary_registry_and_gateway_command_strips_it():
     command = parse_install_command(
         (
@@ -374,6 +470,13 @@ def test_parse_install_records_primary_registry_and_gateway_command_strips_it():
 
     assert primary_registry_url(command) == "https://pypi.org/simple"
     assert gateway_child_command(command) == ("pip", "install", "requests==2.31.0")
+    assert gateway_child_command(command, registry_url="http://127.0.0.1:1234/simple") == (
+        "pip",
+        "install",
+        "requests==2.31.0",
+        "--index-url",
+        "http://127.0.0.1:1234/simple",
+    )
 
 
 def test_runtime_preflight_blocks_untrusted_pip_index_url():
@@ -575,6 +678,46 @@ def test_runtime_preflight_warns_when_release_time_unknown_by_default(tmp_path):
     assert any(decision.policy_id == "ca9.package_age_unknown" for decision in preflight.decisions)
 
 
+def test_runtime_preflight_applies_package_age_exception_with_evidence(tmp_path):
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(
+        _write_feed_bundle(
+            tmp_path,
+            pypi_releases={"packages": {"requests": {"2.31.0": "2026-06-26T11:00:00+00:00"}}},
+        ),
+        cache_dir=cache_root / "feed",
+    )
+    policy = PackagePolicy(
+        package_age=PackageAgePolicy(enabled=True, minimum_hours=48),
+        exceptions=(
+            PolicyException(
+                policy_id="ca9.package_age",
+                ecosystem="pypi",
+                package="Requests",
+                version="2.31.*",
+                action="warn",
+                owner="platform-security",
+                reason="Emergency compatibility release",
+                expires="2026-06-27",
+            ),
+        ),
+    )
+
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "requests==2.31.0"),
+        policy,
+        env={},
+        feed_cache_dir=cache_root / "feed",
+        now=datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc),
+    )
+
+    decision = next(item for item in preflight.decisions if item.policy_id == "ca9.package_age")
+    assert preflight.action == "warn"
+    assert decision.action == "warn"
+    assert decision.evidence["policy_exception"]["owner"] == "platform-security"
+    assert decision.evidence["policy_exception"]["original_action"] == "block"
+
+
 def test_runtime_preflight_blocks_unknown_release_time_when_offline_blocks(tmp_path):
     cache_root = tmp_path / "cache"
     update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
@@ -658,15 +801,95 @@ def test_runtime_preflight_allows_npm_ignore_scripts_with_secrets():
     assert not preflight.decisions
 
 
-def test_runtime_preflight_blocks_unsupported_requirement_file_install():
+def test_runtime_preflight_blocks_missing_requirement_file_install(tmp_path):
     preflight = evaluate_runtime_preflight(
         ("pip", "install", "-r", "requirements.txt"),
         PackagePolicy(),
         env={},
+        cwd=tmp_path,
     )
 
     assert preflight.action == "block"
-    assert preflight.decisions[0].policy_id == "ca9.runtime.unsupported_command"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.requirements_unavailable"
+    assert "does not exist" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_malware_pinned_in_requirement_file(tmp_path):
+    cache_root = tmp_path / "cache"
+    (tmp_path / "requirements.txt").write_text("Bad_Lib==1.0.0\n")
+    update_feed_from_source(
+        _write_feed_bundle(
+            tmp_path,
+            pypi_malware=[
+                {
+                    "name": "bad-lib",
+                    "version": "1.0.0",
+                    "id": "MAL-PYPI-1",
+                    "summary": "known malicious PyPI test package",
+                }
+            ],
+        ),
+        cache_dir=cache_root / "feed",
+    )
+
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "-r", "requirements.txt"),
+        PackagePolicy(),
+        env={},
+        feed_cache_dir=cache_root / "feed",
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "block"
+    assert any(
+        decision.policy_id == "ca9.malware"
+        and decision.package == "bad-lib"
+        and decision.version == "1.0.0"
+        for decision in preflight.decisions
+    )
+
+
+def test_runtime_preflight_never_applies_malware_exception(tmp_path):
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(
+        _write_feed_bundle(
+            tmp_path,
+            pypi_malware=[
+                {
+                    "name": "bad-lib",
+                    "version": "1.0.0",
+                    "id": "MAL-PYPI-1",
+                    "summary": "known malicious PyPI test package",
+                }
+            ],
+        ),
+        cache_dir=cache_root / "feed",
+    )
+    policy = PackagePolicy(
+        exceptions=(
+            PolicyException(
+                policy_id="ca9.malware",
+                package="bad-lib",
+                action="pass",
+                owner="nobody",
+                reason="Must not apply",
+                expires="2099-01-01",
+            ),
+        )
+    )
+
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "bad-lib==1.0.0"),
+        policy,
+        env={},
+        feed_cache_dir=cache_root / "feed",
+        cwd=tmp_path,
+    )
+
+    decision = next(item for item in preflight.decisions if item.policy_id == "ca9.malware")
+    assert preflight.action == "block"
+    assert decision.action == "block"
+    assert not decision.evidence.get("policy_exception")
 
 
 def test_runtime_preflight_can_strip_secrets_in_warn_mode():
@@ -967,6 +1190,7 @@ def _write_feed_bundle(
     tmp_path,
     *,
     pypi_releases: dict | None = None,
+    pypi_malware: list[dict] | None = None,
     expires_at: str | None = None,
 ):
     expires = (
@@ -978,7 +1202,7 @@ def _write_feed_bundle(
         "created_at": "2026-06-26T00:00:00Z",
         "expires_at": expires,
         "datasets": {
-            "pypi-malware": {"packages": []},
+            "pypi-malware": {"packages": pypi_malware or []},
             "npm-malware": {
                 "packages": [
                     {

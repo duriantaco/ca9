@@ -13,7 +13,12 @@ from click.testing import CliRunner
 
 from ca9.cli import main
 from ca9.package_feed import update_feed_from_source
-from ca9.package_policy import ModePolicy, PackageAgePolicy, PackagePolicy
+from ca9.package_policy import (
+    ModePolicy,
+    PackageAgePolicy,
+    PackagePolicy,
+    PolicyException,
+)
 from ca9.runtime.npm_gateway import NpmMetadataGateway, npm_gateway_child_env
 
 
@@ -107,6 +112,61 @@ def test_npm_gateway_hides_too_new_versions(tmp_path):
     assert set(data["versions"]) == {"1.0.0"}
     assert data["dist-tags"]["latest"] == "1.0.0"
     assert gateway.state.removed_versions[0].policy_id == "ca9.package_age"
+
+
+def test_npm_gateway_allows_scoped_package_age_exception(tmp_path):
+    now = datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc)
+    upstream = _FakeNpmRegistry(
+        {
+            "name": "fresh-lib",
+            "versions": {
+                "2.0.0": {"name": "fresh-lib", "version": "2.0.0"},
+            },
+            "dist-tags": {"latest": "2.0.0"},
+        }
+    )
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(
+        _write_feed_bundle(
+            tmp_path,
+            npm_releases={"packages": {"fresh-lib": {"2.0.0": "2026-06-26T11:00:00+00:00"}}},
+        ),
+        cache_dir=cache_root / "feed",
+    )
+    policy = PackagePolicy(
+        package_age=PackageAgePolicy(enabled=True, minimum_hours=48),
+        exceptions=(
+            PolicyException(
+                policy_id="ca9.package_age",
+                ecosystem="npm",
+                package="fresh-*",
+                version="2.*",
+                owner="release-security",
+                reason="Emergency release",
+                expires="2026-06-27",
+            ),
+        ),
+    )
+
+    with (
+        upstream,
+        NpmMetadataGateway(
+            upstream_registry=upstream.url,
+            policy=policy,
+            feed_cache_dir=cache_root / "feed",
+            now=now,
+        ) as gateway,
+    ):
+        body = urllib.request.urlopen(gateway.registry_url + "fresh-lib").read()
+
+    data = json.loads(body)
+    assert set(data["versions"]) == {"2.0.0"}
+    assert gateway.state.removed_versions == []
+    assert gateway.state.applied_exceptions[0]["action"] == "warn"
+    assert (
+        gateway.state.applied_exceptions[0]["evidence"]["policy_exception"]["owner"]
+        == "release-security"
+    )
 
 
 def test_npm_gateway_hides_unknown_release_versions_when_offline_blocks(tmp_path):

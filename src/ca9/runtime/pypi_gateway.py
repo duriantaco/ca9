@@ -30,7 +30,7 @@ from ca9.package_feed import (
     lookup_release_time,
     release_window_covers,
 )
-from ca9.package_policy import PackagePolicy, action_for_mode
+from ca9.package_policy import PackagePolicy, action_for_mode, find_policy_exception
 
 DEFAULT_PYPI_UPSTREAM = "https://pypi.org"
 GATEWAY_SCHEMA = "ca9.pypi.gateway.v1"
@@ -63,10 +63,12 @@ class PyPIGatewayState:
     feed: FeedStatus | None = None
     rewrite_count: int = 0
     removed_links: list[PyPIGatewayDecision] | None = None
+    applied_exceptions: list[dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         self.upstream_base = _normalize_upstream_base(self.upstream_base)
         self.removed_links = []
+        self.applied_exceptions = []
 
 
 class PyPISimpleGateway:
@@ -130,6 +132,7 @@ class PyPISimpleGateway:
             else None,
             "rewrite_count": self.state.rewrite_count,
             "removed_links": [item.to_dict() for item in self.state.removed_links or []],
+            "applied_exceptions": list(self.state.applied_exceptions or []),
         }
 
 
@@ -278,12 +281,17 @@ def _denied_version(
         matches = lookup_malware("pypi", package_name, version, snapshot=snapshot)
         if matches and action_for_mode("block", policy.mode.default) == "block":
             malware_id = matches[0].get("id") or "local-feed"
-            return PyPIGatewayDecision(
-                package=package_name,
-                version=version,
-                policy_id="ca9.malware",
-                reason=f"local feed marks {package_name}=={version} as malicious ({malware_id})",
-                href=href,
+            return _apply_gateway_exception(
+                PyPIGatewayDecision(
+                    package=package_name,
+                    version=version,
+                    policy_id="ca9.malware",
+                    reason=(
+                        f"local feed marks {package_name}=={version} as malicious ({malware_id})"
+                    ),
+                    href=href,
+                ),
+                state,
             )
 
     if policy.package_age.enabled and not _is_age_excluded(
@@ -300,30 +308,71 @@ def _denied_version(
             ):
                 return None
             if action_for_mode("block", policy.mode.offline) == "block":
-                return PyPIGatewayDecision(
-                    package=package_name,
-                    version=version,
-                    policy_id="ca9.package_age_unknown",
-                    reason=(
-                        f"release time for {package_name}=={version} is not available "
-                        "in the local feed"
+                return _apply_gateway_exception(
+                    PyPIGatewayDecision(
+                        package=package_name,
+                        version=version,
+                        policy_id="ca9.package_age_unknown",
+                        reason=(
+                            f"release time for {package_name}=={version} is not available "
+                            "in the local feed"
+                        ),
+                        href=href,
                     ),
-                    href=href,
+                    state,
                 )
         elif action_for_mode("block", policy.mode.default) == "block":
             released = _parse_time(released_at)
             age_hours = (now - released).total_seconds() / 3600
             if age_hours < policy.package_age.minimum_hours:
-                return PyPIGatewayDecision(
-                    package=package_name,
-                    version=version,
-                    policy_id="ca9.package_age",
-                    reason=(
-                        f"package version age is {age_hours:.1f}h, below policy minimum "
-                        f"of {policy.package_age.minimum_hours}h"
+                return _apply_gateway_exception(
+                    PyPIGatewayDecision(
+                        package=package_name,
+                        version=version,
+                        policy_id="ca9.package_age",
+                        reason=(
+                            f"package version age is {age_hours:.1f}h, below policy minimum "
+                            f"of {policy.package_age.minimum_hours}h"
+                        ),
+                        href=href,
                     ),
-                    href=href,
+                    state,
                 )
+    return None
+
+
+def _apply_gateway_exception(
+    decision: PyPIGatewayDecision,
+    state: PyPIGatewayState,
+) -> PyPIGatewayDecision | None:
+    exception = find_policy_exception(
+        state.policy.exceptions,
+        policy_id=decision.policy_id,
+        ecosystem="pypi",
+        package=decision.package,
+        version=decision.version,
+        now=state.now,
+    )
+    if exception is None:
+        return decision
+    payload = {
+        "action": exception.action,
+        "package": decision.package,
+        "version": decision.version,
+        "policy_id": decision.policy_id,
+        "reason": (
+            f"{decision.reason}; exception owned by {exception.owner} applies until "
+            f"{exception.expires}: {exception.reason}"
+        ),
+        "evidence": {
+            "policy_exception": {
+                **exception.to_dict(),
+                "original_action": "block",
+            }
+        },
+    }
+    if state.applied_exceptions is not None and payload not in state.applied_exceptions:
+        state.applied_exceptions.append(payload)
     return None
 
 

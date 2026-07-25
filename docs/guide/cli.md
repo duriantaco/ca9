@@ -131,6 +131,42 @@ ca9 inventory --repo .
 ca9 inventory --repo . -f json -o ca9-inventory.json
 ```
 
+## `ca9 protect`
+
+Report whether the repository's dependency-install workflows are protected.
+The command is local and read-only.
+
+```bash
+ca9 protect [PATH] [OPTIONS]
+```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `-r, --repo PATH` | Project repository path. Defaults to `.`. |
+| `-f, --format table\|json\|markdown\|sarif` | Output format. Defaults to `table`. |
+| `-o, --output PATH` | Write output to a file. |
+| `--policy PATH` | ca9 package policy TOML. |
+| `--scan-workflows / --no-scan-workflows` | Include local GitHub Actions trust-boundary checks. Enabled by default. |
+
+`protect` detects npm, pip, uv, Poetry, Pipenv, PDM, pnpm, Yarn, fyn, and
+PEP 751 lock workflows. It validates the npm v2/v3 and local pip requirements
+workflows that `ca9 run` can currently enforce, reports other managers without
+pretending to mediate them, and combines feed state, exception hygiene,
+inventory, package-policy findings, and workflow decisions in
+`ca9.protect.v1`. Blocking posture or policy decisions exit `1`; warnings exit
+`0`.
+
+Examples:
+
+```bash
+ca9 protect --repo .
+ca9 protect --repo . -f json -o ca9-protect.json
+ca9 protect --repo . -f sarif -o ca9-protect.sarif
+ca9 protect --repo . --no-scan-workflows
+```
+
 ## `ca9 vet`
 
 Run package supply-chain risk checks.
@@ -200,6 +236,12 @@ ca9 policy validate --policy ca9.toml
 ca9 policy explain --policy ca9.toml
 ```
 
+Top-level `[[exceptions]]` entries can downgrade a matching policy decision to
+`warn` or `pass`. Each entry requires `policy_id`, `owner`, `reason`, and an ISO
+`expires` date; optional `ecosystem`, `package`, and `version` selectors narrow
+the scope. Applied entries are included in decision evidence, expired entries
+do not match, and `ca9.malware` cannot be overridden.
+
 ## `ca9 feed`
 
 Manage local package-intelligence feed snapshots.
@@ -248,6 +290,7 @@ Supported command families:
 - `npm i <direct package spec>`
 - `pip install <direct package spec>`
 - `python -m pip install <direct package spec>`
+- `pip install -r <local requirements file> [-c <local constraints file>]`
 
 Options:
 
@@ -271,6 +314,14 @@ supported; `npm-shrinkwrap.json` is not yet supported. Zero-argument `npm instal
 `npm i` is intentionally unsupported because npm may update an out-of-sync lockfile;
 use `npm ci` when ca9 must prove the installed set matches the checked lock.
 
+Requirement and constraint includes resolve relative to the containing file and
+must stay inside the repository. ca9 supports nested local includes, hashes,
+markers, index evidence, and constraints that refine declared requirements.
+Remote requirement files, direct/editable/local dependencies, extra indexes,
+find-links, include cycles, and escaping paths block before pip starts. When the
+PyPI gateway is active, its loopback URL is appended as the final pip index
+option so an index declared inside a requirements file cannot bypass mediation.
+
 Examples:
 
 ```bash
@@ -279,6 +330,7 @@ ca9 run --dry-run -- npm install express@4.18.2
 ca9 run -- npm i @scope/pkg@1.2.3
 ca9 run -- python -m pip install requests==2.31.0
 ca9 run -- pip install requests==2.31.0
+ca9 run -- pip install -r requirements.txt -c constraints.txt
 ```
 
 ## `ca9 ingest-sarif`

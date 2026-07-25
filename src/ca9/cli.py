@@ -665,7 +665,12 @@ def run_cmd(
                 policy=package_policy,
             ) as gateway:
                 completed = subprocess.run(
-                    list(gateway_child_command(preflight.command)),
+                    list(
+                        gateway_child_command(
+                            preflight.command,
+                            registry_url=gateway.index_url,
+                        )
+                    ),
                     env=pypi_gateway_child_env(child_env, gateway.index_url),
                 )
                 gateway_events = _gateway_ledger_events(gateway.to_dict(), session_id=session_id)
@@ -721,6 +726,8 @@ def _gateway_ledger_events(gateway_payload: dict[str, Any], *, session_id: str):
         for decision in gateway_payload.get(key) or []:
             payload = {"action": "block", **decision}
             events.append(LedgerEvent("decision_emitted", payload, session_id))
+    for decision in gateway_payload.get("applied_exceptions") or []:
+        events.append(LedgerEvent("decision_emitted", decision, session_id))
     return events
 
 
@@ -777,6 +784,104 @@ def inventory_cmd(
         output_path.write_text(text)
     else:
         click.echo(text)
+
+
+@main.command(name="protect")
+@click.argument(
+    "path",
+    required=False,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "-r",
+    "--repo",
+    "repo_path",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+    help="Path to the project repository.",
+)
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json", "markdown", "sarif"]),
+    default="table",
+    help="Output format.",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write output to file instead of stdout.",
+)
+@click.option(
+    "--policy",
+    "policy_path",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to ca9 package policy TOML.",
+)
+@click.option(
+    "--scan-workflows/--no-scan-workflows",
+    default=True,
+    show_default=True,
+    help="Scan local GitHub Actions workflows for risky trust boundaries.",
+)
+@click.pass_context
+def protect_cmd(
+    ctx: click.Context,
+    path: Path | None,
+    repo_path: Path,
+    output_format: str,
+    output_path: Path | None,
+    policy_path: Path | None,
+    scan_workflows: bool,
+) -> None:
+    """Report whether this repository's dependency installs are protected."""
+    from ca9.package_feed import FeedError
+    from ca9.package_policy import load_effective_package_policy, validate_package_policy
+    from ca9.protect import (
+        build_protect_report,
+        protect_report_to_json,
+        protect_report_to_markdown,
+        protect_report_to_sarif,
+        protect_report_to_table,
+    )
+
+    if path is None:
+        repo_path = _resolve_option(ctx, "repo_path", repo_path)
+    else:
+        repo_path = path
+
+    try:
+        package_policy = (
+            validate_package_policy(policy_path)
+            if policy_path is not None
+            else load_effective_package_policy(cwd=repo_path)
+        )
+        report = build_protect_report(
+            repo_path,
+            package_policy,
+            scan_workflows=scan_workflows,
+        )
+    except (FeedError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+    renderers = {
+        "json": protect_report_to_json,
+        "markdown": protect_report_to_markdown,
+        "sarif": protect_report_to_sarif,
+        "table": protect_report_to_table,
+    }
+    text = renderers[output_format](report)
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text)
+    else:
+        click.echo(text)
+    sys.exit(report.exit_code)
 
 
 @main.command(name="vet")
@@ -1040,6 +1145,7 @@ def vet_cmd(
         block_untrusted_direct=package_policy.registries.custom_requires_approval
         if package_policy
         else True,
+        exceptions=package_policy.exceptions if package_policy else (),
     )
     report = build_supply_chain_report(
         inventory,

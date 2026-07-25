@@ -92,6 +92,7 @@ nav:
       - Verdict Engine: architecture/engine.md
       - Analysis Pipeline: architecture/analysis.md
       - Parsers: architecture/parsers.md
+      - Secure Install Control Plane: proposals/secure-install-control-plane.md
   - API Reference:
       - Models: api/models.md
       - Engine: api/engine.md
