@@ -14,7 +14,12 @@ from click.testing import CliRunner
 
 from ca9.cli import main
 from ca9.package_feed import update_feed_from_source
-from ca9.package_policy import ModePolicy, PackageAgePolicy, PackagePolicy
+from ca9.package_policy import (
+    ModePolicy,
+    PackageAgePolicy,
+    PackagePolicy,
+    PolicyException,
+)
 from ca9.runtime.pypi_gateway import PyPISimpleGateway, pypi_gateway_child_env
 
 
@@ -98,6 +103,57 @@ def test_pypi_gateway_hides_too_new_sdist_link(tmp_path):
     assert "fresh-lib-1.0.0.tar.gz" in body
     assert "fresh-lib-2.0.0.tar.gz" not in body
     assert gateway.state.removed_links[0].policy_id == "ca9.package_age"
+
+
+def test_pypi_gateway_allows_scoped_package_age_exception(tmp_path):
+    now = datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc)
+    html = b"""
+<html><body>
+<a href="fresh-lib-2.0.0.tar.gz">fresh-lib-2.0.0.tar.gz</a>
+</body></html>
+"""
+    upstream = _FakePyPIRegistry(html)
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(
+        _write_feed_bundle(
+            tmp_path,
+            pypi_releases={"packages": {"fresh-lib": {"2.0.0": "2026-06-26T11:00:00+00:00"}}},
+        ),
+        cache_dir=cache_root / "feed",
+    )
+    policy = PackagePolicy(
+        package_age=PackageAgePolicy(enabled=True, minimum_hours=48),
+        exceptions=(
+            PolicyException(
+                policy_id="ca9.package_age",
+                ecosystem="pypi",
+                package="fresh-lib",
+                version="2.*",
+                owner="release-security",
+                reason="Emergency release",
+                expires="2026-06-27",
+            ),
+        ),
+    )
+
+    with (
+        upstream,
+        PyPISimpleGateway(
+            upstream_base=upstream.url,
+            policy=policy,
+            feed_cache_dir=cache_root / "feed",
+            now=now,
+        ) as gateway,
+    ):
+        body = urllib.request.urlopen(gateway.index_url + "/fresh-lib/").read().decode()
+
+    assert "fresh-lib-2.0.0.tar.gz" in body
+    assert gateway.state.removed_links == []
+    assert gateway.state.applied_exceptions[0]["action"] == "warn"
+    assert (
+        gateway.state.applied_exceptions[0]["evidence"]["policy_exception"]["owner"]
+        == "release-security"
+    )
 
 
 def test_pypi_gateway_hides_unknown_release_links_when_offline_blocks(tmp_path):
@@ -224,7 +280,83 @@ strip_secret_env_for_installs = false
         )
 
     assert result.exit_code == 0
-    assert "--index-url" not in argv_path.read_text()
+    child_args = argv_path.read_text()
+    assert child_args.count("--index-url") == 1
+    assert upstream.url not in child_args
+    assert "--index-url http://127.0.0.1:" in child_args
+    body = index_path.read_text()
+    assert "badlib-0.9.0-py3-none-any.whl" in body
+    assert "badlib-1.0.0-py3-none-any.whl" not in body
+
+
+def test_ca9_run_pip_requirement_file_uses_gateway_for_child_install(
+    tmp_path,
+    monkeypatch,
+):
+    html = b"""
+<html><body>
+<a href="badlib-0.9.0-py3-none-any.whl">badlib-0.9.0-py3-none-any.whl</a>
+<a href="badlib-1.0.0-py3-none-any.whl">badlib-1.0.0-py3-none-any.whl</a>
+</body></html>
+"""
+    upstream = _FakePyPIRegistry(html)
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    bin_dir = tmp_path / "bin"
+    index_path = tmp_path / "simple.html"
+    argv_path = tmp_path / "argv.txt"
+    policy_path = repo / "ca9.toml"
+    policy_path.write_text(
+        """
+[registries]
+allow = ["127.0.0.1", "pypi.org", "files.pythonhosted.org"]
+
+[install_scripts]
+block_when_secrets_present = false
+
+[ci]
+strip_secret_env_for_installs = false
+"""
+    )
+    _write_fake_command(
+        bin_dir,
+        "pip",
+        "#!/bin/sh\n"
+        f'{sys.executable} -c "import os, pathlib, urllib.request; '
+        f"pathlib.Path({str(argv_path)!r}).write_text(' '.join(__import__('sys').argv[1:])); "
+        "url=os.environ['PIP_INDEX_URL'].rstrip('/') + '/badlib/'; "
+        f'pathlib.Path({str(index_path)!r}).write_bytes(urllib.request.urlopen(url).read())" '
+        '"$@"\n'
+        "exit 0\n",
+    )
+    monkeypatch.chdir(repo)
+
+    runner = CliRunner()
+    with upstream:
+        (repo / "requirements.txt").write_text(f"--index-url {upstream.url}/simple\nbadlib\n")
+        result = runner.invoke(
+            main,
+            [
+                "run",
+                "--policy",
+                str(policy_path),
+                "--",
+                "pip",
+                "install",
+                "-r",
+                "requirements.txt",
+            ],
+            env={
+                "CA9_CACHE_DIR": str(cache_root),
+                "PATH": str(bin_dir),
+            },
+        )
+
+    assert result.exit_code == 0
+    child_args = argv_path.read_text()
+    assert child_args.startswith("install -r requirements.txt --index-url http://127.0.0.1:")
     body = index_path.read_text()
     assert "badlib-0.9.0-py3-none-any.whl" in body
     assert "badlib-1.0.0-py3-none-any.whl" not in body

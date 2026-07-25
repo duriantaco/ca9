@@ -35,12 +35,14 @@ Use it when you want to:
 - **Prevent risky installs:** enforce package policy in CI or local installs so
   known malware, untrusted registries, and secret-exposing install scripts can
   be stopped before package code executes. `ca9 run` supports lockfile-backed
-  `npm ci` plus explicit npm and pip package specs.
+  `npm ci`, local pip requirements/constraints files, and explicit npm/pip
+  package specs.
 
 The core commands are meant to be plain:
 
 ```bash
 ca9 vet .
+ca9 protect .
 ca9 scan --repo .
 ca9 inventory --repo . -f json
 ca9 feed status
@@ -51,6 +53,7 @@ Runtime preflight uses the same package evidence and policy:
 
 ```bash
 ca9 run -- npm ci
+ca9 run -- pip install -r requirements.txt
 ca9 run -- npm install <package>
 ca9 run -- python -m pip install <package>
 ```
@@ -150,10 +153,11 @@ reachability, package inventory, artifact evidence, and policy decisions.
 | **SCA report parsing** | Snyk, Dependabot, Trivy, Grype, OSV-Scanner, pip-audit | Native to each tool | Platform-specific |
 | **Package inventory** | Native manifests plus optional `fyn.lock` and npm `package-lock.json` artifacts, registries, and dependency edges | Varies | Varies |
 | **Supply-chain vetting** | Malware advisories, registry trust, artifact hashes, package age with local feeds, source-only risk, dependency confusion, workflow risk, and license policy | Varies | Varies |
+| **Protection posture** | One local `ca9 protect` report for install-workflow coverage, feed state, exception hygiene, package policy, and Actions trust boundaries | Varies | Varies |
 | **Static + dynamic evidence** | Imports, dependency graph, coverage, API usage | Usually package-level alerts | Varies by vendor and integration |
 | **Open outputs** | JSON, SARIF, OpenVEX, Markdown, HTML, remediation, action plan | Vendor-specific | Platform-specific |
 | **Confidence/evidence trail** | Structured evidence per verdict | Limited | Varies |
-| **Runtime prevention** | `ca9 run` preflight and scoped npm/PyPI metadata gateways for lockfile-backed npm installs and direct npm/pip specs | Varies | Varies |
+| **Runtime prevention** | `ca9 run` preflight and scoped npm/PyPI metadata gateways for lockfile-backed npm installs, pip requirements/constraints, and direct npm/pip specs | Varies | Varies |
 
 **Use ca9 when you want an open, local package supply-chain defense layer for
 inventory, CVE triage, package vetting, CI gates, SARIF upload, OpenVEX
@@ -167,8 +171,9 @@ pip workflows.**
 | CVE reachability | Parses Snyk, Dependabot, Trivy, Grype, OSV-Scanner, and pip-audit reports; scans OSV directly; combines static import evidence, dependency graph evidence, optional coverage, vulnerable API rules, threat intel, accepted risks, and baselines. Non-Python report findings remain explicitly inconclusive. |
 | Inventory | Reads Python manifests, `uv.lock`, `poetry.lock`, `Pipfile`, `fyn.lock`, and npm `package-lock.json`; preserves packages, versions, dependency edges, groups, registries, artifact URLs, hashes, and npm SRI integrity. |
 | Vetting | Gates untrusted registries, dependency confusion, missing hashes, direct URL/Git/mutable sources, local feed malware, optional OSV malware queries, package age, workflow risk, artifact code heuristics, and license policy. |
+| Protection posture | `ca9 protect` detects dependency workflows, validates enforceable npm locks and pip requirements, reports unsupported managers, feed readiness, expired exceptions, package-policy decisions, and local GitHub Actions risks in table, JSON, Markdown, or SARIF. |
 | Artifact analysis | Hash-verifies and safely unpacks Python wheels/sdists and npm tarballs; scans Python startup/install/import-time behavior and npm lifecycle, encoded execution, and credential exfiltration patterns without executing package code. |
-| Runtime prevention | Supports lockfile-backed `ca9 run -- npm ci`, plus `npm install ...`, `npm i ...`, `pip install ...`, and `python -m pip install ...` for direct package specs; checks policy before execution; strips or blocks secrets; mediates npm/PyPI metadata through loopback gateways when a feed is available. |
+| Runtime prevention | Supports lockfile-backed `ca9 run -- npm ci`, local `-r` requirements and `-c` constraints, plus direct `npm install ...`, `npm i ...`, `pip install ...`, and `python -m pip install ...` specs; checks policy before execution; strips or blocks secrets; mediates npm/PyPI metadata through loopback gateways when a feed is available. |
 | Feeds and audit | Installs `ca9.feed.v1` package-intelligence bundles into `~/.cache/ca9/feed`; verifies snapshot hashes; records redacted runtime audit JSONL including preflight decisions, feed use, gateway use, denied versions/links, and child process exit. |
 
 ## Real-world results
@@ -230,6 +235,22 @@ hashes or integrity values, registries, and source evidence. If there is no lock
 falls back to native Python manifest readers for `pyproject.toml`, `requirements*.txt`,
 `Pipfile`, `uv.lock`, and `poetry.lock`.
 
+### Check whether dependency installs are protected
+
+```bash
+ca9 protect --repo .
+ca9 protect --repo . -f json -o ca9-protect.json
+ca9 protect --repo . -f sarif -o ca9-protect.sarif
+```
+
+`ca9 protect` is a read-only, local posture check. It detects package-manager
+workflows, validates npm v2/v3 locks and pip requirements/constraints entry
+points, reports which installs `ca9 run` can enforce, checks local feed readiness
+and exception expiry, evaluates package-policy findings, and scans local GitHub
+Actions workflows by default. Missing enforceable locks and blocking policy
+decisions exit `1`; unsupported managers and other review items are warnings.
+Use `--no-scan-workflows` when the report should cover dependency posture only.
+
 ### Run supply-chain risk checks
 
 ```bash
@@ -285,6 +306,16 @@ fail_closed = false
 enabled = false
 minimum_hours = 48
 exclusions = []
+
+[[exceptions]]
+policy_id = "ca9.package_age"
+ecosystem = "pypi"
+package = "example-package"
+version = "1.2.*"
+action = "warn"
+owner = "platform-security"
+reason = "Validated emergency release"
+expires = 2026-08-01
 ```
 
 Validate and inspect the effective policy before using it in CI:
@@ -297,7 +328,11 @@ ca9 vet --repo . --policy ca9.toml
 
 The policy controls whether ca9 passes, warns, or blocks package supply-chain
 findings. CLI flags such as `--trusted-index`, `--private-index`, and
-`--internal-package` can still be used for one-off runs.
+`--internal-package` can still be used for one-off runs. Exceptions are matched
+by policy ID and optional ecosystem/package/version globs, require an owner,
+reason, and expiry date, and are recorded in decision evidence. Expired
+exceptions do not apply. Known-malware decisions (`ca9.malware`) cannot be
+overridden.
 
 Install package-intelligence feed data when you want deterministic offline
 package-age or package-malware decisions:
@@ -385,6 +420,7 @@ ca9 run -- npm install express@4.18.2
 ca9 run -- npm i @scope/pkg@1.2.3
 ca9 run -- python -m pip install requests==2.31.0
 ca9 run -- pip install requests==2.31.0
+ca9 run -- pip install -r requirements.txt -c constraints.txt
 ```
 
 `npm ci` and its clean-install aliases are checked against every exact non-project
@@ -392,9 +428,13 @@ version in `package-lock.json`, including transitive dependencies. A missing,
 unreadable, or unsupported lockfile blocks before npm starts. Zero-argument
 `npm install` is also blocked because npm can update a stale lock and install
 unvetted versions; use `npm ci` for a lock-backed install. Direct npm and pip
-package specs remain supported. Requirement files, direct URLs, local paths, and
-other package managers are blocked with an unsupported-command decision instead
-of being guessed. Explicit
+package specs remain supported. Local pip requirement and constraint files are
+parsed recursively before pip starts; includes resolve relative to their
+containing file and must remain inside the repository. Exact pins and hashes are
+retained as evidence, constraints refine declared requirements, and
+constraint-only packages are not treated as requested installs. Remote
+requirements, direct URLs, editable/local paths, extra indexes, find-links, and
+other package managers are blocked instead of being guessed. Explicit
 registry/index command options and npm/pip registry environment variables are
 checked against policy; alternate pip sources such as extra indexes and find-links
 are blocked until multi-source mediation is implemented.
@@ -415,7 +455,10 @@ and leaves upstream bytes unchanged when nothing is denied. The PyPI gateway
 filters Simple API wheel and sdist links denied by policy through `PIP_INDEX_URL`.
 Both gateways bind only to `127.0.0.1`, reject proxy-style absolute URLs, and
 clear child-process package-manager config sources that would bypass the
-loopback gateway. Gateway rewrites are also recorded in the runtime audit log.
+loopback gateway. A requirements-file index is retained as upstream policy
+evidence, while ca9 appends the loopback index as the final child option so it
+cannot bypass mediation. Gateway rewrites and applied package exceptions are
+recorded in the runtime audit log.
 
 ### Add CI shims
 
@@ -567,6 +610,7 @@ Confidence scoring is **verdict-directional** — evidence that supports the ver
 ca9 scan [OPTIONS]              Scan repository dependency versions via OSV.dev
 ca9 check SCA_REPORT [OPTIONS]  Analyze a supported SCA JSON report
 ca9 inventory [PATH] [OPTIONS]  Show normalized package inventory
+ca9 protect [PATH] [OPTIONS]    Report dependency-install protection posture
 ca9 vet [PATH] [OPTIONS]        Run package supply-chain risk checks
 ca9 run [OPTIONS] -- COMMAND    Preflight and run supported package-manager installs
 ca9 scripts audit [DIRECTORY]   Audit dependency install scripts for npm allowlists

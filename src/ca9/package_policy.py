@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
+from datetime import date, datetime, timezone
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
+
+from packaging.utils import canonicalize_name
 
 try:
     import tomllib
@@ -14,6 +19,8 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python < 3.11
 
 MODE_VALUES = {"off", "warn", "block", "strict"}
 OFFLINE_MODE_VALUES = {"warn", "block", "strict"}
+EXCEPTION_ACTIONS = {"pass", "warn"}
+NON_OVERRIDABLE_POLICY_IDS = {"ca9.malware"}
 POLICY_SECTIONS = {
     "mode",
     "registries",
@@ -21,6 +28,7 @@ POLICY_SECTIONS = {
     "malware",
     "install_scripts",
     "ci",
+    "exceptions",
 }
 
 
@@ -62,6 +70,22 @@ class CIPolicy:
 
 
 @dataclass(frozen=True)
+class PolicyException:
+    policy_id: str
+    owner: str
+    reason: str
+    expires: str
+    action: str = "warn"
+    ecosystem: str | None = None
+    package: str | None = None
+    version: str | None = None
+    source: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {key: value for key, value in asdict(self).items() if value is not None}
+
+
+@dataclass(frozen=True)
 class PackagePolicy:
     mode: ModePolicy = ModePolicy()
     registries: RegistriesPolicy = RegistriesPolicy()
@@ -69,6 +93,7 @@ class PackagePolicy:
     malware: MalwarePolicy = MalwarePolicy()
     install_scripts: InstallScriptsPolicy = InstallScriptsPolicy()
     ci: CIPolicy = CIPolicy()
+    exceptions: tuple[PolicyException, ...] = ()
     sources: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -119,7 +144,13 @@ def load_effective_package_policy(
     for path in selected_paths:
         data = _read_policy_toml(path)
         _validate_raw_policy(data, path)
-        raw = _deep_merge(raw, _policy_root(data))
+        root = dict(_policy_root(data))
+        if isinstance(root.get("exceptions"), list):
+            root["exceptions"] = [
+                {**item, "_source": str(path)} if isinstance(item, dict) else item
+                for item in root["exceptions"]
+            ]
+        raw = _deep_merge(raw, root)
         sources.append(str(path))
 
     policy = _policy_from_raw(raw)
@@ -130,6 +161,7 @@ def load_effective_package_policy(
         malware=policy.malware,
         install_scripts=policy.install_scripts,
         ci=policy.ci,
+        exceptions=policy.exceptions,
         sources=tuple(sources),
     )
 
@@ -178,7 +210,23 @@ def package_policy_explain(policy: PackagePolicy) -> str:
             f"strip_secret_env_for_installs={str(policy.ci.strip_secret_env_for_installs).lower()}, "
             f"block_unpinned_exec_tools={str(policy.ci.block_unpinned_exec_tools).lower()}"
         ),
+        f"Exceptions: {len(policy.exceptions)} configured",
     ]
+    for exception in policy.exceptions:
+        selectors = [
+            value
+            for value in (
+                exception.ecosystem,
+                exception.package,
+                exception.version,
+            )
+            if value
+        ]
+        scope = "/".join(selectors) if selectors else "all matching decisions"
+        lines.append(
+            f"  - {exception.policy_id} -> {exception.action} for {scope}; "
+            f"owner={exception.owner}; expires={exception.expires}"
+        )
     return "\n".join(lines)
 
 
@@ -188,6 +236,59 @@ def action_for_mode(action: str, mode: str) -> str:
     if mode == "warn" and action in {"block", "investigate"}:
         return "warn"
     return action
+
+
+def find_policy_exception(
+    exceptions: tuple[PolicyException, ...],
+    *,
+    policy_id: str,
+    ecosystem: str | None = None,
+    package: str | None = None,
+    version: str | None = None,
+    now: datetime | date | None = None,
+) -> PolicyException | None:
+    if policy_id in NON_OVERRIDABLE_POLICY_IDS:
+        return None
+    for exception in exceptions:
+        if exception.policy_id != policy_id or policy_exception_expired(exception, now=now):
+            continue
+        if exception.ecosystem:
+            if not ecosystem or exception.ecosystem.lower() != ecosystem.lower():
+                continue
+        if exception.package:
+            if not package:
+                continue
+            normalized_package = _normalize_exception_package(package, ecosystem)
+            normalized_pattern = _normalize_exception_package(exception.package, ecosystem)
+            if not fnmatch(normalized_package, normalized_pattern):
+                continue
+        if exception.version and (not version or not fnmatch(version, exception.version)):
+            continue
+        return exception
+    return None
+
+
+def policy_exception_expired(
+    exception: PolicyException,
+    *,
+    now: datetime | date | None = None,
+) -> bool:
+    current_date = _current_date(now)
+    try:
+        expires_on = date.fromisoformat(exception.expires)
+    except (TypeError, ValueError):
+        return True
+    return current_date > expires_on
+
+
+def expired_policy_exceptions(
+    policy: PackagePolicy,
+    *,
+    now: datetime | date | None = None,
+) -> tuple[PolicyException, ...]:
+    return tuple(
+        exception for exception in policy.exceptions if policy_exception_expired(exception, now=now)
+    )
 
 
 def _read_policy_toml(path: Path) -> dict[str, Any]:
@@ -222,6 +323,9 @@ def _validate_raw_policy(data: dict[str, Any], path: Path) -> None:
         if section not in POLICY_SECTIONS:
             errors.append(f"{path}: unknown policy section or key {section!r}")
             continue
+        if section == "exceptions":
+            errors.extend(_raw_exception_errors(path, value))
+            continue
         if not isinstance(value, dict):
             errors.append(f"{path}: [{section}] must be a table")
             continue
@@ -239,6 +343,7 @@ def _policy_from_raw(raw: dict[str, Any]) -> PackagePolicy:
         raw.get("install_scripts") if isinstance(raw.get("install_scripts"), dict) else {}
     )
     ci = raw.get("ci") if isinstance(raw.get("ci"), dict) else {}
+    exceptions = raw.get("exceptions") if isinstance(raw.get("exceptions"), list) else []
 
     policy = PackagePolicy(
         mode=ModePolicy(
@@ -268,6 +373,7 @@ def _policy_from_raw(raw: dict[str, Any]) -> PackagePolicy:
             strip_secret_env_for_installs=_bool_value(ci, "strip_secret_env_for_installs", True),
             block_unpinned_exec_tools=_bool_value(ci, "block_unpinned_exec_tools", True),
         ),
+        exceptions=tuple(_policy_exception_from_raw(item) for item in exceptions),
     )
     validate_effective_policy(policy)
     return policy
@@ -283,6 +389,21 @@ def _effective_policy_errors(policy: PackagePolicy) -> list[str]:
         errors.append("package_age.minimum_hours must be >= 0")
     if not policy.registries.allow:
         errors.append("registries.allow must include at least one trusted registry")
+    for index, exception in enumerate(policy.exceptions):
+        prefix = f"exceptions[{index}]"
+        for field_name in ("policy_id", "owner", "reason", "expires"):
+            if not str(getattr(exception, field_name, "")).strip():
+                errors.append(f"{prefix}.{field_name} must be a non-empty string")
+        if exception.action not in EXCEPTION_ACTIONS:
+            errors.append(
+                f"{prefix}.action must be one of: " + ", ".join(sorted(EXCEPTION_ACTIONS))
+            )
+        if exception.policy_id in NON_OVERRIDABLE_POLICY_IDS:
+            errors.append(f"{prefix}.policy_id cannot override {exception.policy_id}")
+        try:
+            date.fromisoformat(exception.expires)
+        except (TypeError, ValueError):
+            errors.append(f"{prefix}.expires must be an ISO date (YYYY-MM-DD)")
     return errors
 
 
@@ -322,6 +443,106 @@ def _string_tuple(section: dict[str, Any], key: str, default: tuple[str, ...]) -
     if isinstance(value, tuple):
         return tuple(str(item) for item in value if isinstance(item, str))
     return default
+
+
+def _raw_exception_errors(path: Path, value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return [f"{path}: [[exceptions]] must be an array of tables"]
+    allowed_keys = {
+        "policy_id",
+        "owner",
+        "reason",
+        "expires",
+        "action",
+        "ecosystem",
+        "package",
+        "version",
+    }
+    required_keys = {"policy_id", "owner", "reason", "expires"}
+    errors: list[str] = []
+    for index, item in enumerate(value):
+        prefix = f"{path}: exceptions[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{prefix} must be a table")
+            continue
+        for key in item:
+            if key not in allowed_keys:
+                errors.append(f"{prefix} has unknown key {key!r}")
+        for key in sorted(required_keys):
+            if key not in item:
+                errors.append(f"{prefix}.{key} is required")
+        for key in allowed_keys - {"expires"}:
+            field_value = item.get(key)
+            if field_value is not None and not isinstance(field_value, str):
+                errors.append(f"{prefix}.{key} has invalid type")
+            elif key in required_keys and isinstance(field_value, str) and not field_value.strip():
+                errors.append(f"{prefix}.{key} must be a non-empty string")
+        expires = item.get("expires")
+        if expires is not None:
+            try:
+                _normalize_exception_expiry(expires)
+            except ValueError:
+                errors.append(f"{prefix}.expires must be an ISO date (YYYY-MM-DD)")
+        action = item.get("action", "warn")
+        if isinstance(action, str) and action not in EXCEPTION_ACTIONS:
+            errors.append(
+                f"{prefix}.action must be one of: " + ", ".join(sorted(EXCEPTION_ACTIONS))
+            )
+        policy_id = item.get("policy_id")
+        if policy_id in NON_OVERRIDABLE_POLICY_IDS:
+            errors.append(f"{prefix}.policy_id cannot override {policy_id}")
+    return errors
+
+
+def _policy_exception_from_raw(raw: Any) -> PolicyException:
+    item = raw if isinstance(raw, dict) else {}
+    return PolicyException(
+        policy_id=str(item.get("policy_id") or ""),
+        owner=str(item.get("owner") or ""),
+        reason=str(item.get("reason") or ""),
+        expires=_normalize_exception_expiry(item.get("expires")),
+        action=str(item.get("action") or "warn"),
+        ecosystem=_optional_string(item.get("ecosystem")),
+        package=_optional_string(item.get("package")),
+        version=_optional_string(item.get("version")),
+        source=_optional_string(item.get("_source")),
+    )
+
+
+def _normalize_exception_expiry(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, str):
+        return date.fromisoformat(value.strip()).isoformat()
+    raise ValueError("invalid exception expiry")
+
+
+def _optional_string(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _normalize_exception_package(value: str, ecosystem: str | None) -> str:
+    if (ecosystem or "").lower() == "npm":
+        return value.strip().lower()
+    if "*" in value or "?" in value or "[" in value:
+        return re.sub(r"[-_.]+", "-", value.strip()).lower()
+    return str(canonicalize_name(value))
+
+
+def _current_date(now: datetime | date | None) -> date:
+    if isinstance(now, datetime):
+        current = now
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        return current.astimezone(timezone.utc).date()
+    if isinstance(now, date):
+        return now
+    return datetime.now(timezone.utc).date()
 
 
 def _section_type_errors(path: Path, section: str, values: dict[str, Any]) -> list[str]:

@@ -1,5 +1,5 @@
-name: ca9 Python Supply Chain Security
-description: Run ca9 Python CVE reachability and SCA triage in GitHub Actions
+name: ca9 Supply Chain Security
+description: Run ca9 dependency posture, CVE reachability, and SCA triage in GitHub Actions
 author: duriantaco
 
 branding:
@@ -8,7 +8,7 @@ branding:
 
 inputs:
   command:
-    description: ca9 command to run. Use scan or check.
+    description: ca9 command to run. Use scan, check, or protect.
     required: false
     default: scan
   report:
@@ -19,6 +19,14 @@ inputs:
     description: Repository path to analyze.
     required: false
     default: "."
+  policy:
+    description: Package policy TOML path for command protect.
+    required: false
+    default: ""
+  scan-workflows:
+    description: Scan local GitHub Actions workflows when command is protect.
+    required: false
+    default: "true"
   coverage:
     description: coverage.py JSON path for dynamic evidence.
     required: false
@@ -72,7 +80,7 @@ inputs:
     required: false
     default: "true"
   fail-on-findings:
-    description: Fail the workflow when ca9 exits non-zero for reachable or inconclusive findings.
+    description: Fail the workflow when ca9 exits non-zero for blocking posture or findings.
     required: false
     default: "false"
   extra-args:
@@ -102,6 +110,8 @@ runs:
         CA9_COMMAND: ${{ inputs.command }}
         CA9_REPORT: ${{ inputs.report }}
         CA9_REPO: ${{ inputs.repo }}
+        CA9_POLICY: ${{ inputs.policy }}
+        CA9_SCAN_WORKFLOWS: ${{ inputs.scan-workflows }}
         CA9_COVERAGE: ${{ inputs.coverage }}
         CA9_FORMAT: ${{ inputs.format }}
         CA9_OUTPUT: ${{ inputs.output }}
@@ -118,8 +128,8 @@ runs:
       run: |
         set -u
 
-        if [[ "$CA9_COMMAND" != "scan" && "$CA9_COMMAND" != "check" ]]; then
-          echo "command must be 'scan' or 'check'" >&2
+        if [[ "$CA9_COMMAND" != "scan" && "$CA9_COMMAND" != "check" && "$CA9_COMMAND" != "protect" ]]; then
+          echo "command must be 'scan', 'check', or 'protect'" >&2
           exit 64
         fi
 
@@ -133,36 +143,45 @@ runs:
         fi
 
         cmd+=(--repo "$CA9_REPO")
-        cmd+=(--proof-standard "$CA9_PROOF_STANDARD")
         cmd+=(-f "$CA9_FORMAT")
         cmd+=(-o "$CA9_OUTPUT")
 
-        if [[ -n "$CA9_COVERAGE" ]]; then
-          cmd+=(--coverage "$CA9_COVERAGE")
-        fi
-        if [[ "$CA9_NO_AUTO_COVERAGE" == "true" ]]; then
-          cmd+=(--no-auto-coverage)
-        fi
-        if [[ -n "$CA9_ACCEPTED_RISKS" ]]; then
-          cmd+=(--accepted-risks "$CA9_ACCEPTED_RISKS")
-        fi
-        if [[ -n "$CA9_BASELINE" ]]; then
-          cmd+=(--baseline "$CA9_BASELINE")
-        fi
-        if [[ "$CA9_NEW_ONLY" == "true" ]]; then
-          cmd+=(--new-only)
-        fi
-        if [[ "$CA9_CAPABILITIES" == "true" ]]; then
-          cmd+=(--capabilities)
-        fi
-        if [[ "$CA9_TRACE_PATHS" == "true" ]]; then
-          cmd+=(--trace-paths)
-        fi
-        if [[ "$CA9_THREAT_INTEL" == "true" ]]; then
-          cmd+=(--threat-intel)
-        fi
-        if [[ -n "$CA9_OTEL_TRACES" ]]; then
-          cmd+=(--otel-traces "$CA9_OTEL_TRACES")
+        if [[ "$CA9_COMMAND" == "protect" ]]; then
+          if [[ -n "$CA9_POLICY" ]]; then
+            cmd+=(--policy "$CA9_POLICY")
+          fi
+          if [[ "$CA9_SCAN_WORKFLOWS" == "false" ]]; then
+            cmd+=(--no-scan-workflows)
+          fi
+        else
+          cmd+=(--proof-standard "$CA9_PROOF_STANDARD")
+          if [[ -n "$CA9_COVERAGE" ]]; then
+            cmd+=(--coverage "$CA9_COVERAGE")
+          fi
+          if [[ "$CA9_NO_AUTO_COVERAGE" == "true" ]]; then
+            cmd+=(--no-auto-coverage)
+          fi
+          if [[ -n "$CA9_ACCEPTED_RISKS" ]]; then
+            cmd+=(--accepted-risks "$CA9_ACCEPTED_RISKS")
+          fi
+          if [[ -n "$CA9_BASELINE" ]]; then
+            cmd+=(--baseline "$CA9_BASELINE")
+          fi
+          if [[ "$CA9_NEW_ONLY" == "true" ]]; then
+            cmd+=(--new-only)
+          fi
+          if [[ "$CA9_CAPABILITIES" == "true" ]]; then
+            cmd+=(--capabilities)
+          fi
+          if [[ "$CA9_TRACE_PATHS" == "true" ]]; then
+            cmd+=(--trace-paths)
+          fi
+          if [[ "$CA9_THREAT_INTEL" == "true" ]]; then
+            cmd+=(--threat-intel)
+          fi
+          if [[ -n "$CA9_OTEL_TRACES" ]]; then
+            cmd+=(--otel-traces "$CA9_OTEL_TRACES")
+          fi
         fi
         if [[ -n "$CA9_EXTRA_ARGS" ]]; then
           read -r -a extra_args <<< "$CA9_EXTRA_ARGS"

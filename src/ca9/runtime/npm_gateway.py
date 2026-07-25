@@ -21,7 +21,7 @@ from ca9.package_feed import (
     lookup_release_time,
     release_window_covers,
 )
-from ca9.package_policy import PackagePolicy, action_for_mode
+from ca9.package_policy import PackagePolicy, action_for_mode, find_policy_exception
 
 DEFAULT_NPM_REGISTRY = "https://registry.npmjs.org"
 GATEWAY_SCHEMA = "ca9.npm.gateway.v1"
@@ -52,9 +52,11 @@ class NpmGatewayState:
     feed: FeedStatus | None = None
     rewrite_count: int = 0
     removed_versions: list[NpmGatewayDecision] | None = None
+    applied_exceptions: list[dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         self.removed_versions = []
+        self.applied_exceptions = []
 
 
 class NpmMetadataGateway:
@@ -118,6 +120,7 @@ class NpmMetadataGateway:
             else None,
             "rewrite_count": self.state.rewrite_count,
             "removed_versions": [item.to_dict() for item in self.state.removed_versions or []],
+            "applied_exceptions": list(self.state.applied_exceptions or []),
         }
 
 
@@ -270,11 +273,16 @@ def _denied_version(
         matches = lookup_malware("npm", package_name, version, snapshot=snapshot)
         if matches and action_for_mode("block", policy.mode.default) == "block":
             malware_id = matches[0].get("id") or "local-feed"
-            return NpmGatewayDecision(
-                package=package_name,
-                version=version,
-                policy_id="ca9.malware",
-                reason=f"local feed marks {package_name}@{version} as malicious ({malware_id})",
+            return _apply_gateway_exception(
+                NpmGatewayDecision(
+                    package=package_name,
+                    version=version,
+                    policy_id="ca9.malware",
+                    reason=(
+                        f"local feed marks {package_name}@{version} as malicious ({malware_id})"
+                    ),
+                ),
+                state,
             )
 
     if policy.package_age.enabled and not _is_age_excluded(
@@ -294,28 +302,69 @@ def _denied_version(
             ):
                 return None
             if action_for_mode("block", policy.mode.offline) == "block":
-                return NpmGatewayDecision(
-                    package=package_name,
-                    version=version,
-                    policy_id="ca9.package_age_unknown",
-                    reason=(
-                        f"release time for {package_name}@{version} is not available "
-                        "in the local feed"
+                return _apply_gateway_exception(
+                    NpmGatewayDecision(
+                        package=package_name,
+                        version=version,
+                        policy_id="ca9.package_age_unknown",
+                        reason=(
+                            f"release time for {package_name}@{version} is not available "
+                            "in the local feed"
+                        ),
                     ),
+                    state,
                 )
         elif action_for_mode("block", policy.mode.default) == "block":
             released = _parse_time(released_at)
             age_hours = (now - released).total_seconds() / 3600
             if age_hours < policy.package_age.minimum_hours:
-                return NpmGatewayDecision(
-                    package=package_name,
-                    version=version,
-                    policy_id="ca9.package_age",
-                    reason=(
-                        f"package version age is {age_hours:.1f}h, below policy minimum "
-                        f"of {policy.package_age.minimum_hours}h"
+                return _apply_gateway_exception(
+                    NpmGatewayDecision(
+                        package=package_name,
+                        version=version,
+                        policy_id="ca9.package_age",
+                        reason=(
+                            f"package version age is {age_hours:.1f}h, below policy minimum "
+                            f"of {policy.package_age.minimum_hours}h"
+                        ),
                     ),
+                    state,
                 )
+    return None
+
+
+def _apply_gateway_exception(
+    decision: NpmGatewayDecision,
+    state: NpmGatewayState,
+) -> NpmGatewayDecision | None:
+    exception = find_policy_exception(
+        state.policy.exceptions,
+        policy_id=decision.policy_id,
+        ecosystem="npm",
+        package=decision.package,
+        version=decision.version,
+        now=state.now,
+    )
+    if exception is None:
+        return decision
+    payload = {
+        "action": exception.action,
+        "package": decision.package,
+        "version": decision.version,
+        "policy_id": decision.policy_id,
+        "reason": (
+            f"{decision.reason}; exception owned by {exception.owner} applies until "
+            f"{exception.expires}: {exception.reason}"
+        ),
+        "evidence": {
+            "policy_exception": {
+                **exception.to_dict(),
+                "original_action": "block",
+            }
+        },
+    }
+    if state.applied_exceptions is not None and payload not in state.applied_exceptions:
+        state.applied_exceptions.append(payload)
     return None
 
 

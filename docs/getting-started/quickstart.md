@@ -85,6 +85,17 @@ If you already have a Snyk, Dependabot, Trivy, Grype, OSV-Scanner, or pip-audit 
 
 ## Option C: Inspect package inventory and supply-chain risk
 
+Start with one read-only posture check:
+
+```bash
+ca9 protect --repo .
+```
+
+This reports which dependency workflows ca9 can enforce, whether the local
+package feed and policy exceptions are healthy, and whether package or GitHub
+Actions findings block the repository. Use `-f json`, `-f markdown`, or
+`-f sarif` for CI artifacts.
+
 Use `inventory` to see what ca9 knows about packages, artifact hashes, and dependency
 edges:
 

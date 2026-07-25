@@ -18,7 +18,7 @@ from ca9.core.models import (
     package_key as normalized_package_key,
 )
 from ca9.models import Vulnerability
-from ca9.package_policy import action_for_mode
+from ca9.package_policy import PolicyException, action_for_mode, find_policy_exception
 
 DEFAULT_TRUSTED_INDEXES = ("https://pypi.org/simple", "https://registry.npmjs.org")
 BLOCKING_SIGNALS = {"malware", "untrusted_registry"}
@@ -44,6 +44,7 @@ class SupplyChainPolicy:
     warn_on_missing_artifact_metadata: bool = True
     warn_on_sdist_only: bool = True
     warn_on_mutable_source: bool = True
+    exceptions: tuple[PolicyException, ...] = ()
 
 
 def analyze_supply_chain(
@@ -131,15 +132,67 @@ def evaluate_supply_chain_findings(
             action = "block" if finding.signal_type in BLOCKING_SIGNALS else "warn"
         if not finding.metadata.get("mode_applied"):
             action = action_for_mode(action, active_policy.mode)
+        policy_id = str(finding.metadata.get("policy_id") or f"ca9.{finding.signal_type}")
+        reason = str(finding.metadata.get("reason") or _default_reason(finding))
+        exception = find_policy_exception(
+            active_policy.exceptions,
+            policy_id=policy_id,
+            ecosystem=_finding_ecosystem(finding),
+            package=_optional_metadata_string(finding, "package"),
+            version=_optional_metadata_string(finding, "version"),
+        )
+        decision_evidence: tuple[Evidence, ...] = ()
+        if exception is not None and action != "pass":
+            original_action = action
+            action = exception.action
+            decision_evidence = (_policy_exception_evidence(exception, original_action),)
+            reason = (
+                f"{reason}; exception owned by {exception.owner} applies until "
+                f"{exception.expires}: {exception.reason}"
+            )
         decisions.append(
             Decision(
                 action=action,
                 finding_fingerprint=finding.fingerprint,
-                reason=str(finding.metadata.get("reason") or _default_reason(finding)),
-                policy_id=str(finding.metadata.get("policy_id") or f"ca9.{finding.signal_type}"),
+                reason=reason,
+                policy_id=policy_id,
+                evidence=decision_evidence,
             )
         )
     return decisions
+
+
+def _finding_ecosystem(finding: Finding) -> str | None:
+    if ":" not in finding.package_key:
+        return None
+    return finding.package_key.split(":", 1)[0].lower()
+
+
+def _optional_metadata_string(finding: Finding, key: str) -> str | None:
+    value = finding.metadata.get(key)
+    return str(value) if value is not None else None
+
+
+def _policy_exception_evidence(
+    exception: PolicyException,
+    original_action: str,
+) -> Evidence:
+    return Evidence(
+        kind="policy_exception",
+        description=(
+            f"{exception.owner} accepted this {exception.policy_id} decision until "
+            f"{exception.expires}"
+        ),
+        source=SourceEvidence(
+            source="ca9 package policy",
+            path=exception.source,
+            reader="ca9 policy exception matcher",
+        ),
+        metadata={
+            **exception.to_dict(),
+            "original_action": original_action,
+        },
+    )
 
 
 def _artifact_source_findings(package: Package, policy: SupplyChainPolicy) -> list[Finding]:

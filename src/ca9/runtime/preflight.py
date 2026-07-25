@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -11,6 +12,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
 
 from ca9.package_feed import (
     FeedError,
@@ -22,7 +25,11 @@ from ca9.package_feed import (
     lookup_release_time,
     release_window_covers,
 )
-from ca9.package_policy import PackagePolicy, action_for_mode
+from ca9.package_policy import (
+    PackagePolicy,
+    action_for_mode,
+    find_policy_exception,
+)
 from ca9.readers.package_lock import read_package_lock
 
 RUN_SCHEMA = "ca9.run.v1"
@@ -62,9 +69,18 @@ SUPPORTED_PIP_BOOL_FLAGS = {
     "--upgrade",
     "-U",
     "--pre",
+    "--require-hashes",
     "--no-cache-dir",
     "--disable-pip-version-check",
 }
+PIP_REQUIREMENT_FLAGS = {"-r", "--requirement"}
+PIP_CONSTRAINT_FLAGS = {"-c", "--constraint"}
+MAX_PIP_REQUIREMENT_DEPTH = 16
+_PIP_HASH_RE = re.compile(
+    r"(?:^|\s)--hash(?:=|\s+)"
+    r"(?P<hash>(?:sha256:[0-9a-fA-F]{64}|sha384:[0-9a-fA-F]{96}|sha512:[0-9a-fA-F]{128}))"
+    r"(?=\s|$)"
+)
 SUPPORTED_NPM_FLAGS_WITH_VALUE = {
     "--registry",
     "--tag",
@@ -126,6 +142,8 @@ class PackageRequest:
     raw_spec: str
     version_spec: str | None = None
     exact_version: str | None = None
+    source_path: str | None = None
+    hashes: tuple[str, ...] = ()
 
     @property
     def key(self) -> str:
@@ -143,6 +161,10 @@ class PackageRequest:
             data["version_spec"] = self.version_spec
         if self.exact_version:
             data["exact_version"] = self.exact_version
+        if self.source_path:
+            data["source_path"] = self.source_path
+        if self.hashes:
+            data["hashes"] = list(self.hashes)
         return data
 
 
@@ -285,6 +307,12 @@ class RuntimePreflightError(ValueError):
         self.policy_id = policy_id
 
 
+@dataclass(frozen=True)
+class _ParsedPipRequirement:
+    request: PackageRequest
+    requirement: Requirement
+
+
 def parse_install_command(
     command: tuple[str, ...] | list[str],
     *,
@@ -305,7 +333,7 @@ def parse_install_command(
         )
 
     if _is_pip_install(args):
-        requests, registry_sources = _parse_pip_install(args)
+        requests, registry_sources = _parse_pip_install(args, cwd=cwd or Path.cwd())
         return RuntimeCommand(
             family="pip",
             command=args,
@@ -357,6 +385,7 @@ def evaluate_runtime_preflight(
     if feed and feed.snapshot:
         decisions.extend(_malware_decisions(parsed, policy, feed.snapshot, feed_cache_dir))
         decisions.extend(_package_age_decisions(parsed, policy, feed.snapshot, now=now))
+    decisions = _apply_runtime_policy_exceptions(decisions, parsed, policy, now=now)
 
     secrets = detect_secret_env(active_env)
     stripped: tuple[str, ...] = ()
@@ -371,6 +400,49 @@ def evaluate_runtime_preflight(
         stripped_secret_names=stripped,
         feed=feed,
     )
+
+
+def _apply_runtime_policy_exceptions(
+    decisions: list[RuntimeDecision],
+    command: RuntimeCommand,
+    policy: PackagePolicy,
+    *,
+    now: datetime | None,
+) -> list[RuntimeDecision]:
+    ecosystem = "pypi" if command.family == "pip" else command.family
+    applied: list[RuntimeDecision] = []
+    for decision in decisions:
+        if decision.action == "pass" or not decision.package:
+            applied.append(decision)
+            continue
+        exception = find_policy_exception(
+            policy.exceptions,
+            policy_id=decision.policy_id,
+            ecosystem=ecosystem,
+            package=decision.package,
+            version=decision.version,
+            now=now,
+        )
+        if exception is None:
+            applied.append(decision)
+            continue
+        evidence = dict(decision.evidence or {})
+        evidence["policy_exception"] = {
+            **exception.to_dict(),
+            "original_action": decision.action,
+        }
+        applied.append(
+            replace(
+                decision,
+                action=exception.action,
+                reason=(
+                    f"{decision.reason}; exception owned by {exception.owner} applies "
+                    f"until {exception.expires}: {exception.reason}"
+                ),
+                evidence=evidence,
+            )
+        )
+    return applied
 
 
 def child_environment(env: dict[str, str], preflight: RuntimePreflight) -> dict[str, str]:
@@ -392,11 +464,18 @@ def primary_registry_url(command: RuntimeCommand) -> str | None:
     return None
 
 
-def gateway_child_command(command: RuntimeCommand) -> tuple[str, ...]:
+def gateway_child_command(
+    command: RuntimeCommand,
+    *,
+    registry_url: str | None = None,
+) -> tuple[str, ...]:
     if command.family == "npm":
         return _strip_option_values(command.command, {"--registry"})
     if command.family == "pip":
-        return _strip_option_values(command.command, {"--index-url", "-i"})
+        stripped = _strip_option_values(command.command, {"--index-url", "-i"})
+        if registry_url:
+            return (*stripped, "--index-url", registry_url)
+        return stripped
     return command.command
 
 
@@ -611,18 +690,425 @@ def _parse_npm_install(
     return [_parse_npm_spec(spec) for spec in specs], registry_sources
 
 
-def _parse_pip_install(args: tuple[str, ...]) -> tuple[list[PackageRequest], list[RegistrySource]]:
+def _parse_pip_install(
+    args: tuple[str, ...],
+    *,
+    cwd: Path,
+) -> tuple[list[PackageRequest], list[RegistrySource]]:
     start = 2 if args[0] == "pip" else 4
-    specs, registry_sources = _collect_specs(
-        args[start:],
-        bool_flags=SUPPORTED_PIP_BOOL_FLAGS,
-        flags_with_value=SUPPORTED_PIP_FLAGS_WITH_VALUE,
-        registry_flags={"--index-url", "-i"},
-        unsupported_source_flags=UNSUPPORTED_PIP_SOURCE_FLAGS,
-        manager="pip",
-        ecosystem="pypi",
-    )
-    return [_parse_pip_spec(spec) for spec in specs], registry_sources
+    repo_path = cwd.resolve()
+    requirements: list[_ParsedPipRequirement] = []
+    constraints: dict[str, list[Requirement]] = {}
+    registry_sources: list[RegistrySource] = []
+    visited_files: set[tuple[Path, bool]] = set()
+    active_files: set[Path] = set()
+
+    index = start
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            raise RuntimePreflightError(
+                "pip install argument terminator is unsupported because it can bypass "
+                "gateway option enforcement"
+            )
+
+        file_option = _pip_file_option(arg)
+        if file_option is not None:
+            flag_name, inline_value = file_option
+            value, index = _pip_option_value(args, index, flag_name, inline_value)
+            _read_pip_requirement_file(
+                value,
+                is_constraint=flag_name in PIP_CONSTRAINT_FLAGS,
+                base_dir=repo_path,
+                repo_path=repo_path,
+                requirements=requirements,
+                constraints=constraints,
+                registry_sources=registry_sources,
+                visited_files=visited_files,
+                active_files=active_files,
+                depth=0,
+            )
+            index += 1
+            continue
+
+        if arg.startswith("-"):
+            flag_name = arg.split("=", 1)[0]
+            if flag_name in UNSUPPORTED_PIP_SOURCE_FLAGS:
+                raise RuntimePreflightError(
+                    f"pip source option is not supported by ca9 run yet: {flag_name}"
+                )
+            if flag_name in SUPPORTED_PIP_FLAGS_WITH_VALUE:
+                inline_value = arg.split("=", 1)[1] if "=" in arg else None
+                value, index = _pip_option_value(args, index, flag_name, inline_value)
+                if flag_name in {"--index-url", "-i"}:
+                    registry_sources.append(
+                        RegistrySource(
+                            ecosystem="pypi",
+                            kind="pypi-index",
+                            url=value,
+                            option=flag_name,
+                        )
+                    )
+            elif flag_name not in SUPPORTED_PIP_BOOL_FLAGS:
+                raise RuntimePreflightError(f"unsupported pip install option: {arg}")
+            index += 1
+            continue
+
+        requirements.append(_parse_pip_requirement(arg))
+        index += 1
+
+    active_requirements = [
+        parsed for parsed in requirements if _requirement_marker_applies(parsed.requirement)
+    ]
+    if not active_requirements:
+        raise RuntimePreflightError(
+            "pip install command did not include an applicable direct package spec"
+        )
+    return _apply_pip_constraints(active_requirements, constraints), registry_sources
+
+
+def _pip_file_option(arg: str) -> tuple[str, str | None] | None:
+    for flag_name in ("--requirement", "--constraint"):
+        if arg == flag_name:
+            return flag_name, None
+        if arg.startswith(f"{flag_name}="):
+            return flag_name, arg.split("=", 1)[1]
+    for flag_name in ("-r", "-c"):
+        if arg == flag_name:
+            return flag_name, None
+        if arg.startswith(flag_name) and len(arg) > len(flag_name):
+            value = arg[len(flag_name) :]
+            return flag_name, value.removeprefix("=")
+    return None
+
+
+def _pip_option_value(
+    args: tuple[str, ...],
+    index: int,
+    flag_name: str,
+    inline_value: str | None,
+) -> tuple[str, int]:
+    if inline_value is not None:
+        value = inline_value
+    else:
+        index += 1
+        if index >= len(args):
+            raise RuntimePreflightError(f"pip install option needs a value: {flag_name}")
+        value = args[index]
+    if not value.strip():
+        raise RuntimePreflightError(f"pip install option needs a value: {flag_name}")
+    return value, index
+
+
+def _read_pip_requirement_file(
+    raw_path: str,
+    *,
+    is_constraint: bool,
+    base_dir: Path,
+    repo_path: Path,
+    requirements: list[_ParsedPipRequirement],
+    constraints: dict[str, list[Requirement]],
+    registry_sources: list[RegistrySource],
+    visited_files: set[tuple[Path, bool]],
+    active_files: set[Path],
+    depth: int,
+) -> None:
+    if depth > MAX_PIP_REQUIREMENT_DEPTH:
+        raise RuntimePreflightError(
+            f"pip requirement include depth exceeds {MAX_PIP_REQUIREMENT_DEPTH}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    path = _resolve_pip_requirement_path(raw_path, base_dir=base_dir, repo_path=repo_path)
+    if path in active_files:
+        raise RuntimePreflightError(
+            f"pip requirement include cycle detected at {_relative_path(path, repo_path)}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    visit_key = (path, is_constraint)
+    if visit_key in visited_files:
+        return
+    visited_files.add(visit_key)
+    active_files.add(path)
+
+    try:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RuntimePreflightError(
+                f"cannot read pip requirement file {_relative_path(path, repo_path)}: {exc}",
+                policy_id="ca9.runtime.requirements_unavailable",
+            ) from exc
+
+        source_path = _relative_path(path, repo_path)
+        for line_number, raw_line in _logical_pip_requirement_lines(content):
+            line = _strip_pip_requirement_comment(raw_line)
+            if not line:
+                continue
+
+            try:
+                tokens = tuple(shlex.split(line, comments=False, posix=True))
+            except ValueError as exc:
+                raise RuntimePreflightError(
+                    f"invalid quoting in {source_path}:{line_number}: {exc}",
+                    policy_id="ca9.runtime.requirements_unavailable",
+                ) from exc
+            if not tokens:
+                continue
+
+            include_option = _pip_file_option(tokens[0])
+            if include_option is not None:
+                flag_name, inline_value = include_option
+                value = _requirement_line_option_value(
+                    tokens,
+                    flag_name=flag_name,
+                    inline_value=inline_value,
+                    source_path=source_path,
+                    line_number=line_number,
+                )
+                _read_pip_requirement_file(
+                    value,
+                    is_constraint=flag_name in PIP_CONSTRAINT_FLAGS,
+                    base_dir=path.parent,
+                    repo_path=repo_path,
+                    requirements=requirements,
+                    constraints=constraints,
+                    registry_sources=registry_sources,
+                    visited_files=visited_files,
+                    active_files=active_files,
+                    depth=depth + 1,
+                )
+                continue
+
+            flag_name = tokens[0].split("=", 1)[0]
+            if flag_name in UNSUPPORTED_PIP_SOURCE_FLAGS:
+                raise RuntimePreflightError(
+                    f"pip source option is not supported in {source_path}: {flag_name}",
+                    policy_id="ca9.runtime.requirements_unavailable",
+                )
+            if flag_name in SUPPORTED_PIP_FLAGS_WITH_VALUE:
+                inline_value = tokens[0].split("=", 1)[1] if "=" in tokens[0] else None
+                value = _requirement_line_option_value(
+                    tokens,
+                    flag_name=flag_name,
+                    inline_value=inline_value,
+                    source_path=source_path,
+                    line_number=line_number,
+                )
+                if flag_name in {"--index-url", "-i"}:
+                    registry_sources.append(
+                        RegistrySource(
+                            ecosystem="pypi",
+                            kind="pypi-index",
+                            url=value,
+                            option=f"{source_path}:{line_number}:{flag_name}",
+                        )
+                    )
+                continue
+            if flag_name in SUPPORTED_PIP_BOOL_FLAGS:
+                if len(tokens) != 1:
+                    raise RuntimePreflightError(
+                        f"unexpected value after {flag_name} in {source_path}:{line_number}",
+                        policy_id="ca9.runtime.requirements_unavailable",
+                    )
+                continue
+            if tokens[0].startswith("-"):
+                raise RuntimePreflightError(
+                    f"unsupported pip requirement option in "
+                    f"{source_path}:{line_number}: {tokens[0]}",
+                    policy_id="ca9.runtime.requirements_unavailable",
+                )
+
+            requirement_text, hashes = _extract_pip_hashes(
+                line,
+                source_path=source_path,
+                line_number=line_number,
+            )
+            parsed = _parse_pip_requirement(
+                requirement_text,
+                source_path=source_path,
+                hashes=hashes,
+            )
+            if is_constraint:
+                if hashes:
+                    raise RuntimePreflightError(
+                        f"constraint entries cannot contain hashes in {source_path}:{line_number}",
+                        policy_id="ca9.runtime.requirements_unavailable",
+                    )
+                constraints.setdefault(parsed.request.name, []).append(parsed.requirement)
+            else:
+                requirements.append(parsed)
+    finally:
+        active_files.remove(path)
+
+
+def _resolve_pip_requirement_path(
+    raw_path: str,
+    *,
+    base_dir: Path,
+    repo_path: Path,
+) -> Path:
+    candidate_text = raw_path.strip()
+    if (
+        not candidate_text
+        or "\x00" in candidate_text
+        or candidate_text.startswith("~")
+        or "$" in candidate_text
+        or urlparse(candidate_text).scheme
+    ):
+        raise RuntimePreflightError(
+            f"pip requirement file must be a local repository path: {raw_path!r}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    try:
+        candidate = Path(candidate_text)
+        path = (candidate if candidate.is_absolute() else base_dir / candidate).resolve()
+    except OSError as exc:
+        raise RuntimePreflightError(
+            f"cannot resolve pip requirement file {raw_path!r}: {exc}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        ) from exc
+    if not path.is_relative_to(repo_path):
+        raise RuntimePreflightError(
+            f"pip requirement file escapes the repository: {raw_path!r}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    if not path.is_file():
+        raise RuntimePreflightError(
+            f"pip requirement file does not exist: {_relative_path(path, repo_path)}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    return path
+
+
+def _relative_path(path: Path, repo_path: Path) -> str:
+    try:
+        return path.relative_to(repo_path).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _logical_pip_requirement_lines(content: str) -> tuple[tuple[int, str], ...]:
+    logical_lines: list[tuple[int, str]] = []
+    buffer = ""
+    start_line = 1
+    for line_number, raw_line in enumerate(content.splitlines(), start=1):
+        stripped = raw_line.rstrip()
+        if not buffer:
+            start_line = line_number
+        if stripped.endswith("\\"):
+            buffer += stripped[:-1] + " "
+            continue
+        logical_lines.append((start_line, buffer + raw_line))
+        buffer = ""
+    if buffer:
+        logical_lines.append((start_line, buffer))
+    return tuple(logical_lines)
+
+
+def _strip_pip_requirement_comment(line: str) -> str:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return ""
+    return re.sub(r"\s+#.*$", "", stripped).strip()
+
+
+def _requirement_line_option_value(
+    tokens: tuple[str, ...],
+    *,
+    flag_name: str,
+    inline_value: str | None,
+    source_path: str,
+    line_number: int,
+) -> str:
+    expected_length = 1 if inline_value is not None else 2
+    if len(tokens) != expected_length:
+        raise RuntimePreflightError(
+            f"{flag_name} needs exactly one value in {source_path}:{line_number}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    value = inline_value if inline_value is not None else tokens[1]
+    if not value:
+        raise RuntimePreflightError(
+            f"{flag_name} needs a value in {source_path}:{line_number}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    return value
+
+
+def _extract_pip_hashes(
+    line: str,
+    *,
+    source_path: str,
+    line_number: int,
+) -> tuple[str, tuple[str, ...]]:
+    hashes = tuple(match.group("hash").lower() for match in _PIP_HASH_RE.finditer(line))
+    requirement_text = _PIP_HASH_RE.sub("", line).strip()
+    if "--hash" in requirement_text:
+        raise RuntimePreflightError(
+            f"invalid or unsupported pip hash in {source_path}:{line_number}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    return requirement_text, hashes
+
+
+def _apply_pip_constraints(
+    requirements: list[_ParsedPipRequirement],
+    constraints: dict[str, list[Requirement]],
+) -> list[PackageRequest]:
+    requests: list[PackageRequest] = []
+    for parsed in requirements:
+        applicable_constraints = [
+            constraint
+            for constraint in constraints.get(parsed.request.name, ())
+            if _requirement_marker_applies(constraint)
+        ]
+        if not applicable_constraints:
+            requests.append(parsed.request)
+            continue
+
+        combined = [parsed.requirement, *applicable_constraints]
+        specifier_parts = [str(item.specifier) for item in combined if str(item.specifier)]
+        combined_specifier = SpecifierSet(",".join(specifier_parts))
+        exact_versions = {
+            specifier.version
+            for item in combined
+            for specifier in item.specifier
+            if specifier.operator in {"==", "==="} and "*" not in specifier.version
+        }
+        if len(exact_versions) > 1:
+            raise RuntimePreflightError(
+                f"conflicting exact constraints for pip package {parsed.request.name}",
+                policy_id="ca9.runtime.requirements_unavailable",
+            )
+        exact_version = next(iter(exact_versions), None)
+        if exact_version is not None:
+            try:
+                exact_allowed = combined_specifier.contains(exact_version, prereleases=True)
+            except (TypeError, ValueError):
+                exact_allowed = False
+            if not exact_allowed:
+                raise RuntimePreflightError(
+                    f"pip constraints exclude exact version {parsed.request.name}=={exact_version}",
+                    policy_id="ca9.runtime.requirements_unavailable",
+                )
+        requests.append(
+            replace(
+                parsed.request,
+                version_spec=str(combined_specifier) or None,
+                exact_version=exact_version,
+            )
+        )
+    return requests
+
+
+def _requirement_marker_applies(requirement: Requirement) -> bool:
+    if requirement.marker is None:
+        return True
+    try:
+        return requirement.marker.evaluate()
+    except (KeyError, TypeError, ValueError):
+        # Unknown marker environments should stay visible to policy rather than bypass it.
+        return True
 
 
 def _collect_specs(
@@ -977,6 +1463,15 @@ def _parse_npm_spec(spec: str) -> PackageRequest:
 
 
 def _parse_pip_spec(spec: str) -> PackageRequest:
+    return _parse_pip_requirement(spec).request
+
+
+def _parse_pip_requirement(
+    spec: str,
+    *,
+    source_path: str | None = None,
+    hashes: tuple[str, ...] = (),
+) -> _ParsedPipRequirement:
     if _is_direct_or_local_spec(spec) or "://" in spec:
         raise RuntimePreflightError(f"unsupported pip direct or local package spec: {spec}")
     try:
@@ -985,15 +1480,24 @@ def _parse_pip_spec(spec: str) -> PackageRequest:
         raise RuntimePreflightError(f"invalid pip package spec {spec!r}: {exc}") from exc
     exact_version = None
     version_spec = str(requirement.specifier) or None
-    exact_specs = [item.version for item in requirement.specifier if item.operator == "=="]
+    exact_specs = [
+        item.version
+        for item in requirement.specifier
+        if item.operator in {"==", "==="} and "*" not in item.version
+    ]
     if len(exact_specs) == 1 and len(list(requirement.specifier)) == 1:
         exact_version = exact_specs[0]
-    return PackageRequest(
-        ecosystem="pypi",
-        name=requirement.name.lower().replace("_", "-"),
-        raw_spec=spec,
-        version_spec=version_spec,
-        exact_version=exact_version,
+    return _ParsedPipRequirement(
+        request=PackageRequest(
+            ecosystem="pypi",
+            name=canonicalize_name(requirement.name),
+            raw_spec=spec,
+            version_spec=version_spec,
+            exact_version=exact_version,
+            source_path=source_path,
+            hashes=hashes,
+        ),
+        requirement=requirement,
     )
 
 
