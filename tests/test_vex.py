@@ -51,7 +51,7 @@ class TestVEXStatusMapping:
         assert stmt["status"] == "not_affected"
         assert stmt["justification"] == "component_not_present"
 
-    def test_unreachable_dynamic_maps_to_not_affected_execute_path(self):
+    def test_unreachable_dynamic_maps_to_under_investigation(self):
         report = Report(
             results=[
                 VerdictResult(
@@ -65,8 +65,8 @@ class TestVEXStatusMapping:
         )
         data = json.loads(write_openvex(report))
         stmt = data["statements"][0]
-        assert stmt["status"] == "not_affected"
-        assert stmt["justification"] == "vulnerable_code_not_in_execute_path"
+        assert stmt["status"] == "under_investigation"
+        assert "justification" not in stmt
 
     def test_inconclusive_maps_to_under_investigation(self):
         report = Report(
@@ -138,7 +138,8 @@ class TestVEXJustifications:
             repo_path=".",
         )
         data = json.loads(write_openvex(report))
-        assert data["statements"][0]["justification"] == "vulnerable_code_not_in_execute_path"
+        assert data["statements"][0]["status"] == "under_investigation"
+        assert "justification" not in data["statements"][0]
 
 
 class TestVEXImpactStatement:

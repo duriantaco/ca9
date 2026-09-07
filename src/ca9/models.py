@@ -102,6 +102,10 @@ class Evidence:
     threat_intel: ThreatIntelData | None = None
     production_observed: bool | None = None
     production_trace_count: int = 0
+    # Presence in the coverage report is not proof of complete instrumentation.
+    coverage_scope: str = "unavailable"
+    coverage_measured_files: tuple[str, ...] = ()
+    coverage_unmeasured_targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

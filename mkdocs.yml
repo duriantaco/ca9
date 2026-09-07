@@ -68,6 +68,7 @@ nav:
   - User Guide:
       - CLI Reference: guide/cli.md
       - Supply-Chain Vetting: guide/supply-chain.md
+      - Dependency Update Review: guide/dependency-review.md
       - Supported Formats: guide/formats.md
       - Dynamic Analysis: guide/coverage.md
       - Proof Standards: guide/proof-standards.md

@@ -87,6 +87,11 @@ covered: dict[str, list[int]] = get_covered_files(data)
 # {'/path/to/site-packages/flask/app.py': [1, 2, 5, 10, ...], ...}
 ```
 
+This execution-only view omits zero-hit files. The verdict engine also reads
+`get_measured_files(data)` and calls `observe_coverage` to retain missing statements
+and distinguish unreported or partial affected scope. Strict mode keeps test
+non-execution inconclusive regardless of the report's overall percentage.
+
 ### Package execution check
 
 ```python

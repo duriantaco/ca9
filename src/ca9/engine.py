@@ -16,12 +16,13 @@ from ca9.analysis.ast_scanner import (
     resolve_transitive_deps,
 )
 from ca9.analysis.coverage_reader import (
+    FileCoverage,
     are_call_sites_covered,
     get_coverage_completeness,
     get_covered_files,
-    is_package_executed,
-    is_submodule_executed,
+    get_measured_files,
     load_coverage,
+    observe_coverage,
 )
 from ca9.analysis.vuln_matcher import extract_affected_component
 from ca9.intel_rules import VulnIntelResolution, resolve_vuln_intel
@@ -36,8 +37,6 @@ from ca9.models import (
 )
 from ca9.scoring import compute_confidence
 from ca9.version import check_version
-
-STRICT_DYNAMIC_MIN_COVERAGE = 80.0
 
 
 def _report_dependency_kind(vuln: Vulnerability) -> str | None:
@@ -81,23 +80,11 @@ def _apply_proof_standard(result: VerdictResult, proof_standard: str) -> Verdict
                 "came from the ambient environment rather than the report"
             )
     elif result.verdict == Verdict.UNREACHABLE_DYNAMIC:
-        if evidence.coverage_completeness_pct is None:
-            adjustment = (
-                "strict proof downgraded this suppression because coverage completeness is unknown"
-            )
-        elif evidence.coverage_completeness_pct < STRICT_DYNAMIC_MIN_COVERAGE:
-            adjustment = (
-                "strict proof downgraded this suppression because coverage completeness "
-                f"is below {STRICT_DYNAMIC_MIN_COVERAGE:.0f}%"
-            )
-        elif (
-            evidence.dependency_kind == "transitive"
-            and evidence.dependency_graph_source == "environment"
-        ):
-            adjustment = (
-                "strict proof downgraded this suppression because the transitive dependency "
-                "graph came from the ambient environment rather than the report"
-            )
+        adjustment = (
+            "strict proof downgraded this suppression because non-execution in the supplied "
+            "tests does not prove unreachability; overall coverage percentage cannot establish "
+            "that all affected execution paths were exercised"
+        )
 
     if adjustment is None:
         return result
@@ -132,6 +119,7 @@ def collect_evidence(
     production_observed: bool | None = None,
     production_trace_count: int = 0,
     global_warnings: tuple[str, ...] = (),
+    measured_files: dict[str, FileCoverage] | None = None,
 ) -> Evidence:
     warnings: list[str] = list(global_warnings)
 
@@ -201,19 +189,39 @@ def collect_evidence(
 
     coverage_seen: bool | None = None
     coverage_files: tuple[str, ...] = ()
+    coverage_scope = "unavailable"
+    coverage_measured_files: tuple[str, ...] = ()
+    coverage_unmeasured_targets: tuple[str, ...] = ()
 
-    if covered_files is not None and package_imported:
-        if has_submodule_info:
-            executed, matching_files = is_submodule_executed(
-                component.submodule_paths, component.file_hints, covered_files
+    if covered_files is not None:
+        # Legacy callers supplying execution alone can establish a positive
+        # observation, but cannot reconstruct explicit missing statements.
+        measurement = (
+            measured_files
+            if measured_files is not None
+            else {
+                path: FileCoverage(executed_lines=tuple(lines))
+                for path, lines in covered_files.items()
+            }
+        )
+        observation = observe_coverage(
+            vuln.package_name,
+            measurement,
+            component.submodule_paths if has_submodule_info else (),
+            component.file_hints if has_submodule_info else (),
+        )
+        coverage_seen = observation.seen
+        coverage_files = observation.executed_files
+        coverage_scope = observation.scope
+        coverage_measured_files = observation.measured_files
+        coverage_unmeasured_targets = observation.unmeasured_targets
+        if observation.unmeasured_targets:
+            warnings.append(
+                "coverage report lacks executable statement evidence for "
+                + ", ".join(observation.unmeasured_targets)
+                + "; include the affected code in coverage source and check run/report "
+                "omit settings before collecting fresh coverage"
             )
-        else:
-            executed, matching_files = is_package_executed(vuln.package_name, covered_files)
-        coverage_seen = executed
-        if matching_files:
-            coverage_files = tuple(matching_files)
-        else:
-            coverage_files = ()
 
     if component.warnings:
         warnings.extend(component.warnings)
@@ -238,9 +246,14 @@ def collect_evidence(
                 api_usage_confidence = max(h.confidence for h in api_hits)
 
                 if covered_files is not None:
-                    call_sites = [(h.file_path, h.line) for h in api_hits]
+                    call_sites = [(h.file_path, h.line) for h in call_hits]
                     sites_covered, _cov_count, _total = are_call_sites_covered(
-                        call_sites, covered_files
+                        call_sites,
+                        covered_files,
+                        missing_files={
+                            path: list(info.missing_lines)
+                            for path, info in (measured_files or {}).items()
+                        },
                     )
                     api_call_sites_covered = sites_covered
         elif intel.api_targets:
@@ -270,6 +283,9 @@ def collect_evidence(
         threat_intel=threat_intel_data,
         production_observed=production_observed,
         production_trace_count=production_trace_count,
+        coverage_scope=coverage_scope,
+        coverage_measured_files=coverage_measured_files,
+        coverage_unmeasured_targets=coverage_unmeasured_targets,
     )
 
 
@@ -297,6 +313,61 @@ def derive_verdict(
             affected_component=component,
             evidence=evidence,
         )
+
+    if evidence.dependency_kind == "direct":
+        trace = f"'{import_name}' is directly imported"
+    elif evidence.package_imported:
+        trace = f"'{vuln.package_name}' is a dependency of {dep_of}"
+    else:
+        trace = f"'{vuln.package_name}' was not detected by static import analysis"
+
+    has_submodule_info = component.submodule_paths and component.confidence in ("high", "medium")
+
+    # Observed execution takes precedence over an incomplete static import view.
+    # The affected-version check above remains independent of execution evidence.
+    if has_coverage and evidence.api_usage_seen is True and evidence.api_call_sites_covered is True:
+        return VerdictResult(
+            vulnerability=vuln,
+            verdict=Verdict.REACHABLE,
+            reason=f"{trace}, vulnerable API call sites executed in tests",
+            imported_as=import_name,
+            executed_files=list(evidence.coverage_files),
+            dependency_of=dep_of,
+            affected_component=component,
+            evidence=evidence,
+        )
+
+    if has_coverage and evidence.coverage_seen is True:
+        verdict = Verdict.REACHABLE
+        if has_submodule_info:
+            detail = f"submodule code was executed in {len(evidence.coverage_files)} file(s)"
+        elif evidence.api_usage_seen is True:
+            detail = f"{len(evidence.api_usage_hits)} vulnerable API call(s) found"
+            if evidence.api_call_sites_covered is False:
+                # Package execution alone does not establish an affected API call.
+                verdict = Verdict.INCONCLUSIVE
+                detail += ", but call sites not executed in tests"
+            else:
+                detail += f", and code executed in {len(evidence.coverage_files)} file(s)"
+        else:
+            detail = f"code was executed in {len(evidence.coverage_files)} file(s)"
+        return VerdictResult(
+            vulnerability=vuln,
+            verdict=verdict,
+            reason=f"{trace} and {detail}",
+            imported_as=import_name,
+            executed_files=list(evidence.coverage_files),
+            dependency_of=dep_of,
+            affected_component=component,
+            evidence=evidence,
+        )
+
+    if evidence.production_observed is True and (
+        not evidence.package_imported or has_submodule_info and evidence.submodule_imported is False
+    ):
+        # A package-level production observation refutes absence, but does not
+        # identify which affected submodule or API executed.
+        return _inconclusive_coverage(vuln, evidence, import_name, component, dep_of, trace)
 
     if not evidence.package_imported:
         if evidence.declared_direct_dependency:
@@ -334,13 +405,6 @@ def derive_verdict(
             evidence=evidence,
         )
 
-    if evidence.dependency_kind == "direct":
-        trace = f"'{import_name}' is directly imported"
-    else:
-        trace = f"'{vuln.package_name}' is a dependency of {dep_of}"
-
-    has_submodule_info = component.submodule_paths and component.confidence in ("high", "medium")
-
     if has_submodule_info:
         if evidence.submodule_imported is False:
             submod_list = ", ".join(component.submodule_paths)
@@ -365,46 +429,21 @@ def derive_verdict(
                 evidence=evidence,
             )
 
-        if evidence.coverage_seen:
-            return VerdictResult(
-                vulnerability=vuln,
-                verdict=Verdict.REACHABLE,
-                reason=(
-                    f"{trace} and submodule code was executed "
-                    f"in {len(evidence.coverage_files)} file(s)"
-                ),
-                imported_as=import_name,
-                executed_files=list(evidence.coverage_files),
-                dependency_of=dep_of,
-                affected_component=component,
-                evidence=evidence,
-            )
-        else:
+        if evidence.coverage_seen is False and evidence.production_observed is not True:
             submod_list = ", ".join(component.submodule_paths)
             return VerdictResult(
                 vulnerability=vuln,
                 verdict=Verdict.UNREACHABLE_DYNAMIC,
-                reason=(f"{trace}, {submod_list} imported but 0 files executed in tests"),
+                reason=(f"{trace}; no execution observed in reported statements for {submod_list}"),
                 imported_as=import_name,
                 dependency_of=dep_of,
                 affected_component=component,
                 evidence=evidence,
             )
+        return _inconclusive_coverage(vuln, evidence, import_name, component, dep_of, trace)
 
     if evidence.api_usage_seen is True:
         api_detail = f"{len(evidence.api_usage_hits)} vulnerable API call(s) found"
-
-        if has_coverage and evidence.api_call_sites_covered is True:
-            return VerdictResult(
-                vulnerability=vuln,
-                verdict=Verdict.REACHABLE,
-                reason=f"{trace}, {api_detail}, and call sites executed in tests",
-                imported_as=import_name,
-                executed_files=list(evidence.coverage_files),
-                dependency_of=dep_of,
-                affected_component=component,
-                evidence=evidence,
-            )
 
         if has_coverage and evidence.api_call_sites_covered is False:
             return VerdictResult(
@@ -412,18 +451,6 @@ def derive_verdict(
                 verdict=Verdict.INCONCLUSIVE,
                 reason=f"{trace}, {api_detail}, but call sites not executed in tests",
                 imported_as=import_name,
-                dependency_of=dep_of,
-                affected_component=component,
-                evidence=evidence,
-            )
-
-        if has_coverage and evidence.coverage_seen:
-            return VerdictResult(
-                vulnerability=vuln,
-                verdict=Verdict.REACHABLE,
-                reason=f"{trace}, {api_detail}, and code executed in {len(evidence.coverage_files)} file(s)",
-                imported_as=import_name,
-                executed_files=list(evidence.coverage_files),
                 dependency_of=dep_of,
                 affected_component=component,
                 evidence=evidence,
@@ -450,27 +477,49 @@ def derive_verdict(
             evidence=evidence,
         )
 
-    if evidence.coverage_seen:
-        return VerdictResult(
-            vulnerability=vuln,
-            verdict=Verdict.REACHABLE,
-            reason=(f"{trace} and code was executed in {len(evidence.coverage_files)} file(s)"),
-            imported_as=import_name,
-            executed_files=list(evidence.coverage_files),
-            dependency_of=dep_of,
-            affected_component=component,
-            evidence=evidence,
-        )
-    else:
+    if evidence.coverage_seen is False and evidence.production_observed is not True:
         return VerdictResult(
             vulnerability=vuln,
             verdict=Verdict.UNREACHABLE_DYNAMIC,
-            reason=f"{trace}, but no code was executed in tests",
+            reason=f"{trace}; no execution observed in the package statements in this coverage report",
             imported_as=import_name,
             dependency_of=dep_of,
             affected_component=component,
             evidence=evidence,
         )
+    return _inconclusive_coverage(vuln, evidence, import_name, component, dep_of, trace)
+
+
+def _inconclusive_coverage(
+    vuln: Vulnerability,
+    evidence: Evidence,
+    import_name: str,
+    component: AffectedComponent,
+    dep_of: str | None,
+    trace: str,
+) -> VerdictResult:
+    if evidence.production_observed is True:
+        detail = (
+            "production traces observed this package; test non-execution cannot establish "
+            "its absence, and affected-code execution is unconfirmed"
+        )
+    else:
+        targets = ", ".join(evidence.coverage_unmeasured_targets) or import_name
+        detail = (
+            f"affected-code measurement for {targets} is {evidence.coverage_scope} "
+            "in the coverage report; "
+            "include the affected code in coverage source, check omit settings, and collect "
+            "fresh coverage; missing measurement cannot establish non-execution"
+        )
+    return VerdictResult(
+        vulnerability=vuln,
+        verdict=Verdict.INCONCLUSIVE,
+        reason=f"{trace}; {detail}",
+        imported_as=import_name,
+        dependency_of=dep_of,
+        affected_component=component,
+        evidence=evidence,
+    )
 
 
 def analyze(
@@ -489,10 +538,12 @@ def analyze(
     analysis_warnings: list[str] = []
 
     covered_files: dict[str, list[int]] | None = None
+    measured_files: dict[str, FileCoverage] | None = None
     coverage_completeness: float | None = None
     if coverage_path:
         coverage_data = load_coverage(coverage_path)
         covered_files = get_covered_files(coverage_data)
+        measured_files = get_measured_files(coverage_data)
         coverage_completeness = get_coverage_completeness(coverage_data)
 
     vuln_intel: dict[str, VulnIntelResolution] = {}
@@ -590,6 +641,7 @@ def analyze(
             production_observed=prod_observed,
             production_trace_count=prod_count,
             global_warnings=tuple(analysis_warnings),
+            measured_files=measured_files,
         )
 
         if evidence.dependency_kind == "transitive":

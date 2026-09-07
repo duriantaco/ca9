@@ -105,14 +105,13 @@ CVE ID               Package   Severity  Verdict
 --------------------------------------------------------------
 GHSA-cpwx-vrp4-4pq7  Jinja2    high      REACHABLE
 GHSA-frmv-pr5f-9mcr  Django    critical  UNREACHABLE (static)
-GHSA-mrwq-x4v8-fh7p  Pygments  medium    UNREACHABLE (dynamic)
+GHSA-mrwq-x4v8-fh7p  Pygments  medium    INCONCLUSIVE
 --------------------------------------------------------------
-Total: 61  |  Reachable: 25  |  Unreachable: 36  |  Inconclusive: 0
-
-59% of flagged CVEs are unreachable — only 25 of 61 require action
+Illustrative verdicts: reachable, statically unreachable, or requiring more evidence
 ```
 
-36 CVEs eliminated. No manual triage. No guessing.
+Strict mode keeps test non-execution inconclusive. Every finding retains its
+evidence and an explanation of what is still unknown.
 
 ## How it works
 
@@ -133,11 +132,15 @@ For each CVE:
   └── YES → Is the package, affected submodule, or known vulnerable API used?
       ├── NO, with enough graph/import evidence → UNREACHABLE (static)
       ├── YES, and runtime/coverage confirms execution → REACHABLE
-      ├── YES, but coverage shows no affected execution → UNREACHABLE (dynamic)
+      ├── YES, but affected execution is unobserved or unmeasured → INCONCLUSIVE (strict)
       └── Not enough evidence → INCONCLUSIVE
 ```
 
-ca9 is **conservative** — it only marks something unreachable when it can prove it. Every verdict comes with an evidence trail and a confidence score so you can see exactly why ca9 reached its conclusion.
+ca9's default **strict** mode does not treat test non-execution as proof of
+unreachability, even at 100% overall coverage. Balanced mode can retain a scoped
+dynamic heuristic when explicit statement evidence exists. OpenVEX exports that
+heuristic as `under_investigation`. Every verdict includes an evidence trail and
+a confidence score explaining the decision.
 
 ## Where ca9 fits
 
@@ -173,10 +176,15 @@ pip workflows.**
 | Vetting | Gates untrusted registries, dependency confusion, missing hashes, direct URL/Git/mutable sources, local feed malware, optional OSV malware queries, package age, workflow risk, artifact code heuristics, and license policy. |
 | Protection posture | `ca9 protect` detects dependency workflows, validates enforceable npm locks and pip requirements, reports unsupported managers, feed readiness, expired exceptions, package-policy decisions, and local GitHub Actions risks in table, JSON, Markdown, or SARIF. |
 | Artifact analysis | Hash-verifies and safely unpacks Python wheels/sdists and npm tarballs; scans Python startup/install/import-time behavior and npm lifecycle, encoded execution, and credential exfiltration patterns without executing package code. |
+| Dependency update review | `ca9 review` compares npm v2/v3 lockfiles and verified release artifacts, highlights new lifecycle hooks, entry points, dependencies, and static observations, and reports incomplete comparisons explicitly. |
 | Runtime prevention | Supports lockfile-backed `ca9 run -- npm ci`, local `-r` requirements and `-c` constraints, plus direct `npm install ...`, `npm i ...`, `pip install ...`, and `python -m pip install ...` specs; checks policy before execution; strips or blocks secrets; mediates npm/PyPI metadata through loopback gateways when a feed is available. |
 | Feeds and audit | Installs `ca9.feed.v1` package-intelligence bundles into `~/.cache/ca9/feed`; verifies snapshot hashes; records redacted runtime audit JSONL including preflight decisions, feed use, gateway use, denied versions/links, and child process exit. |
 
 ## Real-world results
+
+These historical results predate the stricter coverage-scope rules. Current
+strict-mode results can include more inconclusive findings where earlier runs
+used test non-execution to suppress alerts.
 
 ### Django REST Framework — 37 CVEs, 19% noise
 
@@ -250,6 +258,22 @@ and exception expiry, evaluates package-policy findings, and scans local GitHub
 Actions workflows by default. Missing enforceable locks and blocking policy
 decisions exit `1`; unsupported managers and other review items are warnings.
 Use `--no-scan-workflows` when the report should cover dependency posture only.
+
+### Review behavior changes in a dependency update
+
+```bash
+git show main:package-lock.json > /tmp/base-package-lock.json
+ca9 review --base /tmp/base-package-lock.json --head package-lock.json
+ca9 review --base /tmp/base-package-lock.json --head package-lock.json -f json
+```
+
+ca9 compares changed npm dependency occurrences using hash-verified registry
+tarballs, without executing package code. The report highlights changes to
+lifecycle hooks, executable and startup declarations, dependencies, and supported
+static observations. Existing observations do not become new alerts merely
+because a package version or source line number changes. Missing artifacts and
+inspection gaps remain explicit; a pass covers only the declared comparison
+scope. See the [dependency review guide](docs/guide/dependency-review.md).
 
 ### Run supply-chain risk checks
 
@@ -577,8 +601,8 @@ ca9 check pip-audit.json --repo .
 |---------|---------------|------------|
 | `REACHABLE` | Evidence shows the vulnerable package, component, or known API is reachable | **Fix this** |
 | `UNREACHABLE (static)` | Package is never imported — not even transitively | Suppress with confidence |
-| `UNREACHABLE (dynamic)` | Package is imported but vulnerable code was never executed | Likely safe — monitor |
-| `INCONCLUSIVE` | Imported but no coverage data to prove execution | Add coverage or review manually |
+| `UNREACHABLE (dynamic)` | Balanced-mode heuristic: no execution observed in reported affected statements | Review the observation's scope; it is not proof of unreachability |
+| `INCONCLUSIVE` | Evidence is insufficient, including missing measurement or strict-mode test non-execution | Inspect evidence gaps and review manually |
 
 ## Evidence and confidence
 
@@ -590,9 +614,11 @@ Every verdict is backed by structured evidence. Use `--show-confidence` to see s
 | `version_in_range` | Is the installed version within the affected range (PEP 440)? |
 | `package_imported` | Is the package imported anywhere in the repo? |
 | `submodule_imported` | Is the specific vulnerable submodule imported? |
-| `coverage_seen` | Was the vulnerable code executed during tests? |
+| `coverage_seen` | Execution observed (`true`), reported non-execution (`false`), or unknown (`null`) |
+| `coverage_scope` | Whether affected targets have usable statement evidence in the report |
+| `coverage_measured_files` / `coverage_unmeasured_targets` | Matching statement records and targets still lacking them |
 | `api_call_sites_covered` | Were specific vulnerable API call sites executed in tests? |
-| `coverage_completeness_pct` | Overall test coverage percentage — weights dynamic absence signals |
+| `coverage_completeness_pct` | Overall test coverage percentage, retained as context; it does not establish dependency measurement or strengthen absence confidence |
 | `affected_component_source` | How was the vulnerable component identified (commit analysis, curated mapping, regex, class scan)? |
 
 Confidence scoring is **verdict-directional** — evidence that supports the verdict boosts the score, evidence that contradicts it lowers it. A high confidence UNREACHABLE is different from a high confidence REACHABLE.
@@ -611,6 +637,7 @@ ca9 scan [OPTIONS]              Scan repository dependency versions via OSV.dev
 ca9 check SCA_REPORT [OPTIONS]  Analyze a supported SCA JSON report
 ca9 inventory [PATH] [OPTIONS]  Show normalized package inventory
 ca9 protect [PATH] [OPTIONS]    Report dependency-install protection posture
+ca9 review --base FILE --head FILE  Review npm dependency behavior changes
 ca9 vet [PATH] [OPTIONS]        Run package supply-chain risk checks
 ca9 run [OPTIONS] -- COMMAND    Preflight and run supported package-manager installs
 ca9 scripts audit [DIRECTORY]   Audit dependency install scripts for npm allowlists
