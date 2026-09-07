@@ -4,16 +4,9 @@ from ca9.models import Evidence, Verdict, VerdictResult
 
 
 def _coverage_trust(ev: Evidence) -> float:
-    if ev.coverage_completeness_pct is None:
-        return 0.5
-    pct = ev.coverage_completeness_pct
-    if pct >= 80:
-        return 1.0  # high trust
-    if pct >= 50:
-        return 0.7
-    if pct >= 30:
-        return 0.4  # low trust
-    return 0.2
+    # Overall test coverage says nothing about unreported dependency code or
+    # untested inputs. Even reported non-execution is only scoped evidence.
+    return 0.5 if ev.coverage_scope == "reported" and ev.coverage_seen is False else 0.0
 
 
 def _api_usage_boost(ev: Evidence) -> int:

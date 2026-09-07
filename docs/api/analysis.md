@@ -63,6 +63,30 @@ Loads and returns the raw coverage JSON data.
 ### `get_covered_files(coverage_data) -> dict[str, list[int]]`
 
 Extracts a mapping of `{filename: [executed_line_numbers]}` from coverage data.
+Zero-hit files are excluded from this execution-only view. An absent file is not
+evidence that it was measured or could not execute.
+
+### `get_measured_files(coverage_data) -> dict[str, FileCoverage]`
+
+Preserves reported executed and missing statements, including explicit zero-hit
+files. Excluded lines do not count as missing statements. Empty or malformed
+records cannot establish non-execution.
+
+### `observe_coverage(package_name, measured_files, submodule_paths=(), file_hints=()) -> CoverageObservation`
+
+Returns affected-target scope, observed execution, matching statement files, and
+targets without usable statement evidence. `seen` is `True` for observed execution,
+`False` for scoped non-execution, and `None` for insufficient measurement. A
+`reported` scope does not attest to complete instrumentation or source identity.
+See [measurement evidence](../guide/coverage.md#measurement-evidence).
+
+### `are_call_sites_covered(call_sites, covered_files, *, missing_files=None) -> tuple[bool | None, int, int]`
+
+Returns `(observed_execution, executed_count, measured_count)`. A positive result
+requires at least one unambiguously matched executed call-site line. A negative
+result requires explicit missing-line evidence for every requested call site.
+Partial, excluded, or ambiguous measurement otherwise returns `None`. Supplying
+execution-only data without `missing_files` cannot establish a negative result.
 
 ### `is_package_executed(package_name, covered_files) -> tuple[bool, list[str]]`
 

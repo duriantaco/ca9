@@ -34,6 +34,7 @@ from ca9.package_policy import PackagePolicy, action_for_mode, find_policy_excep
 
 DEFAULT_PYPI_UPSTREAM = "https://pypi.org"
 GATEWAY_SCHEMA = "ca9.pypi.gateway.v1"
+EVALUATION_FAILURE_POLICY_ID = "ca9.pypi_gateway_evaluation_failed"
 
 
 @dataclass(frozen=True)
@@ -50,7 +51,26 @@ class PyPIGatewayDecision:
             "version": self.version,
             "policy_id": self.policy_id,
             "reason": self.reason,
-            "href": self.href,
+            "href": _sanitize_url_for_evidence(self.href),
+        }
+
+
+@dataclass(frozen=True)
+class PyPIGatewayEvaluationFailure:
+    package: str
+    reason: str
+    failure_kind: str
+    policy_id: str = EVALUATION_FAILURE_POLICY_ID
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "package": self.package,
+            "policy_id": self.policy_id,
+            "reason": self.reason,
+            "evidence": {
+                "ecosystem": "pypi",
+                "failure_kind": self.failure_kind,
+            },
         }
 
 
@@ -64,11 +84,13 @@ class PyPIGatewayState:
     rewrite_count: int = 0
     removed_links: list[PyPIGatewayDecision] | None = None
     applied_exceptions: list[dict[str, Any]] | None = None
+    evaluation_failures: list[PyPIGatewayEvaluationFailure] | None = None
 
     def __post_init__(self) -> None:
         self.upstream_base = _normalize_upstream_base(self.upstream_base)
         self.removed_links = []
         self.applied_exceptions = []
+        self.evaluation_failures = []
 
 
 class PyPISimpleGateway:
@@ -125,7 +147,7 @@ class PyPISimpleGateway:
         return {
             "schema_version": GATEWAY_SCHEMA,
             "index_url": self.index_url if self._server is not None else None,
-            "upstream_base": self.state.upstream_base,
+            "upstream_base": _sanitize_url_for_evidence(self.state.upstream_base),
             "feed_state": self.state.feed.state if self.state.feed else None,
             "feed_snapshot": self.state.feed.snapshot.snapshot_id
             if self.state.feed and self.state.feed.snapshot
@@ -133,6 +155,9 @@ class PyPISimpleGateway:
             "rewrite_count": self.state.rewrite_count,
             "removed_links": [item.to_dict() for item in self.state.removed_links or []],
             "applied_exceptions": list(self.state.applied_exceptions or []),
+            "evaluation_failures": [
+                item.to_dict() for item in self.state.evaluation_failures or []
+            ],
         }
 
 
@@ -151,12 +176,37 @@ def should_start_pypi_gateway(
 
 def pypi_gateway_child_env(env: dict[str, str], index_url: str) -> dict[str, str]:
     child_env = dict(env)
+    no_proxy = _loopback_no_proxy(child_env)
+    for key in list(child_env):
+        if key.lower() == "pip_proxy":
+            child_env.pop(key)
     child_env["PIP_INDEX_URL"] = index_url
+    child_env["PIP_PYPI_URL"] = index_url
     child_env["PIP_TRUSTED_HOST"] = urllib.parse.urlparse(index_url).hostname or "127.0.0.1"
     child_env["PIP_CONFIG_FILE"] = os.devnull
     child_env.pop("PIP_EXTRA_INDEX_URL", None)
     child_env.pop("PIP_FIND_LINKS", None)
+    child_env.pop("PIP_REQUIREMENT", None)
+    child_env.pop("PIP_CONSTRAINT", None)
+    child_env.pop("PIP_BUILD_CONSTRAINT", None)
+    child_env.pop("PIP_REQUIREMENTS_FROM_SCRIPT", None)
+    child_env.pop("PIP_EDITABLE", None)
+    child_env.pop("PIP_GROUP", None)
+    child_env["NO_PROXY"] = no_proxy
+    child_env["no_proxy"] = no_proxy
     return child_env
+
+
+def _loopback_no_proxy(env: dict[str, str]) -> str:
+    values: list[str] = []
+    for name, value in env.items():
+        if name.lower() != "no_proxy":
+            continue
+        values.extend(item.strip() for item in value.split(",") if item.strip())
+    for host in ("127.0.0.1", "localhost", "::1", "[::1]"):
+        if host not in values:
+            values.append(host)
+    return ",".join(values)
 
 
 def _handler_for_state(state: PyPIGatewayState):
@@ -192,11 +242,34 @@ def _handler_for_state(state: PyPIGatewayState):
                 return
 
             output = body
-            if rewrite and status == 200 and _looks_like_html(headers):
-                package_name = _package_from_simple_path(self.path)
-                rewritten = (
-                    _rewrite_simple_html(body, package_name, state) if package_name else None
-                )
+            package_name = _package_from_simple_path(self.path)
+            if rewrite and 200 <= status < 400 and package_name:
+                if not _looks_like_html(headers):
+                    _deny_project_page(
+                        self,
+                        state,
+                        PyPIGatewayEvaluationFailure(
+                            package=package_name,
+                            failure_kind="unsupported_content_type",
+                            reason=("PyPI project page is not HTML and cannot be safely evaluated"),
+                        ),
+                        include_body=include_body,
+                    )
+                    return
+                try:
+                    rewritten = _rewrite_simple_html(body, package_name, state)
+                except _ProjectPageEvaluationError as exc:
+                    _deny_project_page(
+                        self,
+                        state,
+                        PyPIGatewayEvaluationFailure(
+                            package=package_name,
+                            failure_kind=exc.failure_kind,
+                            reason=exc.reason,
+                        ),
+                        include_body=include_body,
+                    )
+                    return
                 if rewritten is not None:
                     output = rewritten
                     headers = dict(headers)
@@ -212,8 +285,36 @@ def _handler_for_state(state: PyPIGatewayState):
     return Handler
 
 
+class _ProjectPageEvaluationError(Exception):
+    def __init__(self, failure_kind: str, reason: str) -> None:
+        super().__init__(reason)
+        self.failure_kind = failure_kind
+        self.reason = reason
+
+
+def _deny_project_page(
+    handler: BaseHTTPRequestHandler,
+    state: PyPIGatewayState,
+    failure: PyPIGatewayEvaluationFailure,
+    *,
+    include_body: bool,
+) -> None:
+    if state.evaluation_failures is not None and failure not in state.evaluation_failures:
+        state.evaluation_failures.append(failure)
+    body = b"PyPI project page could not be safely evaluated\n"
+    handler.send_response(403)
+    handler.send_header("Content-Type", "text/plain; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    if include_body:
+        handler.wfile.write(body)
+
+
 def _fetch_upstream(url: str) -> tuple[int, dict[str, str], bytes]:
-    request = urllib.request.Request(url, headers={"Accept": "text/html"})
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/vnd.pypi.simple.v1+html, text/html"},
+    )
     with urllib.request.urlopen(request, timeout=30) as response:
         return response.status, dict(response.headers.items()), response.read()
 
@@ -226,23 +327,43 @@ def _rewrite_simple_html(
     try:
         text = body.decode("utf-8")
     except UnicodeDecodeError:
-        return None
+        raise _ProjectPageEvaluationError(
+            "invalid_utf8",
+            "PyPI project page is not valid UTF-8 and cannot be safely evaluated",
+        ) from None
     links = _SimpleLinksParser()
     links.feed(text)
-    if not links.links:
-        return None
+    links.close()
+    if not links.saw_markup:
+        raise _ProjectPageEvaluationError(
+            "invalid_html",
+            "PyPI project page is not valid HTML and cannot be safely evaluated",
+        )
+    if links.failure is not None:
+        raise _ProjectPageEvaluationError(*links.failure)
 
     feed = _ensure_feed(state)
-    if feed is None or feed.snapshot is None:
-        return None
+    if feed.snapshot is None:
+        feed_state = feed.state
+        if feed_state not in {"missing", "tampered"}:
+            feed_state = "unavailable"
+        raise _ProjectPageEvaluationError(
+            f"feed_{feed_state}",
+            f"PyPI policy feed is {feed_state} and the project page cannot be safely evaluated",
+        )
 
     kept: list[_SimpleLink] = []
     removed: list[PyPIGatewayDecision] = []
     for link in links.links:
         version = _version_from_href(link.href, package_name)
         if version is None:
-            kept.append(link)
-            continue
+            raise _ProjectPageEvaluationError(
+                "unparseable_distribution_link",
+                (
+                    "PyPI project page contains a distribution link with an unparseable "
+                    "filename or version"
+                ),
+            )
         decision = _denied_version(
             package_name, version, link.href, state.policy, feed.snapshot, state
         )
@@ -260,12 +381,8 @@ def _rewrite_simple_html(
     return _render_simple_page(package_name, kept).encode("utf-8")
 
 
-def _ensure_feed(state: PyPIGatewayState) -> FeedStatus | None:
-    if state.feed is not None:
-        return state.feed
+def _ensure_feed(state: PyPIGatewayState) -> FeedStatus:
     state.feed = feed_status(policy=state.policy, cache_dir=state.feed_cache_dir, now=state.now)
-    if state.feed.state == "tampered":
-        return None
     return state.feed
 
 
@@ -402,36 +519,73 @@ class _SimpleLinksParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.links: list[_SimpleLink] = []
-        self._active_attrs: tuple[tuple[str, str | None], ...] | None = None
+        self.saw_markup = False
+        self.failure: tuple[str, str] | None = None
+        self._anchor_open = False
+        self._active_link_index: int | None = None
         self._active_text: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() == "a":
-            self._active_attrs = tuple(attrs)
-            self._active_text = []
+        self.saw_markup = True
+        if tag.lower() != "a":
+            return
+        if self._anchor_open:
+            self._fail(
+                "invalid_anchor_structure",
+                "PyPI project page contains nested anchor elements",
+            )
+            return
+
+        self._anchor_open = True
+        self._active_link_index = None
+        self._active_text = []
+        hrefs = [value for name, value in attrs if name.lower() == "href"]
+        if len(hrefs) > 1:
+            self._fail(
+                "duplicate_href",
+                "PyPI project page contains an anchor with duplicate href attributes",
+            )
+            return
+        if not hrefs or not hrefs[0]:
+            return
+        self.links.append(_SimpleLink(href=hrefs[0], text="", attrs=tuple(attrs)))
+        self._active_link_index = len(self.links) - 1
 
     def handle_data(self, data: str) -> None:
-        if self._active_attrs is not None:
+        if self._anchor_open and self._active_link_index is not None:
             self._active_text.append(data)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.lower() != "a" or self._active_attrs is None:
+        if tag.lower() != "a":
             return
-        href = ""
-        for name, value in self._active_attrs:
-            if name.lower() == "href" and value:
-                href = value
-                break
-        if href:
-            self.links.append(
-                _SimpleLink(
-                    href=href,
-                    text="".join(self._active_text),
-                    attrs=self._active_attrs,
-                )
+        if not self._anchor_open:
+            self._fail(
+                "invalid_anchor_structure",
+                "PyPI project page contains an unmatched closing anchor",
             )
-        self._active_attrs = None
+            return
+        if self._active_link_index is not None:
+            active = self.links[self._active_link_index]
+            self.links[self._active_link_index] = _SimpleLink(
+                href=active.href,
+                text="".join(self._active_text),
+                attrs=active.attrs,
+            )
+        self._anchor_open = False
+        self._active_link_index = None
         self._active_text = []
+
+    def close(self) -> None:
+        super().close()
+        if self._anchor_open:
+            self._fail(
+                "invalid_anchor_structure",
+                "PyPI project page contains an unclosed anchor element",
+            )
+
+    def _fail(self, failure_kind: str, reason: str) -> None:
+        if self.failure is None:
+            self.failure = (failure_kind, reason)
 
 
 def _render_simple_page(package_name: str, links: list[_SimpleLink]) -> str:
@@ -463,7 +617,7 @@ def _render_attrs(attrs: tuple[tuple[str, str | None], ...]) -> str:
 def _package_from_simple_path(path: str) -> str | None:
     parsed = urllib.parse.urlparse(path)
     parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) < 2 or parts[0] != "simple":
+    if len(parts) != 2 or parts[0] != "simple":
         return None
     return str(canonicalize_name(urllib.parse.unquote(parts[1])))
 
@@ -487,6 +641,24 @@ def _version_from_href(href: str, package_name: str) -> str | None:
 def _href_path(href: str) -> str:
     parsed = urllib.parse.urlparse(href)
     return urllib.parse.unquote(parsed.path)
+
+
+def _sanitize_url_for_evidence(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return "[redacted-invalid-url]"
+    hostname = parsed.hostname
+    if hostname is None:
+        netloc = "" if not parsed.netloc else "[redacted]"
+    else:
+        rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        netloc = f"{rendered_host}:{port}" if port is not None else rendered_host
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 def _normalize_upstream_base(value: str) -> str:
@@ -516,7 +688,13 @@ def _looks_like_html(headers: dict[str, str]) -> bool:
         if key.lower() == "content-type":
             content_type = value.lower()
             break
-    return not content_type or "html" in content_type
+    if not content_type:
+        return True
+    media_type = content_type.split(";", 1)[0].strip()
+    return media_type in {
+        "text/html",
+        "application/vnd.pypi.simple.v1+html",
+    }
 
 
 def _is_loopback_client(host: str) -> bool:

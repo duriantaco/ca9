@@ -20,8 +20,9 @@ ca9 check snyk-report.json --repo . --proof-standard strict
 Examples:
 
 - A transitive dependency relationship comes only from the ambient Python environment.
-- Coverage exists, but total coverage is below the strict threshold.
-- Coverage data does not include completeness totals.
+- Test coverage records no execution of affected code, even when statements are explicitly reported and the overall percentage is 100%.
+
+Test non-execution remains `INCONCLUSIVE`: exercising one set of tests cannot establish unreachability across other inputs or environments. Overall coverage percentages do not change this decision.
 
 ## Balanced
 
@@ -29,7 +30,13 @@ Examples:
 ca9 check snyk-report.json --repo . --proof-standard balanced
 ```
 
-`balanced` keeps more `UNREACHABLE` verdicts when the evidence points that way. It is useful for triage, demos, and finding where better coverage or dependency manifests would improve confidence.
+`balanced` can retain `UNREACHABLE (dynamic)` as a scoped heuristic when the relevant affected scope has explicit statement evidence and no execution was observed. That verdict describes the supplied report and tests; it does not establish that the code cannot execute. It is useful for local triage and identifying where additional tests would help.
+
+Missing, partial, empty, or excluded-only affected scope cannot justify a dynamic suppression under either standard. Positive execution evidence remains relevant even when other targets are missing. The [coverage guide](coverage.md) explains the `coverage_scope`, `coverage_measured_files`, and `coverage_unmeasured_targets` evidence fields.
+
+The `reported` scope means each selected affected target has statement evidence. It does not assert complete instrumentation or matching source/build identity. Source revision and build attestation checks are not implemented.
+
+OpenVEX exports all dynamic verdicts as `under_investigation`, including balanced results. Changing proof standards cannot turn test non-execution into a `not_affected` statement.
 
 ## Recommendation
 

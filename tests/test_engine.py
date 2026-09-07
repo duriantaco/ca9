@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
 from ca9.engine import analyze, derive_verdict
 from ca9.models import (
     AffectedComponent,
     ApiUsageHit,
     Evidence,
+    Report,
     Verdict,
     VersionRange,
     Vulnerability,
@@ -50,7 +53,8 @@ class TestAnalyze:
         vulns = [_make_vuln("PyYAML")]
         report = analyze(vulns, sample_repo, coverage_path)
         assert report.results[0].verdict == Verdict.INCONCLUSIVE
-        assert report.results[0].original_verdict == Verdict.UNREACHABLE_DYNAMIC
+        assert report.results[0].original_verdict is None
+        assert report.results[0].evidence.coverage_scope == "no_statements"
 
     def test_full_snyk_report(self, sample_repo, snyk_path):
         from ca9.parsers.snyk import SnykParser
@@ -285,7 +289,7 @@ class TestSubmoduleAnalysis:
         assert r.verdict == Verdict.REACHABLE
         assert r.affected_component is not None
 
-    def test_submodule_not_executed_unreachable_dynamic(self, tmp_path):
+    def test_unreported_submodule_is_inconclusive_despite_high_total_coverage(self, tmp_path):
         repo = tmp_path / "repo"
         repo.mkdir()
         (repo / "app.py").write_text("from django.contrib.admin import site\n")
@@ -307,13 +311,16 @@ class TestSubmoduleAnalysis:
         vulns = [_make_vuln("Django", title="XSS in Django admin")]
         report = analyze(vulns, repo, cov_file)
         r = report.results[0]
-        assert r.verdict == Verdict.UNREACHABLE_DYNAMIC
+        assert r.verdict == Verdict.INCONCLUSIVE
+        assert r.evidence.coverage_seen is None
+        assert r.evidence.coverage_scope == "not_reported"
         assert "django.contrib.admin" in r.reason
 
-    def test_balanced_mode_keeps_unreachable_dynamic(self, sample_repo, coverage_path):
+    def test_balanced_requires_executable_statement_evidence(self, sample_repo, coverage_path):
         vulns = [_make_vuln("PyYAML")]
         report = analyze(vulns, sample_repo, coverage_path, proof_standard="balanced")
-        assert report.results[0].verdict == Verdict.UNREACHABLE_DYNAMIC
+        assert report.results[0].verdict == Verdict.INCONCLUSIVE
+        assert report.results[0].evidence.coverage_seen is None
 
     def test_low_confidence_falls_back_to_package_level(self, sample_repo, coverage_path):
         vulns = [_make_vuln("requests", title="An unspecified vulnerability")]
@@ -438,6 +445,62 @@ class TestApiCallSiteCoverage:
             has_coverage=True,
         )
         assert result.verdict == Verdict.REACHABLE
+
+    def test_positive_api_observation_survives_unreported_module_in_vex(self):
+        from ca9.vex import write_openvex
+
+        evidence = Evidence(
+            package_imported=True,
+            dependency_kind="direct",
+            submodule_imported=True,
+            api_usage_seen=True,
+            api_call_sites_covered=True,
+            api_targets=("requests.api.get",),
+            api_usage_hits=(
+                ApiUsageHit(file_path="app.py", line=10, matched_target="requests.api.get"),
+            ),
+            coverage_scope="not_reported",
+            coverage_unmeasured_targets=("requests.api",),
+        )
+        component = AffectedComponent(
+            package_import_name="requests",
+            submodule_paths=("requests.api",),
+            confidence="high",
+        )
+        result = derive_verdict(
+            _make_vuln("requests"), evidence, "requests", component, None, has_coverage=True
+        )
+
+        assert result.verdict == Verdict.REACHABLE
+        statement = json.loads(write_openvex(Report(results=[result], repo_path=".")))[
+            "statements"
+        ][0]
+        assert statement["status"] == "affected"
+        assert statement["ca9"]["evidence_summary"]["api_call_sites_covered"] is True
+        assert statement["ca9"]["evidence_summary"]["api_targets"] == ["requests.api.get"]
+
+    @pytest.mark.parametrize("submodules", [(), ("requests.api",)])
+    def test_production_observation_prevents_dynamic_absence_claim(self, submodules):
+        evidence = Evidence(
+            package_imported=True,
+            dependency_kind="direct",
+            submodule_imported=True if submodules else None,
+            coverage_seen=False,
+            coverage_scope="reported",
+            production_observed=True,
+            production_trace_count=1,
+        )
+        component = AffectedComponent(
+            package_import_name="requests",
+            submodule_paths=submodules,
+            confidence="high" if submodules else "low",
+        )
+        result = derive_verdict(
+            _make_vuln("requests"), evidence, "requests", component, None, has_coverage=True
+        )
+
+        assert result.verdict == Verdict.INCONCLUSIVE
+        assert "production traces observed" in result.reason
 
 
 class TestVersionRangeFiltering:

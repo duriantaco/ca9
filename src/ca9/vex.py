@@ -12,19 +12,16 @@ from ca9.models import PolicyIgnoredResult, Report, Verdict, VerdictResult
 _VEX_STATUS = {
     Verdict.REACHABLE: "affected",
     Verdict.UNREACHABLE_STATIC: "not_affected",
-    Verdict.UNREACHABLE_DYNAMIC: "not_affected",
+    Verdict.UNREACHABLE_DYNAMIC: "under_investigation",
     Verdict.INCONCLUSIVE: "under_investigation",
 }
 
 
 def _derive_justification(result: VerdictResult) -> str | None:
-    if result.verdict not in (Verdict.UNREACHABLE_STATIC, Verdict.UNREACHABLE_DYNAMIC):
+    if result.verdict != Verdict.UNREACHABLE_STATIC:
         return None
 
     ev = result.evidence
-
-    if result.verdict == Verdict.UNREACHABLE_DYNAMIC:
-        return "vulnerable_code_not_in_execute_path"
 
     # UNREACHABLE_STATIC cases
     if ev is None:
@@ -165,6 +162,11 @@ def _build_statement(
             "dependency_kind": ev.dependency_kind,
             "dependency_graph_source": ev.dependency_graph_source,
             "coverage_seen": ev.coverage_seen,
+            "coverage_scope": ev.coverage_scope,
+            "coverage_measured_files": list(ev.coverage_measured_files),
+            "coverage_unmeasured_targets": list(ev.coverage_unmeasured_targets),
+            "api_call_sites_covered": ev.api_call_sites_covered,
+            "api_targets": list(ev.api_targets),
             "coverage_completeness_pct": ev.coverage_completeness_pct,
             "submodule_imported": ev.submodule_imported,
         }

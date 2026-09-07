@@ -5,11 +5,13 @@ import json
 import os
 import sys
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import pytest
 from click.testing import CliRunner
 
 from ca9.cli import main
@@ -28,7 +30,7 @@ def test_pypi_gateway_removes_malware_wheel_link(tmp_path):
 <!doctype html>
 <html><body>
 <a href="https://files.example/badlib-0.9.0-py3-none-any.whl#sha256=abc">badlib-0.9.0-py3-none-any.whl</a>
-<a href="https://files.example/badlib-1.0.0-py3-none-any.whl#sha256=def" data-requires-python=">=3.10">badlib-1.0.0-py3-none-any.whl</a>
+<a href="https://files.example/badlib-1.0.0-py3-none-any.whl?X-Amz-Signature=do-not-log#sha256=def" data-requires-python=">=3.10">badlib-1.0.0-py3-none-any.whl</a>
 </body></html>
 """
     upstream = _FakePyPIRegistry(html)
@@ -50,6 +52,20 @@ def test_pypi_gateway_removes_malware_wheel_link(tmp_path):
     assert "badlib-1.0.0-py3-none-any.whl" not in body
     assert gateway.state.rewrite_count == 1
     assert gateway.state.removed_links[0].policy_id == "ca9.malware"
+    payload = gateway.to_dict()
+    assert "do-not-log" not in json.dumps(payload)
+    assert payload["removed_links"][0]["href"] == (
+        "https://files.example/badlib-1.0.0-py3-none-any.whl"
+    )
+
+
+def test_pypi_gateway_sanitizes_upstream_url_evidence():
+    gateway = PyPISimpleGateway(
+        upstream_base="https://user:secret@packages.example/simple?token=do-not-log",
+        policy=PackagePolicy(),
+    )
+
+    assert gateway.to_dict()["upstream_base"] == "https://packages.example/simple"
 
 
 def test_pypi_gateway_preserves_upstream_bytes_when_no_rewrite(tmp_path):
@@ -70,6 +86,251 @@ def test_pypi_gateway_preserves_upstream_bytes_when_no_rewrite(tmp_path):
 
     assert body == html
     assert gateway.state.rewrite_count == 0
+
+
+def test_pypi_gateway_rejects_unparseable_distribution_link(tmp_path):
+    html = b"""
+<html><body>
+<a href="badlib-1.0.0.tar.bz2?credential=do-not-log">badlib-1.0.0.tar.bz2</a>
+</body></html>
+"""
+    upstream = _FakePyPIRegistry(html)
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+
+    with (
+        upstream,
+        PyPISimpleGateway(
+            upstream_base=upstream.url,
+            policy=PackagePolicy(),
+            feed_cache_dir=cache_root / "feed",
+        ) as gateway,
+        pytest.raises(urllib.error.HTTPError) as caught,
+    ):
+        urllib.request.urlopen(gateway.index_url + "/badlib/")
+
+    assert caught.value.code == 403
+    payload = gateway.to_dict()
+    assert payload["evaluation_failures"] == [
+        {
+            "package": "badlib",
+            "policy_id": "ca9.pypi_gateway_evaluation_failed",
+            "reason": (
+                "PyPI project page contains a distribution link with an unparseable "
+                "filename or version"
+            ),
+            "evidence": {
+                "ecosystem": "pypi",
+                "failure_kind": "unparseable_distribution_link",
+            },
+        }
+    ]
+    assert "do-not-log" not in json.dumps(payload)
+
+
+def test_pypi_gateway_rejects_unclosed_distribution_anchor(tmp_path):
+    html = b'<html><body><a href="badlib-1.0.0.tar.bz2">'
+    upstream = _FakePyPIRegistry(html)
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+
+    with (
+        upstream,
+        PyPISimpleGateway(
+            upstream_base=upstream.url,
+            policy=PackagePolicy(),
+            feed_cache_dir=cache_root / "feed",
+        ) as gateway,
+        pytest.raises(urllib.error.HTTPError) as caught,
+    ):
+        urllib.request.urlopen(gateway.index_url + "/badlib/")
+
+    assert caught.value.code == 403
+    assert gateway.state.evaluation_failures[0].failure_kind == "invalid_anchor_structure"
+
+
+def test_pypi_gateway_rejects_duplicate_href_attributes(tmp_path):
+    html = (
+        b'<html><body><a href="badlib-0.9.0.tar.gz" '
+        b'href="badlib-1.0.0.tar.bz2">badlib</a></body></html>'
+    )
+    upstream = _FakePyPIRegistry(html)
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+
+    with (
+        upstream,
+        PyPISimpleGateway(
+            upstream_base=upstream.url,
+            policy=PackagePolicy(),
+            feed_cache_dir=cache_root / "feed",
+        ) as gateway,
+        pytest.raises(urllib.error.HTTPError) as caught,
+    ):
+        urllib.request.urlopen(gateway.index_url + "/badlib/")
+
+    assert caught.value.code == 403
+    assert gateway.state.evaluation_failures[0].failure_kind == "duplicate_href"
+
+
+def test_pypi_gateway_evaluates_non_200_success_response(tmp_path):
+    upstream = _FakePyPIRegistry(
+        b'<html><body><a href="badlib-1.0.0.tar.bz2">badlib</a></body></html>',
+        status=203,
+    )
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+
+    with (
+        upstream,
+        PyPISimpleGateway(
+            upstream_base=upstream.url,
+            policy=PackagePolicy(),
+            feed_cache_dir=cache_root / "feed",
+        ) as gateway,
+        pytest.raises(urllib.error.HTTPError) as caught,
+    ):
+        urllib.request.urlopen(gateway.index_url + "/badlib/")
+
+    assert caught.value.code == 403
+    assert gateway.state.evaluation_failures[0].failure_kind == "unparseable_distribution_link"
+
+
+def test_pypi_gateway_evaluates_300_project_response(tmp_path):
+    upstream = _FakePyPIRegistry(
+        b'<html><body><a href="badlib-1.0.0.tar.bz2">badlib</a></body></html>',
+        status=300,
+    )
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+
+    with (
+        upstream,
+        PyPISimpleGateway(
+            upstream_base=upstream.url,
+            policy=PackagePolicy(),
+            feed_cache_dir=cache_root / "feed",
+        ) as gateway,
+        pytest.raises(urllib.error.HTTPError) as caught,
+    ):
+        urllib.request.urlopen(gateway.index_url + "/badlib/")
+
+    assert caught.value.code == 403
+    assert gateway.state.evaluation_failures[0].failure_kind == "unparseable_distribution_link"
+
+
+def test_pypi_gateway_does_not_treat_relative_artifact_as_project_page(tmp_path):
+    artifact = b"not-html-wheel-content"
+    upstream = _FakePyPIRegistry(artifact, content_type="application/octet-stream")
+
+    with (
+        upstream,
+        PyPISimpleGateway(
+            upstream_base=upstream.url,
+            policy=PackagePolicy(),
+        ) as gateway,
+    ):
+        body = urllib.request.urlopen(
+            gateway.index_url + "/badlib/badlib-1.0.0-py3-none-any.whl"
+        ).read()
+
+    assert body == artifact
+    assert gateway.state.evaluation_failures == []
+
+
+def test_pypi_gateway_rejects_non_html_project_page_but_preserves_simple_root(tmp_path):
+    payload = b'{"meta":{"api-version":"1.0"},"files":[]}'
+    upstream = _FakePyPIRegistry(
+        payload,
+        content_type="application/vnd.pypi.simple.v1+json",
+    )
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+
+    with (
+        upstream,
+        PyPISimpleGateway(
+            upstream_base=upstream.url,
+            policy=PackagePolicy(),
+            feed_cache_dir=cache_root / "feed",
+        ) as gateway,
+    ):
+        assert urllib.request.urlopen(gateway.index_url).read() == payload
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(gateway.index_url + "/badlib/")
+
+    assert caught.value.code == 403
+    assert gateway.state.evaluation_failures[0].failure_kind == "unsupported_content_type"
+
+
+def test_pypi_gateway_rejects_non_utf8_project_page(tmp_path):
+    upstream = _FakePyPIRegistry(b"<html><body>\xff</body></html>")
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+
+    with (
+        upstream,
+        PyPISimpleGateway(
+            upstream_base=upstream.url,
+            policy=PackagePolicy(),
+            feed_cache_dir=cache_root / "feed",
+        ) as gateway,
+        pytest.raises(urllib.error.HTTPError) as caught,
+    ):
+        urllib.request.urlopen(gateway.index_url + "/badlib/")
+
+    assert caught.value.code == 403
+    assert gateway.state.evaluation_failures[0].failure_kind == "invalid_utf8"
+
+
+def test_pypi_gateway_preserves_non_200_project_response(tmp_path):
+    payload = b"project not found"
+    upstream = _FakePyPIRegistry(payload, content_type="text/plain", status=404)
+
+    with (
+        upstream,
+        PyPISimpleGateway(
+            upstream_base=upstream.url,
+            policy=PackagePolicy(),
+        ) as gateway,
+        pytest.raises(urllib.error.HTTPError) as caught,
+    ):
+        urllib.request.urlopen(gateway.index_url + "/badlib/")
+
+    assert caught.value.code == 404
+    assert caught.value.read() == payload
+    assert gateway.state.evaluation_failures == []
+
+
+@pytest.mark.parametrize("feed_state", ["missing", "tampered"])
+def test_pypi_gateway_rejects_project_page_when_feed_cannot_be_loaded(
+    tmp_path,
+    feed_state,
+):
+    html = b'<html><body><a href="badlib-0.9.0.tar.gz">badlib</a></body></html>'
+    upstream = _FakePyPIRegistry(html)
+    cache_root = tmp_path / "cache"
+    if feed_state == "tampered":
+        snapshot = update_feed_from_source(
+            _write_feed_bundle(tmp_path),
+            cache_dir=cache_root / "feed",
+        )
+        (snapshot.snapshot_dir / "pypi-malware.json").write_text('{"packages": []}\n')
+
+    with (
+        upstream,
+        PyPISimpleGateway(
+            upstream_base=upstream.url,
+            policy=PackagePolicy(),
+            feed_cache_dir=cache_root / "feed",
+        ) as gateway,
+        pytest.raises(urllib.error.HTTPError) as caught,
+    ):
+        urllib.request.urlopen(gateway.index_url + "/badlib/")
+
+    assert caught.value.code == 403
+    assert gateway.state.evaluation_failures[0].failure_kind == f"feed_{feed_state}"
+    assert gateway.to_dict()["feed_state"] == feed_state
 
 
 def test_pypi_gateway_hides_too_new_sdist_link(tmp_path):
@@ -207,17 +468,37 @@ def test_pypi_gateway_child_env_clears_alternate_sources():
     child_env = pypi_gateway_child_env(
         {
             "PIP_INDEX_URL": "https://packages.example/simple",
+            "PIP_PYPI_URL": "https://alias.example/simple",
             "PIP_EXTRA_INDEX_URL": "https://extra.example/simple",
             "PIP_FIND_LINKS": "https://files.example",
             "PIP_CONFIG_FILE": "/tmp/pip.conf",
+            "PIP_REQUIREMENT": "requirements.txt",
+            "PIP_CONSTRAINT": "constraints.txt",
+            "PIP_BUILD_CONSTRAINT": "build-constraints.txt",
+            "PIP_REQUIREMENTS_FROM_SCRIPT": "script.py",
+            "PIP_EDITABLE": "git+https://example.invalid/project.git",
+            "PIP_GROUP": "project:dev",
+            "PIP_PROXY": "http://proxy.example",
+            "NO_PROXY": "metadata.internal",
         },
         "http://127.0.0.1:12345/simple",
     )
 
     assert child_env["PIP_INDEX_URL"] == "http://127.0.0.1:12345/simple"
+    assert child_env["PIP_PYPI_URL"] == "http://127.0.0.1:12345/simple"
     assert child_env["PIP_CONFIG_FILE"] == os.devnull
     assert "PIP_EXTRA_INDEX_URL" not in child_env
     assert "PIP_FIND_LINKS" not in child_env
+    assert "PIP_REQUIREMENT" not in child_env
+    assert "PIP_CONSTRAINT" not in child_env
+    assert "PIP_BUILD_CONSTRAINT" not in child_env
+    assert "PIP_REQUIREMENTS_FROM_SCRIPT" not in child_env
+    assert "PIP_EDITABLE" not in child_env
+    assert "PIP_GROUP" not in child_env
+    assert "PIP_PROXY" not in child_env
+    assert "metadata.internal" in child_env["NO_PROXY"]
+    assert "127.0.0.1" in child_env["NO_PROXY"]
+    assert child_env["NO_PROXY"] == child_env["no_proxy"]
 
 
 def test_ca9_run_pip_uses_gateway_for_child_install(tmp_path):
@@ -289,7 +570,70 @@ strip_secret_env_for_installs = false
     assert "badlib-1.0.0-py3-none-any.whl" not in body
 
 
-def test_ca9_run_pip_requirement_file_uses_gateway_for_child_install(
+def test_ca9_run_pip_records_gateway_evaluation_failure_in_ledger(tmp_path):
+    upstream = _FakePyPIRegistry(
+        b'{"meta":{"api-version":"1.0"},"files":[]}',
+        content_type="application/vnd.pypi.simple.v1+json",
+    )
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+    bin_dir = tmp_path / "bin"
+    audit_log = tmp_path / "audit.jsonl"
+    policy_path = tmp_path / "ca9.toml"
+    policy_path.write_text(
+        """
+[registries]
+allow = ["127.0.0.1", "pypi.org", "files.pythonhosted.org"]
+
+[install_scripts]
+block_when_secrets_present = false
+
+[ci]
+strip_secret_env_for_installs = false
+"""
+    )
+    _write_fake_command(
+        bin_dir,
+        "pip",
+        "#!/bin/sh\n"
+        f'{sys.executable} -c "import os, urllib.request; '
+        "url=os.environ['PIP_INDEX_URL'].rstrip('/') + '/safe-lib/'; "
+        'urllib.request.urlopen(url).read()"\n',
+    )
+
+    with upstream:
+        result = CliRunner().invoke(
+            main,
+            [
+                "run",
+                "--policy",
+                str(policy_path),
+                "--audit-log",
+                str(audit_log),
+                "--",
+                "pip",
+                "install",
+                "--index-url",
+                upstream.url + "/simple",
+                "safe-lib",
+            ],
+            env={"CA9_CACHE_DIR": str(cache_root), "PATH": str(bin_dir)},
+        )
+
+    assert result.exit_code == 1
+    events = [json.loads(line) for line in audit_log.read_text().splitlines()]
+    failure = next(
+        event
+        for event in events
+        if event["event_kind"] == "decision_emitted"
+        and event["payload"]["policy_id"] == "ca9.pypi_gateway_evaluation_failed"
+    )
+    assert failure["payload"]["action"] == "block"
+    assert failure["payload"]["package"] == "safe-lib"
+    assert failure["payload"]["evidence"]["failure_kind"] == "unsupported_content_type"
+
+
+def test_ca9_run_pip_rejects_requirement_file_index_before_child_install(
     tmp_path,
     monkeypatch,
 ):
@@ -354,17 +698,18 @@ strip_secret_env_for_installs = false
             },
         )
 
-    assert result.exit_code == 0
-    child_args = argv_path.read_text()
-    assert child_args.startswith("install -r requirements.txt --index-url http://127.0.0.1:")
-    body = index_path.read_text()
-    assert "badlib-0.9.0-py3-none-any.whl" in body
-    assert "badlib-1.0.0-py3-none-any.whl" not in body
+    assert result.exit_code == 1
+    assert "ca9.runtime.requirements_unavailable" in result.output
+    assert "--index-url" in result.output
+    assert not argv_path.exists()
+    assert not index_path.exists()
 
 
 class _FakePyPIRegistry:
-    def __init__(self, payload: bytes):
+    def __init__(self, payload: bytes, *, content_type: str = "text/html", status: int = 200):
         self.payload = payload
+        self.content_type = content_type
+        self.status = status
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -377,11 +722,13 @@ class _FakePyPIRegistry:
 
     def __enter__(self):
         payload = self.payload
+        content_type = self.content_type
+        status = self.status
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html")
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)

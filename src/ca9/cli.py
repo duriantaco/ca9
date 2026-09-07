@@ -20,6 +20,7 @@ from ca9.models import Report
 from ca9.parsers import detect_parser
 from ca9.policy import apply_policy
 from ca9.report import write_html, write_json, write_markdown, write_sarif, write_table
+from ca9.review.cli import review_cmd
 from ca9.vex import write_openvex
 
 
@@ -651,7 +652,12 @@ def run_cmd(
             ) as gateway:
                 completed = subprocess.run(
                     list(gateway_child_command(preflight.command)),
-                    env=npm_gateway_child_env(child_env, gateway.registry_url),
+                    env=npm_gateway_child_env(
+                        child_env,
+                        gateway.registry_url,
+                        user_config_path=gateway.user_config_path,
+                        global_config_path=gateway.global_config_path,
+                    ),
                 )
                 gateway_events = _gateway_ledger_events(gateway.to_dict(), session_id=session_id)
         elif should_start_pypi_gateway(preflight.command.family, package_policy, preflight.feed):
@@ -722,7 +728,7 @@ def _gateway_ledger_events(gateway_payload: dict[str, Any], *, session_id: str):
     from ca9.runtime.preflight import LedgerEvent
 
     events = [LedgerEvent("gateway_used", gateway_payload, session_id)]
-    for key in ("removed_versions", "removed_links"):
+    for key in ("removed_versions", "removed_links", "evaluation_failures"):
         for decision in gateway_payload.get(key) or []:
             payload = {"action": "block", **decision}
             events.append(LedgerEvent("decision_emitted", payload, session_id))
@@ -2392,6 +2398,9 @@ def enrich_sbom_cmd(
         click.echo(f"Enriched SBOM written to {output_path}", err=True)
     else:
         click.echo(text)
+
+
+main.add_command(review_cmd)
 
 
 if __name__ == "__main__":

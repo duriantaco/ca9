@@ -3,14 +3,19 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import pytest
 from click.testing import CliRunner
 
+import ca9.runtime.npm_gateway as npm_gateway_module
 from ca9.cli import main
 from ca9.package_feed import update_feed_from_source
 from ca9.package_policy import (
@@ -75,6 +80,40 @@ def test_npm_gateway_preserves_upstream_bytes_when_no_rewrite(tmp_path):
 
     assert body == raw
     assert gateway.state.rewrite_count == 0
+
+
+def test_npm_gateway_evaluates_300_packument(tmp_path):
+    upstream = _FakeNpmRegistry(
+        {
+            "name": "left-pad",
+            "versions": {
+                "1.2.0": {"name": "left-pad", "version": "1.2.0"},
+                "1.3.0": {"name": "left-pad", "version": "1.3.0"},
+            },
+            "dist-tags": {"latest": "1.3.0"},
+        },
+        status=300,
+    )
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+
+    with (
+        upstream,
+        NpmMetadataGateway(
+            upstream_registry=upstream.url,
+            policy=PackagePolicy(),
+            feed_cache_dir=cache_root / "feed",
+        ) as gateway,
+    ):
+        url = urllib.parse.urlparse(gateway.registry_url)
+        connection = http.client.HTTPConnection(url.hostname, url.port)
+        connection.request("GET", "/left-pad")
+        response = connection.getresponse()
+        body = json.loads(response.read())
+
+    assert response.status == 300
+    assert set(body["versions"]) == {"1.2.0"}
+    assert body["dist-tags"]["latest"] == "1.2.0"
 
 
 def test_npm_gateway_hides_too_new_versions(tmp_path):
@@ -253,21 +292,138 @@ def test_npm_gateway_rejects_absolute_proxy_urls(tmp_path):
     assert response.status == 403
 
 
-def test_npm_gateway_child_env_overrides_registry_and_config_sources():
-    child_env = npm_gateway_child_env(
-        {
-            "NPM_CONFIG_REGISTRY": "https://packages.example",
-            "npm_config_@scope:registry": "https://scope.example",
-            "NPM_CONFIG_USERCONFIG": "/tmp/npmrc",
-        },
-        "http://127.0.0.1:12345/",
+def test_npm_gateway_child_env_uses_distinct_owned_config_files():
+    gateway = NpmMetadataGateway(policy=PackagePolicy())
+
+    with gateway:
+        user_config = gateway.user_config_path
+        global_config = gateway.global_config_path
+        child_env = npm_gateway_child_env(
+            {
+                "NPM_CONFIG_REGISTRY": "https://packages.example",
+                "npm_config_@scope:registry": "https://scope.example",
+                "NPM_CONFIG_USERCONFIG": "/tmp/npmrc",
+                "npm_config_proxy": "http://proxy.example",
+                "NPM_CONFIG_HTTPS_PROXY": "http://secure-proxy.example",
+                "NO_PROXY": "metadata.internal",
+            },
+            "http://127.0.0.1:12345/",
+            user_config_path=user_config,
+            global_config_path=global_config,
+        )
+
+        assert user_config != global_config
+        assert user_config.is_file()
+        assert global_config.is_file()
+        assert user_config.read_bytes() == b""
+        assert global_config.read_bytes() == b""
+        assert child_env["NPM_CONFIG_REGISTRY"] == "http://127.0.0.1:12345/"
+        assert child_env["npm_config_registry"] == "http://127.0.0.1:12345/"
+        assert child_env["npm_config_@scope:registry"] == "http://127.0.0.1:12345/"
+        assert child_env["NPM_CONFIG_USERCONFIG"] == str(user_config.resolve())
+        assert child_env["npm_config_userconfig"] == str(user_config.resolve())
+        assert child_env["NPM_CONFIG_GLOBALCONFIG"] == str(global_config.resolve())
+        assert child_env["npm_config_globalconfig"] == str(global_config.resolve())
+        assert child_env["npm_config_proxy"] == "false"
+        assert child_env["NPM_CONFIG_PROXY"] == "false"
+        assert child_env["npm_config_https_proxy"] == "false"
+        assert child_env["NPM_CONFIG_HTTPS_PROXY"] == "false"
+        assert "metadata.internal" in child_env["NO_PROXY"]
+        assert "127.0.0.1" in child_env["NO_PROXY"]
+        assert child_env["NO_PROXY"] == child_env["no_proxy"]
+        assert child_env["npm_config_noproxy"] == child_env["NO_PROXY"]
+
+    assert not user_config.exists()
+    assert not global_config.exists()
+
+
+def test_npm_gateway_sanitizes_upstream_url_evidence():
+    gateway = NpmMetadataGateway(
+        upstream_registry="https://user:secret@registry.example/path?token=do-not-log",
+        policy=PackagePolicy(),
     )
 
-    assert child_env["NPM_CONFIG_REGISTRY"] == "http://127.0.0.1:12345/"
-    assert child_env["npm_config_registry"] == "http://127.0.0.1:12345/"
-    assert child_env["npm_config_@scope:registry"] == "http://127.0.0.1:12345/"
-    assert child_env["NPM_CONFIG_USERCONFIG"] == os.devnull
-    assert child_env["npm_config_userconfig"] == os.devnull
+    assert gateway.to_dict()["upstream_registry"] == "https://registry.example/path"
+
+
+def test_npm_gateway_child_env_rejects_shared_or_devnull_config(tmp_path):
+    empty_config = tmp_path / "empty.npmrc"
+    other_config = tmp_path / "other.npmrc"
+    empty_config.touch()
+    other_config.touch()
+
+    with pytest.raises(ValueError, match="must be distinct"):
+        npm_gateway_child_env(
+            {},
+            "http://127.0.0.1:12345/",
+            user_config_path=empty_config,
+            global_config_path=empty_config,
+        )
+    with pytest.raises(ValueError, match="must not be"):
+        npm_gateway_child_env(
+            {},
+            "http://127.0.0.1:12345/",
+            user_config_path=os.devnull,
+            global_config_path=other_config,
+        )
+
+
+def test_npm_gateway_cleans_config_files_when_server_start_fails(tmp_path, monkeypatch):
+    config_root = tmp_path / "gateway-config"
+    created_paths = []
+
+    class ControlledTemporaryDirectory:
+        def __init__(self, *, prefix):
+            config_root.mkdir()
+            self.name = str(config_root)
+
+        def cleanup(self):
+            for child in config_root.iterdir():
+                child.unlink()
+            config_root.rmdir()
+
+    def fail_to_start_server(*args, **kwargs):
+        created_paths.extend(config_root.iterdir())
+        raise OSError("cannot bind")
+
+    monkeypatch.setattr(npm_gateway_module, "TemporaryDirectory", ControlledTemporaryDirectory)
+    monkeypatch.setattr(npm_gateway_module, "ThreadingHTTPServer", fail_to_start_server)
+    gateway = NpmMetadataGateway(policy=PackagePolicy())
+
+    with pytest.raises(OSError, match="cannot bind"):
+        gateway.start()
+
+    assert {path.name for path in created_paths} == {"user.npmrc", "global.npmrc"}
+    assert not config_root.exists()
+    with pytest.raises(RuntimeError, match="not started"):
+        _ = gateway.user_config_path
+
+
+def test_npm_gateway_config_files_are_accepted_by_npm(tmp_path):
+    npm = shutil.which("npm")
+    if npm is None:
+        pytest.skip("npm is not installed")
+
+    gateway = NpmMetadataGateway(policy=PackagePolicy())
+    with gateway:
+        registry_url = gateway.registry_url
+        child_env = npm_gateway_child_env(
+            dict(os.environ),
+            registry_url,
+            user_config_path=gateway.user_config_path,
+            global_config_path=gateway.global_config_path,
+        )
+        completed = subprocess.run(
+            [npm, "config", "get", "registry"],
+            cwd=tmp_path,
+            env=child_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == registry_url
 
 
 def test_ca9_run_npm_uses_gateway_for_child_install(tmp_path):
@@ -352,8 +508,9 @@ strip_secret_env_for_installs = false
 
 
 class _FakeNpmRegistry:
-    def __init__(self, payload):
+    def __init__(self, payload, *, status=200):
         self.payload = payload
+        self.status = status
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -366,11 +523,12 @@ class _FakeNpmRegistry:
 
     def __enter__(self):
         payload = self.payload
+        status = self.status
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()

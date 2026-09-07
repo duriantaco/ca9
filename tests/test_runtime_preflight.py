@@ -36,6 +36,174 @@ def test_parse_npm_install_direct_specs():
     assert [request.exact_version for request in command.package_requests] == ["1.3.0", "2.0.0"]
 
 
+def test_parse_npm_boolean_options_cannot_hide_package_specs():
+    for option in (
+        "--ignore-scripts=left-pad@1.3.0",
+        "--audit=left-pad@1.3.0",
+        "--dry-run=left-pad@1.3.0",
+        "--global=left-pad@1.3.0",
+    ):
+        preflight = evaluate_runtime_preflight(
+            ("npm", "install", "safe-lib@1.0.0", option),
+            PackagePolicy(malware=MalwarePolicy(enabled=False)),
+            env={},
+        )
+
+        assert preflight.action == "block"
+        assert preflight.decisions[0].policy_id == "ca9.runtime.unsupported_command"
+        assert "only accepts true or false" in preflight.decisions[0].reason
+
+
+def test_parse_npm_ignore_scripts_boolean_value_controls_script_posture():
+    ignored = parse_install_command(("npm", "install", "left-pad@1.3.0", "--ignore-scripts=true"))
+    enabled = parse_install_command(("npm", "install", "left-pad@1.3.0", "--ignore-scripts=false"))
+
+    assert ignored.install_scripts_possible is False
+    assert enabled.install_scripts_possible is True
+
+
+def test_runtime_preflight_blocks_scoped_registry_in_project_npmrc(tmp_path):
+    (tmp_path / ".npmrc").write_text(
+        "# Project npm settings\n"
+        "registry=https://registry.npmjs.org/\n"
+        "\n"
+        "@acme:registry = https://packages.example/\n"
+    )
+
+    preflight = evaluate_runtime_preflight(
+        ("npm", "install", "@acme/widget@1.0.0"),
+        PackagePolicy(),
+        env={},
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "block"
+    decision = next(
+        decision
+        for decision in preflight.decisions
+        if decision.policy_id == "ca9.runtime.unsupported_source"
+    )
+    assert ".npmrc:4:@acme:registry" in decision.reason
+    assert decision.evidence == {
+        "ecosystem": "npm",
+        "kind": "npm-config-file",
+        "url": "https://packages.example/",
+        "option": ".npmrc:4:@acme:registry",
+    }
+
+
+def test_runtime_preflight_ignores_comments_and_unscoped_registry_in_project_npmrc(tmp_path):
+    (tmp_path / ".npmrc").write_text(
+        "# @ignored:registry=https://packages.example/\n"
+        "; @also-ignored:registry=https://packages.example/\n"
+        "registry=https://registry.npmjs.org/\n"
+    )
+
+    preflight = evaluate_runtime_preflight(
+        ("npm", "install", "left-pad@1.3.0"),
+        PackagePolicy(malware=MalwarePolicy(enabled=False)),
+        env={},
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "pass"
+    assert not preflight.command.registry_sources
+
+
+def test_runtime_preflight_blocks_npm_ini_variants_of_scoped_registry(tmp_path):
+    forms = (
+        '"@acme:registry"=https://packages.example/\n',
+        "'@acme:registry'=https://packages.example/\n",
+        '"@acme\\u003aregistry"=https://packages.example/\n',
+        "@acme:registry[]=https://packages.example/\n",
+        "@acme:registry#comment=https://packages.example/\n",
+        "@acme:registry;comment=https://packages.example/\n",
+        "${NPM_CONFIG_KEY}=https://packages.example/\n",
+        " \ufeff@acme:registry=https://packages.example/\n",
+        "\n\ufeff\ufeff@acme:registry=https://packages.example/\n",
+        "@acme:registry\ufeff=https://packages.example/\n",
+    )
+
+    for content in forms:
+        (tmp_path / ".npmrc").write_text(content)
+        preflight = evaluate_runtime_preflight(
+            ("npm", "install", "@acme/widget@1.0.0"),
+            PackagePolicy(),
+            env={"NPM_CONFIG_KEY": "@acme:registry"},
+            cwd=tmp_path,
+        )
+
+        assert preflight.action == "block", content
+        assert preflight.decisions[0].policy_id == "ca9.runtime.unsupported_source"
+
+
+def test_runtime_preflight_does_not_apply_project_npmrc_to_global_install(tmp_path):
+    (tmp_path / ".npmrc").write_text("@acme:registry=https://packages.example/\n")
+
+    preflight = evaluate_runtime_preflight(
+        ("npm", "install", "--global", "@acme/widget@1.0.0"),
+        PackagePolicy(malware=MalwarePolicy(enabled=False)),
+        env={},
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "pass"
+    assert not preflight.command.registry_sources
+
+
+def test_runtime_preflight_blocks_scoped_registry_from_ancestor_project_root(tmp_path):
+    project_root = tmp_path / "project"
+    nested_cwd = project_root / "src" / "tools"
+    nested_cwd.mkdir(parents=True)
+    (project_root / "package.json").write_text('{"name": "project"}\n')
+    (project_root / ".npmrc").write_text("@acme:registry=https://packages.example/\n")
+
+    preflight = evaluate_runtime_preflight(
+        ("npm", "install", "@acme/widget@1.0.0"),
+        PackagePolicy(),
+        env={},
+        cwd=nested_cwd,
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.unsupported_source"
+    assert "../../.npmrc:1:@acme:registry" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_scoped_registry_from_workspace_root(tmp_path):
+    workspace = tmp_path / "workspace"
+    package_root = workspace / "packages" / "api"
+    package_root.mkdir(parents=True)
+    (workspace / "package.json").write_text('{"name": "workspace", "workspaces": ["packages/*"]}\n')
+    (workspace / ".npmrc").write_text("@acme:registry=https://packages.example/\n")
+    (package_root / "package.json").write_text('{"name": "api"}\n')
+
+    preflight = evaluate_runtime_preflight(
+        ("npm", "install", "@acme/widget@1.0.0"),
+        PackagePolicy(),
+        env={},
+        cwd=package_root,
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.unsupported_source"
+    assert "../../.npmrc:1:@acme:registry" in preflight.decisions[0].reason
+
+
+def test_runtime_preflight_blocks_npm_install_prefix_project_switch(tmp_path):
+    for prefix_args in (("--prefix", "other-project"), ("--prefix=other-project",)):
+        preflight = evaluate_runtime_preflight(
+            ("npm", "install", "left-pad@1.3.0", *prefix_args),
+            PackagePolicy(),
+            env={},
+            cwd=tmp_path,
+        )
+
+        assert preflight.action == "block"
+        assert preflight.decisions[0].policy_id == "ca9.runtime.unsupported_command"
+        assert "different project config or lockfile" in preflight.decisions[0].reason
+
+
 def test_parse_npm_ci_loads_direct_and_transitive_lock_packages(tmp_path):
     _write_package_lock(tmp_path)
 
@@ -302,7 +470,7 @@ def test_runtime_preflight_blocks_npm_ci_prefix_lockfile_switch(tmp_path):
 
         assert preflight.action == "block"
         assert preflight.decisions[0].policy_id == "ca9.runtime.unsupported_command"
-        assert "select a different lockfile" in preflight.decisions[0].reason
+        assert "different project config or lockfile" in preflight.decisions[0].reason
 
 
 def test_parse_npm_ci_preserves_workspace_links_without_treating_them_as_registry_packages(
@@ -366,7 +534,6 @@ def test_parse_pip_requirement_files_applies_nested_constraints_and_hashes(tmp_p
     extras = tmp_path / "requirements"
     extras.mkdir()
     (tmp_path / "requirements.txt").write_text(
-        "--index-url https://pypi.org/simple\n"
         "Requests>=2\n"
         "-r requirements/extras.txt\n"
         "-c constraints.txt\n"
@@ -390,8 +557,70 @@ def test_parse_pip_requirement_files_applies_nested_constraints_and_hashes(tmp_p
     assert requests["httpx"].exact_version == "0.27.2"
     assert requests["httpx"].source_path == "requirements/extras.txt"
     assert requests["urllib3"].hashes == (f"sha256:{'a' * 64}",)
-    assert command.registry_sources[0].url == "https://pypi.org/simple"
-    assert command.registry_sources[0].option.startswith("requirements.txt:1:")
+    assert not command.registry_sources
+
+
+def test_parse_pip_requirement_file_rejects_index_url(tmp_path):
+    (tmp_path / "requirements.txt").write_text(
+        "--index-url=https://pypi.org/simple\nrequests==2.31.0\n"
+    )
+
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "-r", "requirements.txt"),
+        PackagePolicy(),
+        env={},
+        feed_cache_dir=cache_root / "feed",
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.requirements_unavailable"
+    assert "requirements.txt:1" in preflight.decisions[0].reason
+    assert "--index-url" in preflight.decisions[0].reason
+
+
+def test_parse_pip_nested_constraint_file_rejects_short_index_url(tmp_path):
+    constraints = tmp_path / "constraints"
+    constraints.mkdir()
+    (tmp_path / "requirements.txt").write_text("requests==2.31.0\n-c constraints/base.txt\n")
+    (constraints / "base.txt").write_text(
+        "# The nested constraint must not be able to replace the gateway.\n"
+        "-i https://pypi.org/simple\n"
+        "requests==2.31.0\n"
+    )
+
+    cache_root = tmp_path / "cache"
+    update_feed_from_source(_write_feed_bundle(tmp_path), cache_dir=cache_root / "feed")
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "-r", "requirements.txt"),
+        PackagePolicy(),
+        env={},
+        feed_cache_dir=cache_root / "feed",
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "block"
+    assert preflight.decisions[0].policy_id == "ca9.runtime.requirements_unavailable"
+    assert "constraints/base.txt:2" in preflight.decisions[0].reason
+    assert "-i" in preflight.decisions[0].reason
+
+
+def test_parse_pip_requirement_file_allows_index_when_gateway_is_disabled(tmp_path):
+    (tmp_path / "requirements.txt").write_text(
+        "--index-url=https://pypi.org/simple\nrequests==2.31.0\n"
+    )
+
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "-r", "requirements.txt"),
+        PackagePolicy(malware=MalwarePolicy(enabled=False)),
+        env={},
+        cwd=tmp_path,
+    )
+
+    assert preflight.action == "pass"
+    assert preflight.command.registry_sources[0].kind == "pypi-requirement-index"
 
 
 def test_parse_pip_requirement_file_rejects_include_cycle(tmp_path):
@@ -552,6 +781,61 @@ def test_runtime_preflight_blocks_untrusted_npm_registry_env():
     assert any(decision.policy_id == "ca9.untrusted_registry" for decision in preflight.decisions)
 
 
+def test_runtime_preflight_blocks_untrusted_ca9_npm_gateway_upstream_env():
+    preflight = evaluate_runtime_preflight(
+        ("npm", "install", "left-pad@1.3.0"),
+        PackagePolicy(malware=MalwarePolicy(enabled=False)),
+        env={"CA9_NPM_UPSTREAM_REGISTRY": "https://packages.example"},
+    )
+
+    assert preflight.action == "block"
+    decision = next(
+        decision
+        for decision in preflight.decisions
+        if decision.policy_id == "ca9.untrusted_registry"
+    )
+    assert decision.evidence == {
+        "ecosystem": "npm",
+        "kind": "npm-gateway-upstream",
+        "url": "https://packages.example",
+        "option": "env:CA9_NPM_UPSTREAM_REGISTRY",
+    }
+
+
+def test_runtime_preflight_blocks_denied_ca9_pypi_gateway_upstream_env():
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "requests==2.31.0"),
+        PackagePolicy(
+            registries=RegistriesPolicy(deny=("pypi.org",)),
+            malware=MalwarePolicy(enabled=False),
+        ),
+        env={"CA9_PYPI_UPSTREAM_INDEX": "https://pypi.org/simple"},
+    )
+
+    assert preflight.action == "block"
+    decision = next(
+        decision for decision in preflight.decisions if decision.policy_id == "ca9.denied_registry"
+    )
+    assert decision.evidence == {
+        "ecosystem": "pypi",
+        "kind": "pypi-gateway-upstream",
+        "url": "https://pypi.org/simple",
+        "option": "env:CA9_PYPI_UPSTREAM_INDEX",
+    }
+
+
+def test_runtime_preflight_allows_trusted_ca9_gateway_upstream_env():
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "requests==2.31.0"),
+        PackagePolicy(malware=MalwarePolicy(enabled=False)),
+        env={"CA9_PYPI_UPSTREAM_INDEX": "https://pypi.org/simple"},
+    )
+
+    assert preflight.action == "pass"
+    assert preflight.command.registry_sources[-1].kind == "pypi-gateway-upstream"
+    assert not preflight.decisions
+
+
 def test_runtime_preflight_blocks_pip_alternate_source_env():
     preflight = evaluate_runtime_preflight(
         ("pip", "install", "requests==2.31.0"),
@@ -563,6 +847,47 @@ def test_runtime_preflight_blocks_pip_alternate_source_env():
     assert any(
         decision.policy_id == "ca9.runtime.unsupported_source" for decision in preflight.decisions
     )
+
+
+def test_runtime_preflight_blocks_implicit_pip_requirement_env():
+    for name in (
+        "PIP_REQUIREMENT",
+        "PIP_CONSTRAINT",
+        "PIP_BUILD_CONSTRAINT",
+        "PIP_REQUIREMENTS_FROM_SCRIPT",
+        "PIP_EDITABLE",
+        "PIP_GROUP",
+    ):
+        preflight = evaluate_runtime_preflight(
+            ("pip", "install", "requests==2.31.0"),
+            PackagePolicy(malware=MalwarePolicy(enabled=False)),
+            env={name: "requirements.txt"},
+        )
+
+        assert preflight.action == "block"
+        decision = next(
+            decision
+            for decision in preflight.decisions
+            if decision.policy_id == "ca9.runtime.unsupported_source"
+        )
+        assert decision.evidence["kind"] == "pypi-requirement-env"
+        assert decision.evidence["option"] == f"env:{name}"
+
+
+def test_runtime_preflight_checks_pip_index_alias_env():
+    preflight = evaluate_runtime_preflight(
+        ("pip", "install", "requests==2.31.0"),
+        PackagePolicy(malware=MalwarePolicy(enabled=False)),
+        env={"PIP_PYPI_URL": "https://packages.example/simple"},
+    )
+
+    assert preflight.action == "block"
+    decision = next(
+        decision
+        for decision in preflight.decisions
+        if decision.policy_id == "ca9.untrusted_registry"
+    )
+    assert decision.evidence["option"] == "env:PIP_PYPI_URL"
 
 
 def test_runtime_preflight_blocks_config_file_env_sources():

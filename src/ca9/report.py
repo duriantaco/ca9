@@ -49,6 +49,9 @@ def _evidence_to_dict(evidence) -> dict | None:
         "affected_component_confidence": evidence.affected_component_confidence,
         "coverage_seen": evidence.coverage_seen,
         "coverage_files": list(evidence.coverage_files),
+        "coverage_scope": evidence.coverage_scope,
+        "coverage_measured_files": list(evidence.coverage_measured_files),
+        "coverage_unmeasured_targets": list(evidence.coverage_unmeasured_targets),
         "external_fetch_warnings": list(evidence.external_fetch_warnings),
     }
     if evidence.api_targets:

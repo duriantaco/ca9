@@ -154,7 +154,7 @@ class TestCLI:
         assert verdicts["some-unused-package"] == "unreachable_static"
         assert result.exit_code == 1
 
-    def test_strict_default_downgrades_weak_dynamic_suppression(
+    def test_strict_default_keeps_incomplete_measurement_inconclusive(
         self, snyk_path, sample_repo, coverage_path
     ):
         runner = CliRunner()
@@ -173,9 +173,10 @@ class TestCLI:
         data = json.loads(result.output)
         verdicts = {r["package"]: r for r in data["results"]}
         assert verdicts["PyYAML"]["verdict"] == "inconclusive"
-        assert verdicts["PyYAML"]["original_verdict"] == "unreachable_dynamic"
+        assert verdicts["PyYAML"]["original_verdict"] is None
+        assert verdicts["PyYAML"]["evidence"]["coverage_scope"] == "no_statements"
 
-    def test_balanced_mode_keeps_dynamic_suppression(self, snyk_path, sample_repo, coverage_path):
+    def test_balanced_mode_requires_statement_evidence(self, snyk_path, sample_repo, coverage_path):
         runner = CliRunner()
         result = runner.invoke(
             main,
@@ -193,7 +194,48 @@ class TestCLI:
         )
         data = json.loads(result.output)
         verdicts = {r["package"]: r["verdict"] for r in data["results"]}
-        assert verdicts["PyYAML"] == "unreachable_dynamic"
+        assert verdicts["PyYAML"] == "inconclusive"
+
+    def test_unmeasured_dependency_exits_inconclusive_and_exports_under_investigation(
+        self, tmp_path
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("import samplelib\n")
+        report_path = tmp_path / "audit.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "dependencies": [
+                        {
+                            "name": "samplelib",
+                            "version": "1.0.0",
+                            "vulns": [{"id": "TEST-COVERAGE", "description": "Test finding"}],
+                        }
+                    ]
+                }
+            )
+        )
+        coverage_path = tmp_path / "coverage.json"
+        coverage_path.write_text(
+            json.dumps(
+                {
+                    "files": {str(repo / "app.py"): {"executed_lines": [1]}},
+                    "totals": {"percent_covered": 100.0},
+                }
+            )
+        )
+
+        result = CliRunner().invoke(
+            main,
+            [str(report_path), "--repo", str(repo), "--coverage", str(coverage_path), "-f", "vex"],
+        )
+
+        assert result.exit_code == 2, result.output
+        statement = json.loads(result.output)["statements"][0]
+        assert statement["status"] == "under_investigation"
+        assert "justification" not in statement
+        assert statement["ca9"]["evidence_summary"]["coverage_scope"] == "not_reported"
 
     def test_output_to_file(self, snyk_path, sample_repo, tmp_path):
         output_file = tmp_path / "report.json"

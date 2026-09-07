@@ -54,6 +54,10 @@ _AUTHORIZATION_RE = re.compile(
     r"(?P<space>\s*)"
     r"(?P<value>[^,\s;]+)"
 )
+_NPM_SCOPED_REGISTRY_KEY_RE = re.compile(
+    r"^@[^\s:=]+:registry$",
+    re.IGNORECASE,
+)
 SUPPORTED_PIP_FLAGS_WITH_VALUE = {
     "--index-url",
     "-i",
@@ -124,15 +128,25 @@ NPM_CLEAN_INSTALL_SUBCOMMANDS = frozenset(
     {"ci", "clean-install", "ic", "install-clean", "isntall-clean"}
 )
 NPM_REGISTRY_ENV_NAMES = ("NPM_CONFIG_REGISTRY", "npm_config_registry")
+NPM_GATEWAY_UPSTREAM_ENV_NAMES = ("CA9_NPM_UPSTREAM_REGISTRY",)
 NPM_CONFIG_FILE_ENV_NAMES = (
     "NPM_CONFIG_USERCONFIG",
     "npm_config_userconfig",
     "NPM_CONFIG_GLOBALCONFIG",
     "npm_config_globalconfig",
 )
-PIP_INDEX_ENV_NAMES = ("PIP_INDEX_URL",)
+PIP_INDEX_ENV_NAMES = ("PIP_INDEX_URL", "PIP_PYPI_URL")
+PIP_GATEWAY_UPSTREAM_ENV_NAMES = ("CA9_PYPI_UPSTREAM_INDEX",)
 PIP_UNSUPPORTED_SOURCE_ENV_NAMES = ("PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS")
 PIP_CONFIG_FILE_ENV_NAMES = ("PIP_CONFIG_FILE",)
+PIP_REQUIREMENT_ENV_NAMES = (
+    "PIP_REQUIREMENT",
+    "PIP_CONSTRAINT",
+    "PIP_BUILD_CONSTRAINT",
+    "PIP_REQUIREMENTS_FROM_SCRIPT",
+    "PIP_EDITABLE",
+    "PIP_GROUP",
+)
 
 
 @dataclass(frozen=True)
@@ -329,7 +343,7 @@ def parse_install_command(
             command=args,
             package_requests=tuple(requests),
             registry_sources=tuple(registry_sources),
-            install_scripts_possible="--ignore-scripts" not in args,
+            install_scripts_possible=_npm_install_scripts_possible(args[2:]),
         )
 
     if _is_pip_install(args):
@@ -381,6 +395,7 @@ def evaluate_runtime_preflight(
     decisions: list[RuntimeDecision] = []
     feed = _load_feed_status_if_needed(parsed, policy, feed_cache_dir=feed_cache_dir, now=now)
     decisions.extend(_registry_source_decisions(parsed, policy))
+    decisions.extend(_gateway_requirement_source_decisions(parsed, policy, feed))
     decisions.extend(_feed_availability_decisions(feed, policy))
     if feed and feed.snapshot:
         decisions.extend(_malware_decisions(parsed, policy, feed.snapshot, feed_cache_dir))
@@ -669,9 +684,10 @@ def _parse_npm_install(
 ) -> tuple[list[PackageRequest], list[RegistrySource]]:
     subcommand = args[1]
     clean_install = subcommand in NPM_CLEAN_INSTALL_SUBCOMMANDS
-    if clean_install and any(arg.split("=", 1)[0] == "--prefix" for arg in args[2:]):
+    if any(arg.split("=", 1)[0] == "--prefix" for arg in args[2:]):
         raise RuntimePreflightError(
-            "npm ci --prefix is unsupported because it can select a different lockfile"
+            "npm --prefix is unsupported because it can select a different project config "
+            "or lockfile"
         )
     specs, registry_sources = _collect_specs(
         args[2:],
@@ -682,12 +698,155 @@ def _parse_npm_install(
         ecosystem="npm",
         require_specs=not clean_install,
     )
+    if not _npm_global_mode(args[2:]):
+        registry_sources.extend(_npm_project_config_sources(cwd))
     if clean_install and specs:
         raise RuntimePreflightError("npm ci does not accept direct package specs")
     if clean_install:
         locked_requests, locked_sources = _npm_lock_requests(cwd)
         return locked_requests, [*registry_sources, *locked_sources]
     return [_parse_npm_spec(spec) for spec in specs], registry_sources
+
+
+def _npm_project_config_sources(cwd: Path) -> list[RegistrySource]:
+    sources: list[RegistrySource] = []
+    resolved_cwd = cwd.resolve()
+    for config_path in _npm_project_config_paths(resolved_cwd):
+        display_path = os.path.relpath(config_path, resolved_cwd)
+        try:
+            content = config_path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as exc:
+            raise RuntimePreflightError(
+                f"cannot inspect npm project config {display_path}: {exc}",
+                policy_id="ca9.runtime.unsupported_source",
+            ) from exc
+
+        for line_number, raw_line in enumerate(content.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            parsed = _npmrc_scoped_registry(line)
+            if parsed is None:
+                continue
+            key, value = parsed
+            sources.append(
+                RegistrySource(
+                    ecosystem="npm",
+                    kind="npm-config-file",
+                    url=value,
+                    option=f"{display_path}:{line_number}:{key}",
+                )
+            )
+    return sources
+
+
+def _npm_global_mode(args: tuple[str, ...]) -> bool:
+    enabled = False
+    for arg in args:
+        flag_name, separator, raw_value = arg.partition("=")
+        if flag_name not in {"--global", "-g"}:
+            continue
+        enabled = not separator or raw_value == "true"
+    return enabled
+
+
+def _npm_install_scripts_possible(args: tuple[str, ...]) -> bool:
+    ignore_scripts = False
+    for arg in args:
+        flag_name, separator, raw_value = arg.partition("=")
+        if flag_name != "--ignore-scripts":
+            continue
+        ignore_scripts = not separator or raw_value == "true"
+    return not ignore_scripts
+
+
+def _npmrc_scoped_registry(line: str) -> tuple[str, str] | None:
+    if "=" not in line:
+        return None
+    raw_key, value = line.split("=", 1)
+    key = _npmrc_unsafe_key(raw_key)
+    if "${" in key:
+        # @npmcli/config performs environment expansion on parsed keys. Without
+        # duplicating the child's full config loader, an interpolated key cannot
+        # be proven not to become a scoped registry selector.
+        return "interpolated-key", value.strip()
+    key = key.removesuffix("[]")
+    if _NPM_SCOPED_REGISTRY_KEY_RE.fullmatch(key) is None:
+        return None
+    return key, value.strip()
+
+
+def _npmrc_unsafe_key(raw_key: str) -> str:
+    # JavaScript String.trim(), used by npm's INI parser, treats U+FEFF as
+    # whitespace. Remove it conservatively anywhere in the raw key so repeated
+    # or non-file-leading BOMs cannot hide a scoped registry selector.
+    key = raw_key.replace("\ufeff", "").strip()
+    quoted = len(key) >= 2 and key[0] == key[-1] and key[0] in {"'", '"'}
+    if quoted:
+        candidate = key[1:-1] if key[0] == "'" else key
+        try:
+            decoded = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            decoded = candidate
+        return str(decoded).strip()
+
+    decoded: list[str] = []
+    escaped = False
+    for character in key:
+        if escaped:
+            if character in {"\\", ";", "#"}:
+                decoded.append(character)
+            else:
+                decoded.extend(("\\", character))
+            escaped = False
+        elif character in {";", "#"}:
+            break
+        elif character == "\\":
+            escaped = True
+        else:
+            decoded.append(character)
+    if escaped:
+        decoded.append("\\")
+    return "".join(decoded).strip()
+
+
+def _npm_project_config_paths(cwd: Path) -> tuple[Path, ...]:
+    project_root: Path | None = None
+    workspace_roots: list[Path] = []
+    for candidate in (cwd, *cwd.parents):
+        package_path = candidate / "package.json"
+        if project_root is None and (
+            package_path.is_file() or (candidate / "node_modules").is_dir()
+        ):
+            project_root = candidate
+            continue
+        if project_root is not None and _npm_declares_workspaces(package_path):
+            # npm may promote localPrefix to a matching workspace root. Treat every
+            # ancestor workspace declaration as a candidate instead of trying to
+            # reproduce npm's evolving glob semantics and risking a missed config.
+            workspace_roots.append(candidate)
+
+    roots = [project_root or cwd, *workspace_roots]
+    return tuple(root / ".npmrc" for root in roots if (root / ".npmrc").is_file())
+
+
+def _npm_declares_workspaces(package_path: Path) -> bool:
+    if not package_path.is_file():
+        return False
+    try:
+        package = json.loads(package_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        # npm also skips malformed ancestor package files while looking for a
+        # workspace root. The nearest package directory is still inspected above.
+        return False
+    if not isinstance(package, dict):
+        return False
+    workspaces = package.get("workspaces")
+    if isinstance(workspaces, dict):
+        workspaces = workspaces.get("packages")
+    return isinstance(workspaces, list) and any(
+        isinstance(pattern, str) and pattern.strip() for pattern in workspaces
+    )
 
 
 def _parse_pip_install(
@@ -882,7 +1041,8 @@ def _read_pip_requirement_file(
             flag_name = tokens[0].split("=", 1)[0]
             if flag_name in UNSUPPORTED_PIP_SOURCE_FLAGS:
                 raise RuntimePreflightError(
-                    f"pip source option is not supported in {source_path}: {flag_name}",
+                    f"pip source option is not supported in "
+                    f"{source_path}:{line_number}: {flag_name}",
                     policy_id="ca9.runtime.requirements_unavailable",
                 )
             if flag_name in SUPPORTED_PIP_FLAGS_WITH_VALUE:
@@ -898,7 +1058,7 @@ def _read_pip_requirement_file(
                     registry_sources.append(
                         RegistrySource(
                             ecosystem="pypi",
-                            kind="pypi-index",
+                            kind="pypi-requirement-index",
                             url=value,
                             option=f"{source_path}:{line_number}:{flag_name}",
                         )
@@ -1161,7 +1321,12 @@ def _collect_specs(
                             option=flag_name,
                         )
                     )
-            elif flag_name not in bool_flags:
+            elif flag_name in bool_flags:
+                if "=" in arg and arg.split("=", 1)[1] not in {"true", "false"}:
+                    raise RuntimePreflightError(
+                        f"{manager} boolean option only accepts true or false: {arg}"
+                    )
+            else:
                 raise RuntimePreflightError(f"unsupported {manager} install option: {arg}")
             index += 1
             continue
@@ -1543,6 +1708,17 @@ def _npm_env_registry_sources(env: dict[str, str]) -> list[RegistrySource]:
                     option=f"env:{name}",
                 )
             )
+    for name in NPM_GATEWAY_UPSTREAM_ENV_NAMES:
+        value = env.get(name)
+        if value:
+            sources.append(
+                RegistrySource(
+                    ecosystem="npm",
+                    kind="npm-gateway-upstream",
+                    url=value,
+                    option=f"env:{name}",
+                )
+            )
     for name in NPM_CONFIG_FILE_ENV_NAMES:
         value = env.get(name)
         if value:
@@ -1570,6 +1746,17 @@ def _pip_env_registry_sources(env: dict[str, str]) -> list[RegistrySource]:
                     option=f"env:{name}",
                 )
             )
+    for name in PIP_GATEWAY_UPSTREAM_ENV_NAMES:
+        value = env.get(name)
+        if value:
+            sources.append(
+                RegistrySource(
+                    ecosystem="pypi",
+                    kind="pypi-gateway-upstream",
+                    url=value,
+                    option=f"env:{name}",
+                )
+            )
     for name in PIP_UNSUPPORTED_SOURCE_ENV_NAMES:
         value = env.get(name)
         if value:
@@ -1588,6 +1775,17 @@ def _pip_env_registry_sources(env: dict[str, str]) -> list[RegistrySource]:
                 RegistrySource(
                     ecosystem="pypi",
                     kind="pypi-config-file",
+                    url=value,
+                    option=f"env:{name}",
+                )
+            )
+    for name in PIP_REQUIREMENT_ENV_NAMES:
+        value = env.get(name)
+        if value:
+            sources.append(
+                RegistrySource(
+                    ecosystem="pypi",
+                    kind="pypi-requirement-env",
                     url=value,
                     option=f"env:{name}",
                 )
@@ -1656,7 +1854,12 @@ def _registry_source_decisions(
 ) -> list[RuntimeDecision]:
     decisions: list[RuntimeDecision] = []
     for source in command.registry_sources:
-        if source.kind in {"pypi-unsupported-source", "pypi-config-file", "npm-config-file"}:
+        if source.kind in {
+            "pypi-unsupported-source",
+            "pypi-config-file",
+            "pypi-requirement-env",
+            "npm-config-file",
+        }:
             decisions.append(
                 RuntimeDecision(
                     action="block",
@@ -1689,6 +1892,34 @@ def _registry_source_decisions(
                 )
             )
     return decisions
+
+
+def _gateway_requirement_source_decisions(
+    command: RuntimeCommand,
+    policy: PackagePolicy,
+    feed: FeedStatus | None,
+) -> list[RuntimeDecision]:
+    gateway_active = (
+        command.family == "pip"
+        and (policy.malware.enabled or policy.package_age.enabled)
+        and feed is not None
+        and feed.snapshot is not None
+    )
+    if not gateway_active:
+        return []
+    return [
+        RuntimeDecision(
+            action="block",
+            policy_id="ca9.runtime.requirements_unavailable",
+            reason=(
+                f"pip source option is not supported while the PyPI gateway is active: "
+                f"{source.option}"
+            ),
+            evidence=source.to_dict(),
+        )
+        for source in command.registry_sources
+        if source.kind == "pypi-requirement-index"
+    ]
 
 
 def _malware_decisions(
