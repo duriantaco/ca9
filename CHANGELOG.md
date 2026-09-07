@@ -5,6 +5,16 @@ All notable changes to ca9 will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0](https://github.com/duriantaco/ca9/compare/v0.5.0...v0.6.0) (2026-09-07)
+
+
+### Features
+
+* **supply-chain:** add npm ci enforcement and scanner integrations ([#32](https://github.com/duriantaco/ca9/issues/32)) ([8872537](https://github.com/duriantaco/ca9/commit/8872537f7c1428dec31a26d559bbda433807a021))
+* **supply-chain:** add npm lifecycle script auditing ([#34](https://github.com/duriantaco/ca9/issues/34)) ([2f3c7be](https://github.com/duriantaco/ca9/commit/2f3c7be32029bca809a2a279807ae9b60cbebb44))
+* **supply-chain:** add secure install control plane ([#35](https://github.com/duriantaco/ca9/issues/35)) ([31171cd](https://github.com/duriantaco/ca9/commit/31171cd57a6d0cec756addcbbb71d18ad30af1cb))
+* **supply-chain:** review npm dependency updates and strengthen evidence gates ([#36](https://github.com/duriantaco/ca9/issues/36)) ([b199512](https://github.com/duriantaco/ca9/commit/b199512e168949c0c9bfeb3233191bf2f129ebd9))
+
 ## [0.5.0](https://github.com/duriantaco/ca9/compare/v0.4.0...v0.5.0) (2026-06-27)
 
 
