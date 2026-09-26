@@ -1,0 +1,13 @@
+{
+  "built_at": "2026-09-26T11:23:06Z",
+  "expires_at": "2026-10-03T11:23:05Z",
+  "malware_counts": {
+    "npm-malware": 51522,
+    "pypi-malware": 10693
+  },
+  "schema": "ca9.feed.v1",
+  "sources": {
+    "PyPI": "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip",
+    "npm": "https://osv-vulnerabilities.storage.googleapis.com/npm/all.zip"
+  }
+}
