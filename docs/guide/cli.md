@@ -214,13 +214,14 @@ Options:
 | `--private-index URL` | Private package index allowed for internal package names. Can be repeated. |
 | `--internal-package PATTERN` | Internal package name or glob pattern, e.g. `acme-*`. Can be repeated. |
 | `--malware-query` | Query OSV for known malicious-package advisories. |
+| `--scan-publisher-changes` | Query public npm metadata for recent publisher changes after release dormancy in direct, locked dependencies. |
 | `--scan-artifacts` | Hash-verify, unpack, and statically inspect package artifacts. |
 | `--scan-workflows` | Scan GitHub Actions workflows for risky token, OIDC, and trust-boundary patterns. |
 | `--allow-unhashed-downloads` | Allow artifact scanning when the lockfile has no artifact hash. |
 | `--max-artifact-mb N` | Maximum artifact download size for `--scan-artifacts`. Defaults to `100`. |
 | `--deny-license ID` | Denied license identifier. Can be repeated. |
 | `--require-known-license` | Warn when scanned artifact metadata has no known license. |
-| `--offline` | Use cached OSV data only for `--malware-query`. |
+| `--offline` | Use cached OSV data only for `--malware-query`; incompatible with `--scan-publisher-changes`. |
 | `--refresh-cache` | Clear OSV cache before `--malware-query`. |
 | `--max-osv-workers N` | Maximum concurrent OSV detail fetches. Defaults to `8`. |
 
@@ -229,6 +230,7 @@ Examples:
 ```bash
 ca9 vet --repo .
 ca9 vet --repo . --scan-artifacts
+ca9 vet --repo . --scan-publisher-changes
 ca9 vet --repo . --scan-workflows
 ca9 vet --repo . --malware-query --offline
 ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.acme.internal/simple

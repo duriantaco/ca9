@@ -13,7 +13,7 @@ from ca9.analyzers.supply_chain import (
     findings_from_malware_advisories,
 )
 from ca9.cli import main
-from ca9.core.models import Artifact, Inventory, Package, SourceEvidence
+from ca9.core.models import Artifact, Finding, Inventory, Package, SourceEvidence
 from ca9.models import Vulnerability
 
 UNTRUSTED_FYN_LOCK = """
@@ -108,6 +108,50 @@ def test_vet_cli_blocks_direct_untrusted_registry(tmp_path):
     assert data["schema_version"] == "ca9.vet.v1"
     assert data["summary"]["blocking"] == 1
     assert any(finding["signal_type"] == "untrusted_registry" for finding in data["findings"])
+
+
+def test_vet_cli_includes_opt_in_publisher_change_warning(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text(json.dumps(NPM_PACKAGE_LOCK))
+    finding = Finding(
+        title="Recent npm publisher change for left-pad",
+        signal_type="npm_publisher_change",
+        package_key="npm:left-pad@1.3.0",
+        severity="medium",
+        metadata={"action": "warn", "package": "left-pad", "version": "1.3.0"},
+    )
+
+    with patch(
+        "ca9.npm_publisher.scan_npm_publisher_changes",
+        return_value=([finding], ["npm metadata was incomplete"]),
+    ) as scan:
+        result = CliRunner().invoke(
+            main, ["vet", "--repo", str(repo), "-f", "json", "--scan-publisher-changes"]
+        )
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert any(item["signal_type"] == "npm_publisher_change" for item in data["findings"])
+    assert any(item["action"] == "warn" for item in data["decisions"])
+    assert "npm metadata was incomplete" in data["warnings"]
+    scan.assert_called_once()
+
+
+def test_vet_cli_rejects_offline_publisher_change_check(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package-lock.json").write_text(json.dumps(NPM_PACKAGE_LOCK))
+
+    with patch("ca9.npm_publisher.scan_npm_publisher_changes") as scan:
+        result = CliRunner().invoke(
+            main,
+            ["vet", "--repo", str(repo), "--scan-publisher-changes", "--offline"],
+        )
+
+    assert result.exit_code != 0
+    assert "requires npm registry access" in result.output
+    scan.assert_not_called()
 
 
 def test_vet_cli_blocks_internal_package_from_public_index(tmp_path):

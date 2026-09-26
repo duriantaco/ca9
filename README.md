@@ -280,6 +280,7 @@ scope. See the [dependency review guide](docs/guide/dependency-review.md).
 ```bash
 ca9 vet --repo .
 ca9 vet --repo . --malware-query
+ca9 vet --repo . --scan-publisher-changes
 ca9 vet --repo . --scan-artifacts
 ca9 vet --repo . --scan-workflows
 ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.acme.internal/simple
@@ -299,6 +300,14 @@ probing, and broad credential-file harvest patterns. Direct dependencies from
 untrusted indexes, known malicious packages, too-new package versions, and
 high-risk workflow patterns are blocking findings; weaker local signals are
 warnings or investigation items.
+
+With `--scan-publisher-changes`, ca9 queries public npm registry metadata for
+direct, locked npm dependencies. It warns when a new publisher released a stable
+version after at least 180 days without a release, within the last 365 days, and
+the locked version belongs to that publisher's later releases. Verified npm
+trusted publishing and publishers who maintain another package with at least
+100,000 weekly downloads are exempt. This is a review signal, not a malware
+verdict. The check requires network access and cannot be combined with `--offline`.
 
 With `--scan-artifacts`, ca9 downloads only lockfile artifacts with hashes by
 default, verifies the hash, safely unpacks Python wheels/sdists and npm tarballs
@@ -687,13 +696,14 @@ Vet-only options:
   --private-index URL               Private index allowed for internal packages
   --internal-package PATTERN        Internal package glob, e.g. acme-*; repeatable
   --malware-query                   Query OSV for known malicious packages
+  --scan-publisher-changes          Query npm for recent publisher handovers after dormancy
   --scan-artifacts                  Hash-verify, unpack, and statically inspect artifacts
   --scan-workflows                  Scan GitHub Actions workflow risk patterns
   --allow-unhashed-downloads        Allow artifact downloads without lockfile hashes
   --max-artifact-mb N               Max artifact download size  [default: 100]
   --deny-license ID                 Denied license identifier; repeatable
   --require-known-license           Warn when artifact metadata has no known license
-  --offline                         Use cached OSV data only for malware query
+  --offline                         Use cached OSV data for malware query; incompatible with publisher checks
 
 Policy-only options:
   --policy PATH                   ca9 package policy TOML
