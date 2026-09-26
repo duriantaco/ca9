@@ -948,6 +948,12 @@ def protect_cmd(
     help="Query OSV for known malicious package advisories.",
 )
 @click.option(
+    "--scan-publisher-changes",
+    is_flag=True,
+    default=False,
+    help="Query public npm metadata for recent publisher changes after release dormancy.",
+)
+@click.option(
     "--scan-artifacts",
     is_flag=True,
     default=False,
@@ -988,7 +994,7 @@ def protect_cmd(
     "--offline",
     is_flag=True,
     default=False,
-    help="Use only cached OSV data for --malware-query.",
+    help="Use cached OSV data for --malware-query; cannot scan publisher changes.",
 )
 @click.option(
     "--refresh-cache",
@@ -1014,6 +1020,7 @@ def vet_cmd(
     private_indexes: tuple[str, ...],
     internal_package_patterns: tuple[str, ...],
     malware_query: bool,
+    scan_publisher_changes: bool,
     scan_artifacts: bool,
     scan_workflows: bool,
     allow_unhashed_downloads: bool,
@@ -1050,6 +1057,18 @@ def vet_cmd(
         raise click.ClickException(str(exc)) from None
 
     inventory = build_inventory(repo_path)
+    if offline and scan_publisher_changes:
+        raise click.ClickException(
+            "--scan-publisher-changes requires npm registry access; remove --offline"
+        )
+
+    publisher_findings = []
+    publisher_warnings = []
+    if scan_publisher_changes:
+        from ca9.npm_publisher import scan_npm_publisher_changes
+
+        publisher_findings, publisher_warnings = scan_npm_publisher_changes(inventory.packages)
+
     policy_findings = []
     feed_warnings = []
     if package_policy.package_age.enabled:
@@ -1107,7 +1126,7 @@ def vet_cmd(
                 raise click.ClickException(str(e)) from None
 
     artifact_findings = []
-    artifact_warnings = [*policy_warnings, *feed_warnings]
+    artifact_warnings = [*policy_warnings, *feed_warnings, *publisher_warnings]
     artifact_scans = 0
     skipped_artifacts = 0
     workflow_findings = []
@@ -1132,7 +1151,12 @@ def vet_cmd(
             require_known_license=require_known_license,
         )
         artifact_findings.extend(analyze_license_policy(artifact_result.snapshots, license_policy))
-        artifact_warnings = [*policy_warnings, *feed_warnings, *artifact_result.warnings]
+        artifact_warnings = [
+            *policy_warnings,
+            *feed_warnings,
+            *publisher_warnings,
+            *artifact_result.warnings,
+        ]
         artifact_scans = artifact_result.scanned_artifacts
         skipped_artifacts = artifact_result.skipped_artifacts
 
@@ -1157,7 +1181,12 @@ def vet_cmd(
         inventory,
         policy=policy,
         malware_advisories=malware_advisories,
-        extra_findings=[*policy_findings, *artifact_findings, *workflow_findings],
+        extra_findings=[
+            *policy_findings,
+            *publisher_findings,
+            *artifact_findings,
+            *workflow_findings,
+        ],
         extra_warnings=artifact_warnings,
         artifact_scans=artifact_scans,
         skipped_artifacts=skipped_artifacts,

@@ -178,6 +178,33 @@ is separate from the installed local feed: the feed path is deterministic and lo
 while `--malware-query` asks OSV or uses the OSV cache. Use `--offline` to restrict the
 query path to cached OSV data.
 
+## Npm Publisher Change Review
+
+Query the public npm registry for recent changes in publishers after a dormant
+release period:
+
+```bash
+ca9 vet --repo . --scan-publisher-changes
+```
+
+This optional check covers direct npm dependencies pinned in `package-lock.json`
+and resolved from `https://registry.npmjs.org`. It reads full package metadata
+and warns when a stable release in the past 365 days followed a gap of at least
+180 days and came from a publisher not seen in earlier releases. The locked
+version must be from that publisher and no older than the handover. Releases
+with npm's verified trusted-publisher identity and publishers with another
+package receiving at least 100,000 weekly downloads are excluded. If the
+publisher lookup is unavailable, ca9 keeps the finding and adds a report
+warning. Metadata fetch failures also appear in report warnings. This signal calls
+for human review; it does not establish malicious behavior. The check can
+download large registry documents, so it is opt-in and cannot run with
+`--offline`.
+
+Some old npm releases have timestamps but no publisher identity. ca9 reports
+that incomplete history and can still warn when the publisher immediately
+before the handover is known. In that case, the new publisher is the first
+*observed* publisher in the available metadata, not necessarily the first ever.
+
 ## GitHub Actions Workflow Scanning
 
 Scan workflow files for risky token and trust-boundary patterns:

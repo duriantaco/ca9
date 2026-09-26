@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ca9 vet --scan-publisher-changes` optionally reviews direct npm lockfile
+  dependencies for recent publisher handovers after long release gaps using
+  public npm metadata. It emits review warnings tied to the locked version.
 - `ca9 review --base FILE --head FILE` compares npm v2/v3 dependency updates
   using lockfile occurrence identity, verified release artifacts, lifecycle and
   entry-point declarations, and stable static observations. Markdown and JSON
