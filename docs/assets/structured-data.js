@@ -19,7 +19,7 @@
         "name": "ca9",
         "applicationCategory": "SecurityApplication",
         "operatingSystem": "Python 3.10+",
-        "softwareVersion": "0.5.0", // x-release-please-version
+        "softwareVersion": "0.6.0", // x-release-please-version
         "description": "Open source Python CVE reachability analysis for evidence-backed SCA triage. Parse Snyk, Dependabot, Trivy, Grype, OSV-Scanner, and pip-audit reports or query OSV; emit JSON, SARIF, and OpenVEX evidence.",
         "url": "https://duriantaco.github.io/ca9/",
         "codeRepository": "https://github.com/duriantaco/ca9",
