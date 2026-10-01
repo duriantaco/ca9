@@ -83,6 +83,7 @@ nav:
       - OSV-Scanner: integrations/osv-scanner.md
       - pip-audit: integrations/pip-audit.md
       - SARIF: integrations/sarif.md
+      - Darkmoon: integrations/darkmoon.md
       - OpenVEX: integrations/openvex.md
       - SBOM: integrations/sbom.md
       - MCP Server: integrations/mcp.md
