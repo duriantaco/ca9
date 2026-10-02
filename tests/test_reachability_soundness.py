@@ -309,17 +309,52 @@ class TestIndirectUse:
         r = analyze([vuln("acme-engine")], repo, proof_standard="balanced").results[0]
         assert r.verdict == Verdict.UNREACHABLE_STATIC
 
-    def test_entry_points_make_it_inconclusive(self, tmp_path, site):
+    def test_plugin_entry_points_make_it_inconclusive(self, tmp_path, site):
+        install_dist(
+            site,
+            "acme-plugin",
+            {"acme_plugin/__init__.py": ""},
+            entry_points="[pytest11]\nacme = acme_plugin.hooks\n",
+        )
+        repo = make_repo(tmp_path, {"requirements.txt": "acme-plugin==1.0.0\n", "app.py": ""})
+        r = analyze([vuln("acme-plugin")], repo, proof_standard="balanced").results[0]
+        assert r.verdict == Verdict.INCONCLUSIVE
+        assert "declares entry points (pytest11: acme)" in r.reason
+
+    @pytest.mark.parametrize(
+        ("filename", "content"),
+        [
+            ("Makefile", "migrate:\n\tacme-run upgrade head\n"),
+            (".github/workflows/deploy.yml", "steps:\n  - run: acme-run upgrade head\n"),
+        ],
+    )
+    def test_invoked_console_script_makes_it_inconclusive(self, tmp_path, site, filename, content):
         install_dist(
             site,
             "acme-cli",
             {"acme_cli/__init__.py": ""},
-            entry_points="[console_scripts]\nacme = acme_cli:main\n",
+            entry_points="[console_scripts]\nacme-run = acme_cli:main\n",
         )
-        repo = make_repo(tmp_path, {"requirements.txt": "acme-cli==1.0.0\n", "app.py": ""})
+        repo = make_repo(
+            tmp_path,
+            {"requirements.txt": "acme-cli==1.0.0\n", "app.py": "", filename: content},
+        )
         r = analyze([vuln("acme-cli")], repo, proof_standard="balanced").results[0]
         assert r.verdict == Verdict.INCONCLUSIVE
-        assert "declares entry points (console_scripts: acme)" in r.reason
+        assert f"installs a command: 'acme-run' is named in {filename}" in r.reason
+
+    def test_unreferenced_console_script_stays_unreachable_in_balanced(self, tmp_path, site):
+        install_dist(
+            site,
+            "acme-cli",
+            {"acme_cli/__init__.py": ""},
+            entry_points="[console_scripts]\nacme-run = acme_cli:main\n",
+        )
+        repo = make_repo(tmp_path, {"requirements.txt": "acme-cli==1.0.0\n", "app.py": ""})
+        balanced = analyze([vuln("acme-cli")], repo, proof_standard="balanced").results[0]
+        strict = analyze([vuln("acme-cli")], repo, proof_standard="strict").results[0]
+        assert balanced.verdict == Verdict.UNREACHABLE_STATIC
+        assert strict.verdict == Verdict.INCONCLUSIVE
 
     def test_optional_dependency_of_imported_package_is_inconclusive(self, tmp_path, site):
         install_dist(

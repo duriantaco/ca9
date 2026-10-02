@@ -44,6 +44,10 @@ _TEXT_CONFIG_PATTERNS = (
     "*.conf",
 )
 _PARSED_CONFIG_PATTERNS = ("*.ini", "*.cfg")
+_WORKFLOW_PATTERNS = ("*.yml", "*.yaml")
+# Entry-point groups that only install commands; other groups are plugin hooks
+# that a host framework can load without the project naming the package.
+_SCRIPT_ENTRY_POINT_GROUPS = frozenset({"console_scripts", "gui_scripts"})
 _TOML_PATTERN = "*.toml"
 _SKIPPED_TOML = frozenset({"poetry.lock", "uv.lock", "pdm.lock", "pipfile", "pylock.toml"})
 
@@ -210,10 +214,13 @@ def scan_repo_references(repo_path: Path) -> RepoReferences:
             continue
         name = path.name
         is_python = name.endswith(".py")
+        is_workflow = rel.parts[:2] == (".github", "workflows") and _matches(
+            name, _WORKFLOW_PATTERNS
+        )
         if is_python:
             if not _is_runtime_python_file(path, repo_path):
                 continue
-        elif not _is_scanned_config(name):
+        elif not is_workflow and not _is_scanned_config(name):
             continue
 
         try:
@@ -252,11 +259,31 @@ def collect_indirect_use_signals(
 
     if index is not None:
         groups = index.entry_points(package_name)
-        if groups:
+        plugin_groups = {
+            group: names
+            for group, names in groups.items()
+            if group not in _SCRIPT_ENTRY_POINT_GROUPS
+        }
+        if plugin_groups:
             rendered = "; ".join(
-                f"{group}: {', '.join(names[:3])}" for group, names in list(groups.items())[:3]
+                f"{group}: {', '.join(names[:3])}"
+                for group, names in list(plugin_groups.items())[:3]
             )
             signals.append(f"'{package_name}' declares entry points ({rendered})")
+        scripts = sorted(
+            {name for group in _SCRIPT_ENTRY_POINT_GROUPS for name in groups.get(group, ())}
+        )
+        if scripts:
+            if references is None:
+                signals.append(
+                    f"'{package_name}' installs commands ({', '.join(scripts[:3])}) "
+                    "and the repository was not searched for them"
+                )
+            else:
+                signals.extend(
+                    f"'{package_name}' installs a command: {hit}"
+                    for hit in references.find(scripts)
+                )
 
     dependent = (optional_dependents or {}).get(key)
     if dependent:
