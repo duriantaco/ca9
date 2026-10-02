@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from packaging.utils import canonicalize_name
 
@@ -19,6 +20,10 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python < 3.11
 
 MODE_VALUES = {"off", "warn", "block", "strict"}
 OFFLINE_MODE_VALUES = {"warn", "block", "strict"}
+# Enforcement strength used when an implicitly discovered repo policy may only tighten.
+MODE_RANK = {"off": 0, "warn": 1, "block": 2, "strict": 3}
+OFFLINE_MODE_RANK = {"warn": 0, "block": 1, "strict": 2}
+REPO_POLICY_FILENAME = "ca9.toml"
 EXCEPTION_ACTIONS = {"pass", "warn"}
 NON_OVERRIDABLE_POLICY_IDS = {"ca9.malware"}
 POLICY_SECTIONS = {
@@ -86,6 +91,25 @@ class PolicyException:
 
 
 @dataclass(frozen=True)
+class IgnoredPolicySetting:
+    key: str
+    requested: str
+    effective: str
+    source: str
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+    def warning(self) -> str:
+        return (
+            f"policy: ignored relaxing setting {self.key} = {self.requested} from "
+            f"{self.source} (kept {self.effective}); an implicitly discovered repo policy "
+            f"can only tighten enforcement. To trust it, pass --policy {self.source} "
+            f"or set CA9_POLICY={self.source}"
+        )
+
+
+@dataclass(frozen=True)
 class PackagePolicy:
     mode: ModePolicy = ModePolicy()
     registries: RegistriesPolicy = RegistriesPolicy()
@@ -95,6 +119,8 @@ class PackagePolicy:
     ci: CIPolicy = CIPolicy()
     exceptions: tuple[PolicyException, ...] = ()
     sources: tuple[str, ...] = ()
+    tighten_only_sources: tuple[str, ...] = ()
+    ignored_settings: tuple[IgnoredPolicySetting, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -110,17 +136,36 @@ def discover_policy_paths(
     env: dict[str, str] | None = None,
     home: Path | None = None,
 ) -> tuple[Path, ...]:
-    active_env = env or os.environ
+    trusted, repo_policy = discover_policy_sources(cwd=cwd, env=env, home=home)
+    return trusted if repo_policy is None else (*trusted, repo_policy)
+
+
+def discover_policy_sources(
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    home: Path | None = None,
+) -> tuple[tuple[Path, ...], Path | None]:
+    """Return (trusted policy paths, tighten-only repo policy path).
+
+    The user policy and an explicit CA9_POLICY are trusted. A ca9.toml found in
+    the working directory comes from the checked-out repository, so it may only
+    tighten the trusted policy unless CA9_POLICY names the same file.
+    """
+    active_env = os.environ if env is None else env
     current = (cwd or Path.cwd()).resolve()
     user_home = home or Path.home()
-    candidates: list[Path] = [
-        user_home / ".config" / "ca9" / "policy.toml",
-        current / "ca9.toml",
-    ]
+    trusted: list[Path] = []
+    user_policy = user_home / ".config" / "ca9" / "policy.toml"
+    if user_policy.is_file():
+        trusted.append(user_policy)
     env_path = active_env.get("CA9_POLICY")
-    if env_path:
-        candidates.append(Path(env_path).expanduser())
-    return tuple(path for path in candidates if path.is_file())
+    if env_path and Path(env_path).expanduser().is_file():
+        trusted.append(Path(env_path).expanduser())
+    repo_policy = current / REPO_POLICY_FILENAME
+    if not repo_policy.is_file() or any(_same_file(repo_policy, path) for path in trusted):
+        return tuple(trusted), None
+    return tuple(trusted), repo_policy
 
 
 def load_package_policy(path: Path | None = None) -> PackagePolicy:
@@ -136,34 +181,170 @@ def load_effective_package_policy(
     env: dict[str, str] | None = None,
     home: Path | None = None,
 ) -> PackagePolicy:
-    selected_paths = (
-        paths if paths is not None else discover_policy_paths(cwd=cwd, env=env, home=home)
-    )
+    if paths is not None:
+        trusted_paths, repo_policy = tuple(paths), None
+    else:
+        trusted_paths, repo_policy = discover_policy_sources(cwd=cwd, env=env, home=home)
     raw: dict[str, Any] = {}
     sources: list[str] = []
-    for path in selected_paths:
-        data = _read_policy_toml(path)
-        _validate_raw_policy(data, path)
-        root = dict(_policy_root(data))
-        if isinstance(root.get("exceptions"), list):
-            root["exceptions"] = [
-                {**item, "_source": str(path)} if isinstance(item, dict) else item
-                for item in root["exceptions"]
-            ]
-        raw = _deep_merge(raw, root)
+    for path in trusted_paths:
+        raw = _deep_merge(raw, _load_policy_root(path))
         sources.append(str(path))
 
     policy = _policy_from_raw(raw)
-    return PackagePolicy(
-        mode=policy.mode,
-        registries=policy.registries,
-        package_age=policy.package_age,
-        malware=policy.malware,
-        install_scripts=policy.install_scripts,
-        ci=policy.ci,
-        exceptions=policy.exceptions,
+    ignored: tuple[IgnoredPolicySetting, ...] = ()
+    tighten_only: tuple[str, ...] = ()
+    if repo_policy is not None:
+        policy, ignored = tighten_package_policy(
+            policy, _load_policy_root(repo_policy), source=str(repo_policy)
+        )
+        sources.append(str(repo_policy))
+        tighten_only = (str(repo_policy),)
+    return replace(
+        policy,
         sources=tuple(sources),
+        tighten_only_sources=tighten_only,
+        ignored_settings=ignored,
     )
+
+
+def tighten_package_policy(
+    base: PackagePolicy,
+    root: dict[str, Any],
+    *,
+    source: str,
+) -> tuple[PackagePolicy, tuple[IgnoredPolicySetting, ...]]:
+    """Overlay an untrusted policy table on base, keeping only tightening values.
+
+    Ordering per field, weakest to strongest:
+      mode.default: off < warn < block < strict
+      mode.offline: warn < block < strict
+      every boolean toggle (checks, fail_closed, approvals, CI shielding): false < true
+      registries.allow: only entries already allowed (narrowing); deny: additions only
+      package_age.minimum_hours: higher only, unless trusted policy has age checks off
+      package_age.exclusions: removals only; exceptions: never added
+    """
+    requested = _policy_from_raw(root)
+    ignored: list[IgnoredPolicySetting] = []
+
+    def ignore(key: str, requested_value: Any, effective_value: Any) -> None:
+        ignored.append(
+            IgnoredPolicySetting(
+                key=key,
+                requested=_format_policy_value(requested_value),
+                effective=_format_policy_value(effective_value),
+                source=source,
+            )
+        )
+
+    def present(section: str, key: str) -> bool:
+        table = root.get(section)
+        return isinstance(table, dict) and key in table
+
+    def ranked(key: str, want: str, have: str, ranks: dict[str, int]) -> str:
+        if ranks[want] >= ranks[have]:
+            return want
+        ignore(key, want, have)
+        return have
+
+    def stricter_bool(section: str, key: str, have: bool) -> bool:
+        want = getattr(getattr(requested, section), key)
+        if want or not have:
+            return want or have
+        ignore(f"{section}.{key}", want, have)
+        return have
+
+    def tighten_bools(section: str, current: Any) -> Any:
+        updates = {
+            key: stricter_bool(section, key, getattr(current, key))
+            for key, value in asdict(current).items()
+            if isinstance(value, bool) and present(section, key)
+        }
+        return replace(current, **updates)
+
+    mode = base.mode
+    if present("mode", "default"):
+        mode = replace(
+            mode,
+            default=ranked("mode.default", requested.mode.default, mode.default, MODE_RANK),
+        )
+    if present("mode", "offline"):
+        mode = replace(
+            mode,
+            offline=ranked("mode.offline", requested.mode.offline, mode.offline, OFFLINE_MODE_RANK),
+        )
+
+    registries = tighten_bools("registries", base.registries)
+    if present("registries", "allow"):
+        covered = tuple(
+            entry
+            for entry in requested.registries.allow
+            if _registry_entry_covered(entry, base.registries.allow)
+        )
+        widened = [entry for entry in requested.registries.allow if entry not in covered]
+        if widened:
+            ignore("registries.allow", widened, list(base.registries.allow))
+        if covered:
+            registries = replace(registries, allow=covered)
+    if present("registries", "deny"):
+        if any(entry not in requested.registries.deny for entry in base.registries.deny):
+            ignore("registries.deny", list(requested.registries.deny), list(base.registries.deny))
+        added = tuple(
+            entry for entry in requested.registries.deny if entry not in base.registries.deny
+        )
+        registries = replace(registries, deny=(*base.registries.deny, *added))
+
+    package_age = base.package_age
+    if not package_age.enabled:
+        # Any package-age configuration is at least as strict as age checks being off.
+        package_age = replace(
+            package_age,
+            **{
+                key: getattr(requested.package_age, key)
+                for key in ("enabled", "minimum_hours", "exclusions")
+                if present("package_age", key)
+            },
+        )
+    else:
+        package_age = tighten_bools("package_age", package_age)
+        if present("package_age", "minimum_hours"):
+            want_hours = requested.package_age.minimum_hours
+            if want_hours >= package_age.minimum_hours:
+                package_age = replace(package_age, minimum_hours=want_hours)
+            else:
+                ignore("package_age.minimum_hours", want_hours, package_age.minimum_hours)
+        if present("package_age", "exclusions"):
+            kept = tuple(
+                item for item in requested.package_age.exclusions if item in package_age.exclusions
+            )
+            added = [item for item in requested.package_age.exclusions if item not in kept]
+            if added:
+                ignore("package_age.exclusions", added, list(package_age.exclusions))
+            package_age = replace(package_age, exclusions=kept)
+
+    for exception in requested.exceptions:
+        if not any(_same_exception(exception, existing) for existing in base.exceptions):
+            ignore(
+                "exceptions",
+                _exception_summary(exception),
+                [_exception_summary(item) for item in base.exceptions],
+            )
+
+    tightened = replace(
+        base,
+        mode=mode,
+        registries=registries,
+        package_age=package_age,
+        malware=tighten_bools("malware", base.malware),
+        install_scripts=tighten_bools("install_scripts", base.install_scripts),
+        ci=tighten_bools("ci", base.ci),
+    )
+    validate_effective_policy(tightened)
+    return tightened, tuple(ignored)
+
+
+def policy_trust_warnings(policy: PackagePolicy) -> tuple[str, ...]:
+    return tuple(setting.warning() for setting in policy.ignored_settings)
 
 
 def validate_package_policy(path: Path | None = None) -> PackagePolicy:
@@ -183,6 +364,10 @@ def package_policy_explain(policy: PackagePolicy) -> str:
     lines = [
         "ca9 package policy",
         f"Sources: {sources}",
+    ]
+    if policy.tighten_only_sources:
+        lines.append("Tighten-only repo policy: " + ", ".join(policy.tighten_only_sources))
+    lines += [
         f"Mode: default={policy.mode.default}, offline={policy.mode.offline}",
         (
             "Registries: allow="
@@ -226,6 +411,18 @@ def package_policy_explain(policy: PackagePolicy) -> str:
         lines.append(
             f"  - {exception.policy_id} -> {exception.action} for {scope}; "
             f"owner={exception.owner}; expires={exception.expires}"
+        )
+    if policy.ignored_settings:
+        lines.append(f"Ignored relaxations: {len(policy.ignored_settings)}")
+        for setting in policy.ignored_settings:
+            lines.append(
+                f"  - {setting.key} = {setting.requested} from {setting.source} "
+                f"(kept {setting.effective})"
+            )
+        source = policy.ignored_settings[0].source
+        lines.append(
+            f"  Repo policy can only tighten; to trust it pass --policy {source} "
+            f"or set CA9_POLICY={source}"
         )
     return "\n".join(lines)
 
@@ -289,6 +486,72 @@ def expired_policy_exceptions(
     return tuple(
         exception for exception in policy.exceptions if policy_exception_expired(exception, now=now)
     )
+
+
+def _load_policy_root(path: Path) -> dict[str, Any]:
+    data = _read_policy_toml(path)
+    _validate_raw_policy(data, path)
+    root = dict(_policy_root(data))
+    if isinstance(root.get("exceptions"), list):
+        root["exceptions"] = [
+            {**item, "_source": str(path)} if isinstance(item, dict) else item
+            for item in root["exceptions"]
+        ]
+    return root
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
+
+
+def _same_exception(left: PolicyException, right: PolicyException) -> bool:
+    return replace(left, source=None) == replace(right, source=None)
+
+
+def _registry_entry_covered(entry: str, allowed: tuple[str, ...]) -> bool:
+    # Mirrors runtime registry matching: exact URL, or a path-less entry covering its host.
+    normalized = _normalize_registry_entry(entry)
+    host, _ = _registry_entry_parts(entry)
+    for candidate in allowed:
+        if normalized == _normalize_registry_entry(candidate):
+            return True
+        candidate_host, candidate_path = _registry_entry_parts(candidate)
+        if candidate_host and not candidate_path and candidate_host == host:
+            return True
+    return False
+
+
+def _normalize_registry_entry(value: str) -> str:
+    return value.strip().rstrip("/").lower()
+
+
+def _registry_entry_parts(value: str) -> tuple[str, str]:
+    raw = value.strip()
+    if "://" in raw:
+        parsed = urlparse(raw)
+        return (parsed.hostname or "").lower(), parsed.path.rstrip("/")
+    host, _, path = raw.partition("/")
+    return host.rsplit(":", 1)[0].lower(), path.rstrip("/")
+
+
+def _format_policy_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_format_policy_value(item) for item in value) + "]"
+    if isinstance(value, str):
+        return json.dumps(value)
+    return str(value)
+
+
+def _exception_summary(exception: PolicyException) -> str:
+    selectors = "/".join(
+        value for value in (exception.ecosystem, exception.package, exception.version) if value
+    )
+    return f"{exception.policy_id} for {selectors}" if selectors else exception.policy_id
 
 
 def _read_policy_toml(path: Path) -> dict[str, Any]:

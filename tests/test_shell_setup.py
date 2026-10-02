@@ -186,4 +186,42 @@ def test_doctor_shell_cli_reports_missing_setup(tmp_path):
     assert result.exit_code == 1
     data = json.loads(result.output)
     assert data["ok"] is False
-    assert set(data["missing_shims"]) == {"npm", "pip", "python"}
+    assert set(data["missing_shims"]) == {"npm", "npx", "pip", "pip3", "python", "python3"}
+
+
+def test_doctor_shell_warns_when_virtualenv_shadows_python_shim(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    profile = home / ".zshrc"
+    shim_dir = tmp_path / "shims"
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    for name in ("python", "pip"):
+        (venv_bin / name).write_text("#!/bin/sh\nexit 0\n")
+        (venv_bin / name).chmod(0o755)
+    env = {"HOME": str(home), "SHELL": "/bin/zsh"}
+    install_shell_setup(profile_path=profile, shim_dir=shim_dir, env=env)
+
+    shadowed = doctor_shell(
+        profile_path=profile,
+        shim_dir=shim_dir,
+        env={**env, "PATH": f"{venv_bin}:{shim_dir}"},
+    )
+    clean = doctor_shell(
+        profile_path=profile,
+        shim_dir=shim_dir,
+        env={**env, "PATH": f"{shim_dir}:{venv_bin}"},
+    )
+
+    assert shadowed.ok is False
+    assert shadowed.exit_code == 1
+    assert [name for name, _ in shadowed.shadowed_shims] == ["pip", "python"]
+    assert any(
+        "`python` resolves to" in warning and "export PATH=" in warning
+        for warning in shadowed.warnings
+    )
+    assert shadowed.to_dict()["shadowed_shims"] == [
+        {"name": "pip", "resolved": str(venv_bin / "pip")},
+        {"name": "python", "resolved": str(venv_bin / "python")},
+    ]
+    assert clean.ok is True

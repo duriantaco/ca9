@@ -301,7 +301,7 @@ def test_ca9_run_dry_run_without_feed_warns_on_stderr_json_and_ledger(tmp_path, 
     )
 
     assert table.exit_code == 0
-    assert "ca9 warning: malware checks are inactive" in table.stderr
+    assert "ca9: warning: malware checks are inactive" in table.stderr
     assert "ca9 feed update" in table.stderr
     assert "ca9 runtime preflight: warn" in table.stdout
     assert as_json.exit_code == 0
