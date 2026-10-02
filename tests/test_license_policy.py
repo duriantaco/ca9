@@ -19,7 +19,17 @@ def test_vet_cli_blocks_denied_wheel_license(tmp_path):
     runner = CliRunner()
     result = runner.invoke(
         main,
-        ["vet", "--repo", str(repo), "-f", "json", "--deny-license", "AGPL-3.0"],
+        [
+            "vet",
+            "--repo",
+            str(repo),
+            "-f",
+            "json",
+            "--local-artifact-root",
+            str(tmp_path),
+            "--deny-license",
+            "AGPL-3.0",
+        ],
     )
 
     assert result.exit_code == 1
@@ -37,7 +47,17 @@ def test_vet_cli_allows_non_denied_wheel_license(tmp_path):
     runner = CliRunner()
     result = runner.invoke(
         main,
-        ["vet", "--repo", str(repo), "-f", "json", "--deny-license", "AGPL-3.0"],
+        [
+            "vet",
+            "--repo",
+            str(repo),
+            "-f",
+            "json",
+            "--local-artifact-root",
+            str(tmp_path),
+            "--deny-license",
+            "AGPL-3.0",
+        ],
     )
 
     assert result.exit_code == 0
@@ -53,7 +73,16 @@ def test_vet_cli_warns_on_unknown_license_when_required(tmp_path):
     runner = CliRunner()
     result = runner.invoke(
         main,
-        ["vet", "--repo", str(repo), "-f", "json", "--require-known-license"],
+        [
+            "vet",
+            "--repo",
+            str(repo),
+            "-f",
+            "json",
+            "--local-artifact-root",
+            str(tmp_path),
+            "--require-known-license",
+        ],
     )
 
     assert result.exit_code == 0
@@ -74,7 +103,17 @@ def test_vet_cli_blocks_denied_sdist_license(tmp_path):
     runner = CliRunner()
     result = runner.invoke(
         main,
-        ["vet", "--repo", str(repo), "-f", "json", "--deny-license", "GPL-3.0"],
+        [
+            "vet",
+            "--repo",
+            str(repo),
+            "-f",
+            "json",
+            "--local-artifact-root",
+            str(tmp_path),
+            "--deny-license",
+            "GPL-3.0",
+        ],
     )
 
     assert result.exit_code == 1

@@ -985,6 +985,14 @@ def protect_cmd(
     help="Maximum artifact download size for --scan-artifacts.",
 )
 @click.option(
+    "--local-artifact-root",
+    "local_artifact_roots",
+    multiple=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Directory whose local lockfile artifacts --scan-artifacts may read. Can be repeated. "
+    "Local artifact paths are not read otherwise.",
+)
+@click.option(
     "--deny-license",
     "denied_licenses",
     multiple=True,
@@ -1031,6 +1039,7 @@ def vet_cmd(
     scan_workflows: bool,
     allow_unhashed_downloads: bool,
     max_artifact_mb: int,
+    local_artifact_roots: tuple[Path, ...],
     denied_licenses: tuple[str, ...],
     require_known_license: bool,
     offline: bool,
@@ -1142,11 +1151,16 @@ def vet_cmd(
         from ca9.analyzers.package_code import analyze_package_snapshots
         from ca9.artifacts.fetch import ArtifactScanConfig, collect_artifact_snapshots
 
+        # Lockfile URLs are untrusted input: fetch only from known or configured indexes,
+        # and read local artifacts only beneath roots the operator names.
         artifact_result = collect_artifact_snapshots(
             inventory,
             ArtifactScanConfig(
                 allow_unhashed_downloads=allow_unhashed_downloads,
                 max_artifact_bytes=max_artifact_mb * 1024 * 1024,
+                allowed_local_roots=tuple(root.resolve() for root in local_artifact_roots),
+                trusted_indexes=(*trusted_indexes, *package_policy.registries.allow),
+                private_indexes=private_indexes,
             ),
         )
         artifact_findings = [*artifact_result.findings]

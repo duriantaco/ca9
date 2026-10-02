@@ -476,7 +476,19 @@ wheels = [
     )
 
     runner = CliRunner()
-    result = runner.invoke(main, ["vet", "--repo", str(repo), "-f", "json", "--scan-artifacts"])
+    result = runner.invoke(
+        main,
+        [
+            "vet",
+            "--repo",
+            str(repo),
+            "-f",
+            "json",
+            "--scan-artifacts",
+            "--local-artifact-root",
+            str(tmp_path),
+        ],
+    )
 
     assert result.exit_code == 1
     data = json.loads(result.output)
