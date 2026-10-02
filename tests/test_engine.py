@@ -34,10 +34,14 @@ def _make_vuln(
 
 
 class TestAnalyze:
-    def test_unreachable_static(self, sample_repo):
+    def test_guessed_import_name_is_not_proof_of_absence(self, sample_repo):
+        # No metadata or curated mapping: "some_unused_package" is only a guess.
         vulns = [_make_vuln("some-unused-package")]
-        report = analyze(vulns, sample_repo)
-        assert report.results[0].verdict == Verdict.UNREACHABLE_STATIC
+        report = analyze(vulns, sample_repo, proof_standard="balanced")
+        result = report.results[0]
+        assert result.verdict == Verdict.INCONCLUSIVE
+        assert "was guessed" in result.reason
+        assert result.evidence.import_name_source == "guessed"
 
     def test_imported_no_coverage(self, sample_repo):
         vulns = [_make_vuln("requests")]
@@ -67,7 +71,7 @@ class TestAnalyze:
         assert verdicts["requests"] == Verdict.REACHABLE
         assert verdicts["PyYAML"] == Verdict.INCONCLUSIVE
         assert verdicts["Pillow"] == Verdict.INCONCLUSIVE
-        assert verdicts["some-unused-package"] == Verdict.UNREACHABLE_STATIC
+        assert verdicts["some-unused-package"] == Verdict.INCONCLUSIVE
 
     def test_report_counts(self, sample_repo, coverage_path):
         vulns = [
@@ -78,8 +82,9 @@ class TestAnalyze:
         report = analyze(vulns, sample_repo, coverage_path)
         assert report.total == 3
         assert report.reachable_count == 1
-        assert report.unreachable_count == 1
-        assert report.inconclusive_count == 1
+        # some-unused-package has a guessed import name, so it stays inconclusive.
+        assert report.unreachable_count == 0
+        assert report.inconclusive_count == 2
 
     def test_threat_intel_failure_surfaces_warning(self, sample_repo):
         vulns = [_make_vuln("requests", vuln_id="CVE-2024-0001")]
@@ -163,11 +168,23 @@ class TestAnalyze:
         assert len(r.executed_files) > 0
         assert r.reason
 
-    def test_direct_dependency_not_imported_stays_unreachable_static(self, sample_repo):
-        vulns = [_make_vuln("some-unused-package")]
-        report = analyze(vulns, sample_repo)
-        assert report.results[0].verdict == Verdict.UNREACHABLE_STATIC
-        assert "declared as a direct dependency" in report.results[0].reason
+    def test_declared_not_imported_is_unreachable_only_in_balanced(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("requests==2.0.0\nmarkupsafe==2.0.0\n")
+        (repo / "app.py").write_text("import requests\n")
+        vulns = [_make_vuln("markupsafe")]
+
+        with patch("ca9.analysis.ast_scanner.importlib.metadata.distributions", return_value=[]):
+            balanced = analyze(vulns, repo, proof_standard="balanced").results[0]
+            strict = analyze(vulns, repo, proof_standard="strict").results[0]
+
+        assert balanced.verdict == Verdict.UNREACHABLE_STATIC
+        assert "declared as a direct dependency" in balanced.reason
+        assert balanced.evidence.import_name_source == "curated"
+        assert strict.verdict == Verdict.INCONCLUSIVE
+        assert strict.original_verdict == Verdict.UNREACHABLE_STATIC
+        assert "declared but no import found" in strict.reason
 
     def test_transitive_without_dependency_graph_is_inconclusive(self, sample_repo):
         vulns = [_make_vuln("urllib3")]
@@ -220,7 +237,11 @@ class TestCoverageCompletenessPropagation:
 
 
 class TestSubmoduleAnalysis:
-    def test_submodule_not_imported_with_temp_repo(self, tmp_path):
+    @pytest.mark.parametrize("proof_standard", ["strict", "balanced"])
+    def test_submodule_not_imported_without_package_source_is_inconclusive(
+        self, tmp_path, proof_standard
+    ):
+        # Django is not installed here, so its own imports of sessions are unknown.
         repo = tmp_path / "repo"
         repo.mkdir()
         (repo / "app.py").write_text("from django.db import models\n")
@@ -231,10 +252,13 @@ class TestSubmoduleAnalysis:
                 title="Session fixation vulnerability",
             )
         ]
-        report = analyze(vulns, repo)
+        with patch("ca9.analysis.ast_scanner.importlib.metadata.distributions", return_value=[]):
+            report = analyze(vulns, repo, proof_standard=proof_standard)
         r = report.results[0]
-        assert r.verdict == Verdict.UNREACHABLE_STATIC
+        assert r.verdict == Verdict.INCONCLUSIVE
+        assert r.evidence.submodule_imported is None
         assert "django.contrib.sessions" in r.reason
+        assert "cannot be ruled out" in r.reason
         assert r.affected_component is not None
         assert r.affected_component.confidence == "high"
 

@@ -151,7 +151,8 @@ class TestCLI:
         data = json.loads(result.output)
         verdicts = {r["package"]: r["verdict"] for r in data["results"]}
         assert verdicts["requests"] == "reachable"
-        assert verdicts["some-unused-package"] == "unreachable_static"
+        # Its import name is only guessed, so a missing import cannot prove it unused.
+        assert verdicts["some-unused-package"] == "inconclusive"
         assert result.exit_code == 1
 
     def test_strict_default_keeps_incomplete_measurement_inconclusive(

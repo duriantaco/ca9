@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib.metadata
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -11,44 +12,25 @@ from packaging.markers import InvalidMarker, Marker, default_environment
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 
+from ca9.analysis.import_names import (
+    CURATED_RENAMES,
+    environment_index,
+    resolve_import_names,
+)
+
+# Primary import names for distributions whose module name differs from the
+# distribution name. Kept for compatibility; see ca9.analysis.import_names.
 PYPI_TO_IMPORT: dict[str, str] = {
-    "beautifulsoup4": "bs4",
-    "dateutil": "dateutil",
-    "django-rest-framework": "rest_framework",
-    "djangorestframework": "rest_framework",
-    "elasticsearch-dsl": "elasticsearch_dsl",
-    "google-api-python-client": "googleapiclient",
-    "google-auth": "google.auth",
-    "google-cloud-storage": "google.cloud.storage",
-    "jinja2": "jinja2",
-    "msgpack-python": "msgpack",
-    "opencv-python": "cv2",
-    "opencv-python-headless": "cv2",
-    "pillow": "PIL",
-    "protobuf": "google.protobuf",
-    "pyasn1": "pyasn1",
-    "pycryptodome": "crypto",
-    "pyjwt": "jwt",
-    "pymongo": "pymongo",
-    "pyopenssl": "openssl",
-    "python-dateutil": "dateutil",
-    "python-dotenv": "dotenv",
-    "python-jose": "jose",
-    "python-multipart": "multipart",
-    "pyyaml": "yaml",
-    "scikit-learn": "sklearn",
-    "sentry-sdk": "sentry_sdk",
-    "setuptools": "setuptools",
-    "typing-extensions": "typing_extensions",
-    "websocket-client": "websocket",
+    name: import_names[0] for name, import_names in CURATED_RENAMES.items()
 }
 
 
 def pypi_to_import_name(package_name: str) -> str:
-    lower = package_name.lower()
-    if lower in PYPI_TO_IMPORT:
-        return PYPI_TO_IMPORT[lower]
-    return lower.replace("-", "_")
+    return resolve_import_names(package_name).primary
+
+
+def pypi_to_import_names(package_name: str) -> tuple[str, ...]:
+    return resolve_import_names(package_name).names
 
 
 def collect_imports_from_source(source: str) -> set[str]:
@@ -61,17 +43,27 @@ def collect_imports_from_source(source: str) -> set[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                imports.add(alias.name)
+                _add_with_parents(imports, alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
-            imports.add(node.module)
+            # Relative imports name project modules, not installed packages.
+            if node.level:
+                continue
+            _add_with_parents(imports, node.module)
             for alias in node.names:
                 if alias.name != "*":
                     imports.add(f"{node.module}.{alias.name}")
         elif isinstance(node, ast.Call):
             dynamic_import = _extract_dynamic_import_name(node)
             if dynamic_import:
-                imports.add(dynamic_import)
+                _add_with_parents(imports, dynamic_import)
     return imports
+
+
+def _add_with_parents(imports: set[str], module: str) -> None:
+    # Importing a.b.c executes a and a.b first, so record every parent package.
+    parts = module.split(".")
+    for i in range(1, len(parts) + 1):
+        imports.add(".".join(parts[:i]))
 
 
 def _extract_static_string(node: ast.AST) -> str | None:
@@ -155,11 +147,21 @@ def _is_runtime_python_file(py_file: Path, repo_path: Path) -> bool:
     )
 
 
+def iter_runtime_python_files(repo_path: Path):
+    for dirpath, dirnames, filenames in os.walk(repo_path):
+        # Prune vendored environments instead of walking and discarding them.
+        dirnames[:] = sorted(d for d in dirnames if d not in _EXCLUDED_DIRS)
+        for filename in sorted(filenames):
+            if not filename.endswith(".py"):
+                continue
+            py_file = Path(dirpath) / filename
+            if _is_runtime_python_file(py_file, repo_path):
+                yield py_file
+
+
 def collect_imports_from_repo(repo_path: Path) -> set[str]:
     all_imports: set[str] = set()
-    for py_file in repo_path.rglob("*.py"):
-        if not _is_runtime_python_file(py_file, repo_path):
-            continue
+    for py_file in iter_runtime_python_files(repo_path):
         try:
             source = py_file.read_text(encoding="utf-8", errors="ignore")
         except OSError:
@@ -169,16 +171,16 @@ def collect_imports_from_repo(repo_path: Path) -> set[str]:
 
 
 def is_package_imported(package_name: str, repo_imports: set[str]) -> bool:
-    import_name = pypi_to_import_name(package_name)
-    target = import_name.lower()
+    return imports_any_module(pypi_to_import_names(package_name), repo_imports)
 
+
+def imports_any_module(import_names: tuple[str, ...], repo_imports: set[str]) -> bool:
+    targets = [name.lower() for name in import_names]
     for imp in repo_imports:
         imp_lower = imp.lower()
-        if imp_lower == target:
-            return True
-        if imp_lower.startswith(target + "."):
-            return True
-
+        for target in targets:
+            if imp_lower == target or imp_lower.startswith(target + "."):
+                return True
     return False
 
 
@@ -748,12 +750,12 @@ def discover_declared_dependencies(repo_path: Path) -> set[str]:
 
 
 def _get_direct_deps(package_name: str) -> list[str]:
-    try:
-        reqs = importlib.metadata.requires(package_name)
-    except importlib.metadata.PackageNotFoundError:
-        return []
-    if reqs is None:
-        return []
+    reqs = environment_index().requirements(package_name)
+    if not reqs:
+        try:
+            reqs = importlib.metadata.requires(package_name) or []
+        except importlib.metadata.PackageNotFoundError:
+            return []
     deps = []
     for req_str in reqs:
         if "extra ==" in req_str or "extra==" in req_str:
@@ -764,20 +766,23 @@ def _get_direct_deps(package_name: str) -> list[str]:
     return deps
 
 
+def _directly_imported_distributions(repo_imports: set[str]) -> set[str] | None:
+    index = environment_index()
+    if not index.available:
+        return None
+    return {
+        key
+        for key in index.distributions
+        if imports_any_module(index.resolve(key).names, repo_imports)
+    }
+
+
 def resolve_transitive_deps(repo_imports: set[str]) -> tuple[dict[str, str], bool]:
-    directly_imported: set[str] = set()
-    try:
-        for dist in importlib.metadata.distributions():
-            name = dist.metadata["Name"]
-            if name and is_package_imported(name, repo_imports):
-                directly_imported.add(name)
-    except Exception:
+    directly_imported = _directly_imported_distributions(repo_imports)
+    if not directly_imported:
         return {}, False
 
-    direct_lower = {canonicalize_name(n) for n in directly_imported}
-    if not direct_lower:
-        return {}, False
-
+    direct_lower = set(directly_imported)
     transitive: dict[str, str] = {}
     visited: set[str] = set()
 
@@ -792,7 +797,133 @@ def resolve_transitive_deps(repo_imports: set[str]) -> tuple[dict[str, str], boo
                 transitive[dep_lower] = root
             _walk(dep, root)
 
-    for pkg in directly_imported:
+    for pkg in sorted(directly_imported):
         _walk(pkg, pkg)
 
     return transitive, True
+
+
+def resolve_optional_dependents(repo_imports: set[str]) -> dict[str, str]:
+    """Map packages named only in extras of imported distributions to that distribution.
+
+    Libraries often import optional dependencies lazily (pandas -> openpyxl), so
+    such a package can run without the project importing it.
+    """
+    directly_imported = _directly_imported_distributions(repo_imports) or set()
+    index = environment_index()
+    optional: dict[str, str] = {}
+    for key in sorted(directly_imported):
+        for req_str in index.requirements(key):
+            if "extra ==" not in req_str and "extra==" not in req_str:
+                continue
+            name = _parse_requirement_name(req_str)
+            if name:
+                optional.setdefault(canonicalize_name(name), key)
+    return optional
+
+
+def _local_module_names(repo_path: Path) -> set[str]:
+    names: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(repo_path):
+        dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
+        py_files = [f for f in filenames if f.endswith(".py")]
+        if not py_files:
+            continue
+        rel_parts = Path(dirpath).relative_to(repo_path).parts
+        names.update(part.lower() for part in rel_parts)
+        names.update(f[:-3].lower() for f in py_files)
+    return names
+
+
+def find_unresolved_imports(repo_path: Path, repo_imports: set[str]) -> tuple[str, ...]:
+    """Top-level modules the project imports that no installed distribution provides.
+
+    The environment dependency graph only covers installed distributions, so an
+    imported package missing from the environment hides its dependencies.
+    """
+    index = environment_index()
+    if not index.available:
+        return ()
+
+    provided: set[str] = set()
+    provided_parents: set[str] = set()
+    for key in index.distributions:
+        for name in index.resolve(key).names:
+            lowered = name.lower()
+            provided.add(lowered)
+            parts = lowered.split(".")
+            for i in range(1, len(parts)):
+                provided_parents.add(".".join(parts[:i]))
+
+    ignored = set(getattr(sys, "stdlib_module_names", ())) | set(sys.builtin_module_names)
+    ignored |= {"__future__", "__main__"}
+    ignored = {name.lower() for name in ignored} | _local_module_names(repo_path)
+
+    unresolved: set[str] = set()
+    for imp in repo_imports:
+        lowered = imp.lower()
+        parts = lowered.split(".")
+        if parts[0] in ignored:
+            continue
+        if lowered in provided_parents:
+            continue
+        if any(".".join(parts[:i]) in provided for i in range(1, len(parts) + 1)):
+            continue
+        unresolved.add(imp.split(".", 1)[0])
+    if not unresolved:
+        return ()
+
+    # An import of a module missing here that sits under "except ImportError"
+    # (as the attempt or the fallback) either never runs or fails in this
+    # environment, so it loads nothing; only unguarded imports count.
+    unguarded: set[str] = set()
+    for py_file in iter_runtime_python_files(repo_path):
+        try:
+            source = py_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if any(name in source for name in unresolved - unguarded):
+            unguarded |= _unguarded_import_roots(source) & unresolved
+        if unguarded == unresolved:
+            break
+    return tuple(sorted(unguarded))
+
+
+_IMPORT_ERROR_NAMES = frozenset(
+    {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
+)
+
+
+def _catches_import_error(handler: ast.ExceptHandler) -> bool:
+    if handler.type is None:
+        return True
+    types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return any(isinstance(t, ast.Name) and t.id in _IMPORT_ERROR_NAMES for t in types)
+
+
+def _unguarded_import_roots(source: str) -> set[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+
+    try_types = tuple(t for t in (ast.Try, getattr(ast, "TryStar", None)) if t is not None)
+    guarded: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, try_types) and any(_catches_import_error(h) for h in node.handlers):
+            for stmt in [*node.body, *node.handlers]:
+                guarded.update(id(child) for child in ast.walk(stmt))
+
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        if id(node) in guarded:
+            continue
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            roots.add(node.module.split(".", 1)[0])
+        elif isinstance(node, ast.Call):
+            dynamic = _extract_dynamic_import_name(node)
+            if dynamic:
+                roots.add(dynamic.split(".", 1)[0])
+    return roots

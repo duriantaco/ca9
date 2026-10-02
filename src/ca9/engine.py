@@ -10,9 +10,9 @@ from ca9.analysis.api_usage import find_api_usage
 from ca9.analysis.ast_scanner import (
     collect_imports_from_repo,
     discover_declared_dependencies,
-    is_package_imported,
-    is_submodule_imported,
-    pypi_to_import_name,
+    find_unresolved_imports,
+    imports_any_module,
+    resolve_optional_dependents,
     resolve_transitive_deps,
 )
 from ca9.analysis.coverage_reader import (
@@ -24,6 +24,17 @@ from ca9.analysis.coverage_reader import (
     load_coverage,
     observe_coverage,
 )
+from ca9.analysis.import_names import (
+    EnvironmentIndex,
+    environment_index,
+    reset_environment_index,
+)
+from ca9.analysis.indirect_use import (
+    RepoReferences,
+    collect_indirect_use_signals,
+    scan_repo_references,
+)
+from ca9.analysis.package_imports import submodules_loaded_by_package
 from ca9.analysis.vuln_matcher import extract_affected_component
 from ca9.intel_rules import VulnIntelResolution, resolve_vuln_intel
 from ca9.models import (
@@ -69,12 +80,20 @@ def _apply_proof_standard(result: VerdictResult, proof_standard: str) -> Verdict
     adjustment: str | None = None
 
     if result.verdict == Verdict.UNREACHABLE_STATIC:
-        if (
-            evidence.version_in_range is not False
-            and not evidence.declared_direct_dependency
-            and evidence.submodule_imported is not False
-            and evidence.dependency_graph_source == "environment"
-        ):
+        if evidence.version_in_range is False:
+            adjustment = None
+        elif not evidence.package_imported and evidence.declared_direct_dependency:
+            adjustment = (
+                "strict proof downgraded this suppression: declared but no import found; "
+                "may be used via CLI, plugin, or string-based loading"
+            )
+        elif evidence.package_imported and evidence.submodule_imported is False:
+            adjustment = (
+                "strict proof downgraded this suppression because static analysis of the "
+                "package's own imports cannot rule out plugins, configuration strings, or "
+                "dynamic loading of the affected submodule"
+            )
+        elif evidence.dependency_graph_source == "environment":
             adjustment = (
                 "strict proof downgraded this suppression because the dependency graph "
                 "came from the ambient environment rather than the report"
@@ -120,6 +139,10 @@ def collect_evidence(
     production_trace_count: int = 0,
     global_warnings: tuple[str, ...] = (),
     measured_files: dict[str, FileCoverage] | None = None,
+    *,
+    references: RepoReferences | None = None,
+    optional_dependents: dict[str, str] | None = None,
+    unresolved_imports: tuple[str, ...] = (),
 ) -> Evidence:
     warnings: list[str] = list(global_warnings)
 
@@ -128,10 +151,17 @@ def collect_evidence(
     if version_result.error:
         warnings.append(version_result.error)
 
+    index = environment_index()
+    resolution = index.resolve(vuln.package_name)
+    import_names = resolution.names
+    if import_name not in import_names:
+        import_names = (import_name, *import_names)
+    unproven_import_mappings: list[str] = []
+
     vuln_name_key = canonicalize_name(vuln.package_name)
     report_dep_kind = _report_dependency_kind(vuln)
     report_dep_root = _report_dependency_root(vuln)
-    direct = is_package_imported(vuln.package_name, repo_imports)
+    direct = imports_any_module(import_names, repo_imports)
     declared_direct_dependency = (
         vuln_name_key in declared_direct_deps or report_dep_kind == "direct"
     )
@@ -139,10 +169,13 @@ def collect_evidence(
     dependency_graph_source = ""
     if not direct:
         if report_dep_root is not None:
-            if is_package_imported(report_dep_root, repo_imports):
+            root_resolution = index.resolve(report_dep_root)
+            if imports_any_module(root_resolution.names, repo_imports):
                 dep_of = report_dep_root
             else:
                 dep_of = None
+                if not root_resolution.authoritative:
+                    unproven_import_mappings.append(report_dep_root)
             dependency_graph_source = "report"
         else:
             dep_of = transitive_deps.get(vuln_name_key)
@@ -151,6 +184,8 @@ def collect_evidence(
     else:
         dep_of = None
     package_imported = direct or dep_of is not None
+    if not package_imported and not resolution.authoritative:
+        unproven_import_mappings.insert(0, vuln.package_name)
 
     if direct:
         dependency_kind = "direct"
@@ -159,11 +194,30 @@ def collect_evidence(
     else:
         dependency_kind = None
 
+    # The environment graph covers only installed distributions; an imported
+    # package missing from the environment hides its own dependencies.
+    graph_unresolved: tuple[str, ...] = ()
+    environment_graph_complete = dependency_graph_available
+    if dependency_graph_available and unresolved_imports and not report_graph_available:
+        environment_graph_complete = False
+        if not package_imported:
+            graph_unresolved = tuple(unresolved_imports)
+
     if not dependency_graph_source:
         if report_graph_available:
             dependency_graph_source = "report"
         elif dependency_graph_available:
             dependency_graph_source = "environment"
+
+    indirect_use_signals: tuple[str, ...] = ()
+    if not package_imported:
+        indirect_use_signals = collect_indirect_use_signals(
+            vuln.package_name,
+            import_names,
+            references,
+            index,
+            optional_dependents,
+        )
 
     if component is None:
         component = extract_affected_component(vuln)
@@ -171,21 +225,19 @@ def collect_evidence(
     affected_component_confidence = _confidence_str_to_int(component.confidence)
 
     submodule_imported: bool | None = None
+    submodule_evidence = ""
     has_submodule_info = component.submodule_paths and component.confidence in ("high", "medium")
 
     if has_submodule_info and package_imported:
-        sub_imported, _matched = is_submodule_imported(component.submodule_paths, repo_imports)
-        if sub_imported:
-            submodule_imported = True
-        else:
-            root_imported = any(imp.lower() == import_name.lower() for imp in repo_imports)
-            has_dotted_imports = any(
-                imp.lower().startswith(import_name.lower() + ".") for imp in repo_imports
-            )
-            if has_dotted_imports and not root_imported:
-                submodule_imported = False
-            else:
-                submodule_imported = None
+        submodule_imported, submodule_evidence = _submodule_import_evidence(
+            vuln,
+            import_names,
+            component.submodule_paths,
+            repo_imports,
+            references,
+            index,
+            app_imports_package=direct,
+        )
 
     coverage_seen: bool | None = None
     coverage_files: tuple[str, ...] = ()
@@ -262,7 +314,7 @@ def collect_evidence(
     return Evidence(
         version_in_range=version_in_range,
         dependency_kind=dependency_kind,
-        dependency_graph_available=dependency_graph_available or report_graph_available,
+        dependency_graph_available=environment_graph_complete or report_graph_available,
         dependency_graph_source=dependency_graph_source,
         declared_direct_dependency=declared_direct_dependency,
         package_imported=package_imported,
@@ -286,7 +338,80 @@ def collect_evidence(
         coverage_scope=coverage_scope,
         coverage_measured_files=coverage_measured_files,
         coverage_unmeasured_targets=coverage_unmeasured_targets,
+        import_names=import_names,
+        import_name_source=resolution.source,
+        package_installed=resolution.installed,
+        indirect_use_signals=indirect_use_signals,
+        unproven_import_mappings=tuple(unproven_import_mappings),
+        submodule_evidence=submodule_evidence,
+        dependency_graph_unresolved=graph_unresolved,
     )
+
+
+def _match_submodule(submodule_paths: tuple[str, ...], names: set[str]) -> str | None:
+    # Only the target or something beneath it proves the target loads; a parent
+    # package import is settled by the package's own import graph instead.
+    for submod in submodule_paths:
+        target = submod.lower()
+        for name in sorted(names):
+            lowered = name.lower()
+            if lowered == target or lowered.startswith(target + "."):
+                return name
+    return None
+
+
+def _submodule_import_evidence(
+    vuln: Vulnerability,
+    import_names: tuple[str, ...],
+    submodule_paths: tuple[str, ...],
+    repo_imports: set[str],
+    references: RepoReferences | None,
+    index: EnvironmentIndex,
+    *,
+    app_imports_package: bool,
+) -> tuple[bool | None, str]:
+    matched = _match_submodule(submodule_paths, repo_imports)
+    if matched is not None:
+        return True, f"'{matched}' is imported"
+
+    string_imports = dict(references.dotted_strings) if references else {}
+    matched = _match_submodule(submodule_paths, set(string_imports))
+    if matched is not None:
+        return True, f"'{matched}' is named as a module string in {string_imports[matched]}"
+
+    if not app_imports_package:
+        return None, "it is loaded through a dependent package whose imports were not analyzed"
+
+    installed_version = index.version(vuln.package_name)
+    if installed_version is None:
+        return None, (
+            f"'{vuln.package_name}' source is not installed in the analysis environment, so "
+            "the package's own imports of the affected submodule cannot be ruled out"
+        )
+    if not _same_version(installed_version, vuln.package_version):
+        return None, (
+            f"installed '{vuln.package_name}' is {installed_version}, not the reported "
+            f"{vuln.package_version}, so its source cannot rule out internal imports"
+        )
+
+    app_imports = repo_imports | set(string_imports)
+    for name in import_names:
+        targets = tuple(
+            path for path in submodule_paths if path == name or path.startswith(name + ".")
+        )
+        if not targets:
+            continue
+        return submodules_loaded_by_package(name, app_imports, targets)
+    return None, "the affected submodule is outside the package's import names"
+
+
+def _same_version(left: str, right: str) -> bool:
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return Version(left) == Version(right)
+    except InvalidVersion:
+        return left == right
 
 
 def _confidence_str_to_int(confidence: str) -> int:
@@ -370,6 +495,52 @@ def derive_verdict(
         return _inconclusive_coverage(vuln, evidence, import_name, component, dep_of, trace)
 
     if not evidence.package_imported:
+        if evidence.api_usage_seen is True:
+            # A located call into the vulnerable API outweighs a missed import.
+            return VerdictResult(
+                vulnerability=vuln,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=(
+                    f"no import of '{vuln.package_name}' was matched, but "
+                    f"{len(evidence.api_usage_hits)} vulnerable API call(s) were found"
+                ),
+                imported_as=import_name,
+                affected_component=component,
+                evidence=evidence,
+            )
+
+        if evidence.unproven_import_mappings:
+            guessed = ", ".join(f"'{name}'" for name in evidence.unproven_import_mappings)
+            return VerdictResult(
+                vulnerability=vuln,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=(
+                    f"no import of '{vuln.package_name}' was found, but the import name for "
+                    f"{guessed} was guessed (no installed metadata or curated mapping), so a "
+                    "missing import does not prove it is unused"
+                ),
+                imported_as=import_name,
+                affected_component=component,
+                evidence=evidence,
+            )
+
+        if evidence.indirect_use_signals:
+            if evidence.declared_direct_dependency:
+                lead = f"'{vuln.package_name}' is declared as a direct dependency with no import"
+            else:
+                lead = f"'{vuln.package_name}' is not imported"
+            return VerdictResult(
+                vulnerability=vuln,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=(
+                    f"{lead}, but it may be used without an import: "
+                    + "; ".join(evidence.indirect_use_signals[:3])
+                ),
+                imported_as=import_name,
+                affected_component=component,
+                evidence=evidence,
+            )
+
         if evidence.declared_direct_dependency:
             return VerdictResult(
                 vulnerability=vuln,
@@ -381,13 +552,22 @@ def derive_verdict(
             )
 
         if not evidence.dependency_graph_available:
+            if evidence.dependency_graph_unresolved:
+                missing = ", ".join(evidence.dependency_graph_unresolved[:5])
+                reason = (
+                    f"'{vuln.package_name}' is not directly imported, but the dependency graph is "
+                    f"incomplete because imported modules ({missing}) are not installed in the "
+                    "analysis environment"
+                )
+            else:
+                reason = (
+                    f"'{vuln.package_name}' is not directly imported, but no dependency graph "
+                    f"is available to prove it is unused transitively"
+                )
             return VerdictResult(
                 vulnerability=vuln,
                 verdict=Verdict.INCONCLUSIVE,
-                reason=(
-                    f"'{vuln.package_name}' is not directly imported, but no dependency graph "
-                    f"is available to prove it is unused transitively"
-                ),
+                reason=reason,
                 imported_as=import_name,
                 affected_component=component,
                 evidence=evidence,
@@ -408,10 +588,11 @@ def derive_verdict(
     if has_submodule_info:
         if evidence.submodule_imported is False:
             submod_list = ", ".join(component.submodule_paths)
+            detail = f"; {evidence.submodule_evidence}" if evidence.submodule_evidence else ""
             return VerdictResult(
                 vulnerability=vuln,
                 verdict=Verdict.UNREACHABLE_STATIC,
-                reason=f"{trace}, but affected submodule {submod_list} is not imported",
+                reason=f"{trace}, but affected submodule {submod_list} is not imported{detail}",
                 imported_as=import_name,
                 dependency_of=dep_of,
                 affected_component=component,
@@ -419,10 +600,19 @@ def derive_verdict(
             )
 
         if not has_coverage:
+            if evidence.submodule_imported is None and evidence.submodule_evidence:
+                detail = (
+                    f"affected submodule {', '.join(component.submodule_paths)} is not "
+                    f"imported directly, but {evidence.submodule_evidence}"
+                )
+            elif evidence.submodule_imported is True and evidence.submodule_evidence:
+                detail = f"{evidence.submodule_evidence}, but no coverage data to confirm execution"
+            else:
+                detail = "but no coverage data to confirm execution"
             return VerdictResult(
                 vulnerability=vuln,
                 verdict=Verdict.INCONCLUSIVE,
-                reason=f"{trace}, but no coverage data to confirm execution",
+                reason=f"{trace}, {detail}",
                 imported_as=import_name,
                 dependency_of=dep_of,
                 affected_component=component,
@@ -532,9 +722,16 @@ def analyze(
     threat_intel: bool = False,
     otel_traces_path: Path | None = None,
 ) -> Report:
+    # Read installed metadata fresh for each analysis.
+    reset_environment_index()
     repo_imports = collect_imports_from_repo(repo_path)
     declared_direct_deps = discover_declared_dependencies(repo_path)
     transitive_deps, dependency_graph_available = resolve_transitive_deps(repo_imports)
+    references = scan_repo_references(repo_path)
+    optional_dependents = resolve_optional_dependents(repo_imports)
+    unresolved_imports = (
+        find_unresolved_imports(repo_path, repo_imports) if dependency_graph_available else ()
+    )
     analysis_warnings: list[str] = []
 
     covered_files: dict[str, list[int]] | None = None
@@ -601,7 +798,8 @@ def analyze(
             )
             continue
 
-        import_name = pypi_to_import_name(vuln.package_name)
+        import_names = environment_index().resolve(vuln.package_name).names
+        import_name = import_names[0]
         component = extract_affected_component(vuln)
 
         intel = vuln_intel.get(vuln.id)
@@ -617,9 +815,8 @@ def analyze(
         prod_observed: bool | None = None
         prod_count = 0
         if otel_modules is not None:
-            import_lower = import_name.lower()
             for mod, count in otel_modules.items():
-                if mod.lower() == import_lower or mod.lower().startswith(import_lower + "."):
+                if imports_any_module(import_names, {mod}):
                     prod_observed = True
                     prod_count += count
             if prod_observed is None:
@@ -642,6 +839,9 @@ def analyze(
             production_trace_count=prod_count,
             global_warnings=tuple(analysis_warnings),
             measured_files=measured_files,
+            references=references,
+            optional_dependents=optional_dependents,
+            unresolved_imports=unresolved_imports,
         )
 
         if evidence.dependency_kind == "transitive":
