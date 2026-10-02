@@ -645,7 +645,24 @@ def _registry_from_resolved(resolved: str | None) -> str | None:
     parsed = urlparse(resolved)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return None
-    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{_registry_base_path(parsed.path)}"
+
+
+def _registry_base_path(path: str) -> str:
+    # npm tarball URLs are <registry>/<name>/-/<file>.tgz, where a scoped name
+    # adds an "@scope" segment. Keep the registry's own path so repositories
+    # sharing one host (for example Artifactory remote and internal repos)
+    # stay distinguishable. Unrecognized URL shapes fall back to the origin.
+    segments = path.split("/")
+    if "-" not in segments:
+        return ""
+    marker = len(segments) - 1 - segments[::-1].index("-")
+    base = segments[:marker]
+    if len(base) > 1:
+        base.pop()
+    if len(base) > 1 and base[-1].startswith("@"):
+        base.pop()
+    return "/".join(base).rstrip("/")
 
 
 def _requested_source_kind(specifiers: tuple[str, ...]) -> str:

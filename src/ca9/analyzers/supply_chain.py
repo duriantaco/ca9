@@ -513,7 +513,11 @@ def _package_evidence(package: Package, default_source: str) -> SourceEvidence:
 
 
 def _is_trusted_index(registry: str, policy: SupplyChainPolicy) -> bool:
-    return _registry_matches(registry, policy.trusted_indexes)
+    # A configured private index is an explicit trust decision for the
+    # internal packages it serves.
+    return _registry_matches(registry, policy.trusted_indexes) or _registry_matches(
+        registry, policy.private_indexes
+    )
 
 
 def _is_denied_index(registry: str, policy: SupplyChainPolicy) -> bool:
@@ -549,7 +553,15 @@ def _registry_matches(registry: str, candidates: tuple[str, ...]) -> bool:
     normalized_registry = _normalize_index_url(registry)
     registry_host = _index_host(registry)
     for candidate in candidates:
-        if normalized_registry == _normalize_index_url(candidate):
+        normalized_candidate = _normalize_index_url(candidate)
+        if normalized_registry == normalized_candidate:
+            return True
+        # A configured index with a path covers registries beneath it, matched
+        # on whole path segments so ".../npm-internal" never covers
+        # ".../npm-internal-evil".
+        if "://" in normalized_candidate and normalized_registry.startswith(
+            normalized_candidate + "/"
+        ):
             return True
         candidate_host = _index_host(candidate)
         parsed_candidate = urlparse(candidate.strip())
