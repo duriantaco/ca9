@@ -533,7 +533,11 @@ def _observation_evidence(text: str, rule: str, suffix: str) -> str:
         except SyntaxError:
             return text
     patterns = {
-        "npm-encoded-execution": (package_code._JS_ENCODED_EXEC_RE,),
+        "npm-encoded-execution": (
+            package_code._JS_ENCODED_EXEC_RE,
+            package_code._JS_SINK_WRAPS_DECODE_RE,
+        ),
+        "npm-obfuscated-require": (package_code._JS_OBFUSCATED_REQUIRE_HINT_RE,),
         "npm-credential-exfiltration": (
             package_code._JS_CREDENTIAL_RE,
             package_code._JS_NETWORK_RE,

