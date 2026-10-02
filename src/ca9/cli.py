@@ -461,7 +461,13 @@ def feed_group() -> None:
     default="table",
     help="Output format.",
 )
-def feed_update_cmd(source: str | None, output_format: str) -> None:
+@click.option(
+    "--allow-downgrade",
+    is_flag=True,
+    default=False,
+    help="Install a snapshot even if it is older than the installed one (rollback).",
+)
+def feed_update_cmd(source: str | None, output_format: str, allow_downgrade: bool) -> None:
     """Install a package intelligence feed snapshot into the local ca9 cache."""
     import os
 
@@ -470,7 +476,7 @@ def feed_update_cmd(source: str | None, output_format: str) -> None:
     resolved_source = source or os.environ.get("CA9_FEED_URL") or DEFAULT_FEED_URL
 
     try:
-        snapshot = update_feed_from_source(resolved_source)
+        snapshot = update_feed_from_source(resolved_source, allow_downgrade=allow_downgrade)
     except FeedError as exc:
         raise click.ClickException(str(exc)) from None
 

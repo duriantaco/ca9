@@ -478,9 +478,7 @@ def _apply_malware_tier(
     try:
         status = feed_status(policy=package_policy, cache_dir=feed_cache_dir)
         if status.state in {"missing", "stale"} and not package_policy.malware.fail_closed:
-            warnings.append(
-                f"malware feed is {status.state}; malware tier skipped: {status.reason}"
-            )
+            # package_malware_findings reports the missing/stale feed warning itself.
             for package in candidates:
                 review_reasons_by_key.setdefault(_audit_key(package), []).append(
                     "malware-tier-unavailable"

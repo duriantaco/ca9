@@ -1524,7 +1524,9 @@ def _write_feed_bundle(
     )
     bundle = {
         "schema": "ca9.feed.v1",
-        "created_at": "2026-06-26T00:00:00Z",
+        "created_at": (
+            datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=1)
+        ).isoformat(),
         "expires_at": expires,
         "datasets": {
             "pypi-malware": {"packages": pypi_malware or []},

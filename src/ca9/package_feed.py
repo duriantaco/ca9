@@ -5,15 +5,19 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+from packaging.utils import canonicalize_name
 
 from ca9.core.models import Evidence, Finding, Package, RiskSignal, SourceEvidence, package_key
 from ca9.package_policy import PackagePolicy
@@ -27,6 +31,20 @@ SNAPSHOT_FILE = "snapshot.json"
 # Published daily by .github/workflows/feed.yml to the `feed` branch.
 # Override with the CA9_FEED_URL environment variable or `--from`.
 DEFAULT_FEED_URL = "https://raw.githubusercontent.com/duriantaco/ca9/feed/latest.json"
+# Install-time limits. Feeds are not signed yet, so these bound what a hostile or
+# broken source can do: oversized downloads, rollback to an older snapshot, a
+# far-future created_at, or an expiry that keeps stale data "current" forever.
+MAX_FEED_DOWNLOAD_BYTES = 256 * 1024 * 1024
+MAX_FEED_LIFETIME = timedelta(days=30)
+MAX_FEED_CLOCK_SKEW = timedelta(hours=24)
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+# In-process caches keyed by file identity (path, device, inode, size, mtime), so a
+# rewritten dataset is re-verified and re-parsed while repeat lookups stay cheap.
+_CACHE_LOCK = threading.Lock()
+_VERIFIED_FILES: OrderedDict[tuple[Any, ...], str] = OrderedDict()
+_LOADED_DATASETS: OrderedDict[tuple[Any, ...], _LoadedDataset] = OrderedDict()
+_VERIFIED_FILES_MAX = 64
+_LOADED_DATASETS_MAX = 8
 
 
 class FeedError(ValueError):
@@ -53,9 +71,13 @@ class FeedSnapshot:
     source: str | None = None
     updated_at: str | None = None
 
+    def effective_expires_at(self) -> datetime:
+        """``expires_at``, capped at ``created_at + MAX_FEED_LIFETIME``."""
+        return _capped_expiry(_parse_time(self.created_at), _parse_time(self.expires_at))
+
     def is_expired(self, *, now: datetime | None = None) -> bool:
         active_now = now or datetime.now(timezone.utc)
-        return _parse_time(self.expires_at) <= active_now
+        return self.effective_expires_at() <= active_now
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,11 +133,28 @@ def update_feed_from_source(
     source: str | Path,
     *,
     cache_dir: Path | None = None,
+    allow_downgrade: bool = False,
+    now: datetime | None = None,
 ) -> FeedSnapshot:
     feed_dir = cache_dir or default_feed_cache_dir()
     source_ref = str(source)
+    active_now = now or datetime.now(timezone.utc)
     metadata, dataset_bytes = _load_source(source_ref)
     _validate_required_datasets(dataset_bytes)
+    created_at = _parse_time(_metadata_time(metadata, "created_at"))
+    if created_at > active_now + MAX_FEED_CLOCK_SKEW:
+        raise FeedError(
+            f"{source_ref}: feed created_at {metadata['created_at']} is more than "
+            f"{_format_duration(MAX_FEED_CLOCK_SKEW)} in the future; "
+            "check the feed source and the system clock"
+        )
+    if not allow_downgrade:
+        _reject_rollback(feed_dir, created_at, metadata["created_at"], source_ref)
+    expires_at = _parse_time(_metadata_time(metadata, "expires_at"))
+    if _capped_expiry(created_at, expires_at) < expires_at:
+        # Never honor a lifetime longer than MAX_FEED_LIFETIME, so a feed cannot stay
+        # "current" for years and suppress the stale-feed warnings.
+        metadata = {**metadata, "expires_at": _iso(_capped_expiry(created_at, expires_at))}
 
     feed_dir.mkdir(parents=True, exist_ok=True)
     snapshots_dir = feed_dir / "snapshots"
@@ -165,6 +204,26 @@ def update_feed_from_source(
         raise
 
     return load_current_snapshot(cache_dir=feed_dir)
+
+
+def _reject_rollback(
+    feed_dir: Path,
+    created_at: datetime,
+    created_at_text: str,
+    source_ref: str,
+) -> None:
+    try:
+        installed = load_current_snapshot(cache_dir=feed_dir, validate_hashes=False)
+        installed_created_at = _parse_time(installed.created_at)
+    except FeedError:
+        # Nothing usable is installed (or it is damaged): installing repairs it.
+        return
+    if created_at < installed_created_at:
+        raise FeedError(
+            f"{source_ref}: refusing to install feed snapshot created at {created_at_text}; "
+            f"it is older than the installed snapshot created at {installed.created_at} "
+            "(possible rollback). Re-run with --allow-downgrade to install it anyway."
+        )
 
 
 def load_current_snapshot(
@@ -232,7 +291,7 @@ def feed_status(
             cache_dir=feed_dir,
             state="stale",
             action=action,
-            reason=f"feed snapshot expired at {snapshot.expires_at}",
+            reason=f"feed snapshot expired at {_iso(snapshot.effective_expires_at())}",
             snapshot=snapshot,
         )
 
@@ -275,15 +334,11 @@ def lookup_malware(
     snapshot: FeedSnapshot | None = None,
 ) -> tuple[dict[str, Any], ...]:
     active_snapshot = snapshot or load_current_snapshot(cache_dir=cache_dir)
-    dataset = _read_dataset(active_snapshot, _dataset_name(ecosystem, "malware"))
-    entries = _dataset_entries(dataset)
+    loaded = _load_dataset(active_snapshot, _dataset_name(ecosystem, "malware"))
     normalized_name = _normalize_package_name(ecosystem, name)
     matches: list[dict[str, Any]] = []
-    for entry in entries:
-        entry_name = _normalize_package_name(ecosystem, str(entry.get("name") or ""))
+    for entry in loaded.by_name.get(normalized_name, ()):
         entry_version = entry.get("version")
-        if entry_name != normalized_name:
-            continue
         if version and entry_version and str(entry_version) != version:
             continue
         matches.append(dict(entry))
@@ -299,7 +354,8 @@ def lookup_release_time(
     snapshot: FeedSnapshot | None = None,
 ) -> str | None:
     active_snapshot = snapshot or load_current_snapshot(cache_dir=cache_dir)
-    dataset = _read_dataset(active_snapshot, _dataset_name(ecosystem, "releases"))
+    loaded = _load_dataset(active_snapshot, _dataset_name(ecosystem, "releases"))
+    dataset = loaded.payload
     normalized_name = _normalize_package_name(ecosystem, name)
     packages = dataset.get("packages") if isinstance(dataset, dict) else None
     if isinstance(packages, dict):
@@ -307,9 +363,8 @@ def lookup_release_time(
         if isinstance(versions, dict):
             released_at = versions.get(version)
             return str(released_at) if released_at else None
-    for entry in _dataset_entries(dataset):
-        entry_name = _normalize_package_name(ecosystem, str(entry.get("name") or ""))
-        if entry_name == normalized_name and str(entry.get("version") or "") == version:
+    for entry in loaded.by_name.get(normalized_name, ()):
+        if str(entry.get("version") or "") == version:
             released_at = entry.get("released_at") or entry.get("published_at")
             return str(released_at) if released_at else None
     return None
@@ -436,18 +491,25 @@ def package_malware_findings(
     active_now = now or datetime.now(timezone.utc)
     status = feed_status(policy=policy, cache_dir=cache_dir, now=active_now)
     warnings: list[str] = []
-    if status.state in {"missing", "stale"}:
-        if policy.malware.fail_closed:
-            return [
-                _feed_unavailable_finding(
-                    status,
-                    action="block",
-                    policy_id="ca9.malware_feed_unavailable",
-                )
-            ], []
-        return [], warnings
+    if status.state in {"missing", "stale"} and policy.malware.fail_closed:
+        return [
+            _feed_unavailable_finding(
+                status,
+                action="block",
+                policy_id="ca9.malware_feed_unavailable",
+            )
+        ], []
+    if status.state == "missing":
+        return [], [
+            f"malware feed is missing ({status.reason}); local malware checks were skipped. "
+            "Run `ca9 feed update` to install the feed."
+        ]
     if status.state == "tampered":
         return [_feed_unavailable_finding(status)], []
+    if status.state == "stale" and status.snapshot is not None:
+        # A stale snapshot still knows every package it knew yesterday: match against
+        # it, but say clearly that newer malware may be missing.
+        warnings.append(_stale_malware_feed_warning(status.snapshot, active_now))
 
     snapshot = status.snapshot
     if snapshot is None:
@@ -470,12 +532,27 @@ def package_malware_findings(
     return findings, warnings
 
 
+def _stale_malware_feed_warning(snapshot: FeedSnapshot, now: datetime) -> str:
+    expired_at = snapshot.effective_expires_at()
+    created_at = _parse_time(snapshot.created_at)
+    return (
+        f"malware feed is stale: snapshot {snapshot.snapshot_id} expired at {_iso(expired_at)} "
+        f"({_format_duration(now - expired_at)} ago; data is {_format_duration(now - created_at)} "
+        "old). Packages were matched against this stale snapshot and newer malware may be "
+        "missed. Run `ca9 feed update` to refresh it."
+    )
+
+
 def _load_source(source: str) -> tuple[dict[str, Any], dict[str, bytes]]:
     parsed = urlparse(source)
-    if parsed.scheme in {"http", "https"}:
+    if parsed.scheme == "http":
+        raise FeedError(
+            f"{source}: refusing to download a feed over insecure http://; "
+            "use an https:// URL or a local path"
+        )
+    if parsed.scheme == "https":
         try:
-            with urllib.request.urlopen(source, timeout=30) as response:
-                raw = response.read()
+            raw = _download_feed(source)
             return _load_inline_bundle(json.loads(raw.decode("utf-8")), source)
         except urllib.error.HTTPError as exc:
             raise FeedError(f"{source}: feed download failed with HTTP {exc.code}") from exc
@@ -496,6 +573,31 @@ def _load_source(source: str) -> tuple[dict[str, Any], dict[str, bytes]]:
             return _load_file_backed_source(path.parent, raw)
         return _load_inline_bundle(raw, str(path))
     raise FeedError(f"feed source does not exist: {source}")
+
+
+def _download_feed(url: str) -> bytes:
+    """Download a feed bundle over https, aborting once it exceeds the size cap."""
+    limit = MAX_FEED_DOWNLOAD_BYTES
+    too_large = f"{url}: feed download exceeds the {_format_bytes(limit)} size limit"
+    with urllib.request.urlopen(url, timeout=30) as response:  # noqa: S310 - https only
+        final_url = response.geturl() if hasattr(response, "geturl") else url
+        if urlparse(str(final_url or url)).scheme != "https":
+            raise FeedError(f"{url}: feed download was redirected to non-https {final_url}")
+        headers = getattr(response, "headers", None)
+        declared = headers.get("Content-Length") if headers is not None else None
+        if isinstance(declared, str) and declared.strip().isdigit() and int(declared) > limit:
+            raise FeedError(too_large)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = response.read(_DOWNLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise FeedError(too_large)
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _load_directory_source(path: Path) -> tuple[dict[str, Any], dict[str, bytes]]:
@@ -634,6 +736,13 @@ def _snapshot_from_raw(
     )
 
 
+@dataclass(frozen=True)
+class _LoadedDataset:
+    payload: Any
+    # Normalized package name -> entries, for list-shaped datasets.
+    by_name: dict[str, tuple[dict[str, Any], ...]]
+
+
 def _verify_snapshot_hashes(snapshot: FeedSnapshot) -> None:
     for name, entry in snapshot.content_hashes.items():
         rel_path = entry.get("path")
@@ -644,22 +753,106 @@ def _verify_snapshot_hashes(snapshot: FeedSnapshot) -> None:
             raise FeedTamperError(f"feed dataset {name} has no sha256")
         dataset_path = snapshot.snapshot_dir / rel_path
         try:
-            data = dataset_path.read_bytes()
+            identity = _file_identity(dataset_path, os.stat(dataset_path))
         except OSError as exc:
             raise FeedTamperError(f"{dataset_path}: cannot read feed dataset: {exc}") from exc
+        if _cache_get(_VERIFIED_FILES, identity) == expected_hash:
+            continue
+        _read_verified_bytes(dataset_path, expected_hash)
+
+
+def _read_verified_bytes(path: Path, expected_hash: str | None) -> tuple[bytes, tuple[Any, ...]]:
+    """Read a dataset file and check its sha256, hashing each file version only once."""
+    try:
+        with path.open("rb") as handle:
+            identity = _file_identity(path, os.fstat(handle.fileno()))
+            data = handle.read()
+    except OSError as exc:
+        raise FeedTamperError(f"{path}: cannot read feed dataset: {exc}") from exc
+    if expected_hash and _cache_get(_VERIFIED_FILES, identity) != expected_hash:
         if _sha256_bytes(data) != expected_hash:
-            raise FeedTamperError(f"{dataset_path}: sha256 does not match snapshot metadata")
+            raise FeedTamperError(f"{path}: sha256 does not match snapshot metadata")
+        _cache_put(_VERIFIED_FILES, identity, expected_hash, _VERIFIED_FILES_MAX)
+    return data, identity
 
 
-def _read_dataset(snapshot: FeedSnapshot, dataset: str) -> dict[str, Any]:
+def _load_dataset(snapshot: FeedSnapshot, dataset: str) -> _LoadedDataset:
+    """Return a parsed, indexed dataset, reusing it until the file on disk changes."""
     entry = snapshot.content_hashes.get(dataset)
     if not entry:
         raise FeedError(f"feed dataset {dataset} is not installed")
     path = snapshot.snapshot_dir / str(entry["path"])
+    expected_hash = str(entry.get("sha256") or "") or None
     try:
-        return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        identity = _file_identity(path, os.stat(path))
+    except OSError as exc:
         raise FeedTamperError(f"{path}: cannot read feed dataset: {exc}") from exc
+    cached = _cache_get(_LOADED_DATASETS, (*identity, expected_hash, dataset))
+    if cached is not None:
+        return cached
+    data, identity = _read_verified_bytes(path, expected_hash)
+    payload = _parse_dataset(path, data)
+    loaded = _LoadedDataset(payload=payload, by_name=_index_dataset(dataset, payload))
+    _cache_put(_LOADED_DATASETS, (*identity, expected_hash, dataset), loaded, _LOADED_DATASETS_MAX)
+    return loaded
+
+
+def _read_dataset(snapshot: FeedSnapshot, dataset: str) -> dict[str, Any]:
+    return _load_dataset(snapshot, dataset).payload
+
+
+def _parse_dataset(path: Path, data: bytes) -> Any:
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FeedTamperError(f"{path}: cannot read feed dataset: {exc}") from exc
+
+
+def _index_dataset(dataset: str, payload: Any) -> dict[str, tuple[dict[str, Any], ...]]:
+    ecosystem = dataset.split("-", 1)[0]
+    packages = payload.get("packages") if isinstance(payload, dict) else payload
+    if not isinstance(packages, list):
+        return {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    # Entries are shared with the cached payload; lookups return copies.
+    for entry in packages:
+        if not isinstance(entry, dict):
+            continue
+        name = _normalize_package_name(ecosystem, str(entry.get("name") or ""))
+        grouped.setdefault(name, []).append(entry)
+    return {name: tuple(entries) for name, entries in grouped.items()}
+
+
+def _file_identity(path: Path, stat_result: os.stat_result) -> tuple[Any, ...]:
+    return (
+        str(path),
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+    )
+
+
+def _cache_get(cache: OrderedDict, key: tuple[Any, ...]) -> Any:
+    with _CACHE_LOCK:
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
+
+
+def _cache_put(cache: OrderedDict, key: tuple[Any, ...], value: Any, limit: int) -> None:
+    with _CACHE_LOCK:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > limit:
+            cache.popitem(last=False)
+
+
+def _clear_feed_caches() -> None:
+    with _CACHE_LOCK:
+        _VERIFIED_FILES.clear()
+        _LOADED_DATASETS.clear()
 
 
 def _dataset_entries(dataset: dict[str, Any]) -> tuple[dict[str, Any], ...]:
@@ -737,7 +930,26 @@ def _parse_time(value: str) -> datetime:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return _iso(datetime.now(timezone.utc))
+
+
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _capped_expiry(created_at: datetime, expires_at: datetime) -> datetime:
+    return min(expires_at, created_at + MAX_FEED_LIFETIME)
+
+
+def _format_duration(delta: timedelta) -> str:
+    hours = max(delta.total_seconds(), 0) / 3600
+    if hours < 48:
+        return f"{hours:.0f} hours" if hours >= 1 else "less than an hour"
+    return f"{hours / 24:.0f} days"
+
+
+def _format_bytes(size: int) -> str:
+    return f"{size / (1024 * 1024):.0f} MiB"
 
 
 def _offline_action(policy: PackagePolicy) -> str:
@@ -747,8 +959,6 @@ def _offline_action(policy: PackagePolicy) -> str:
 def _normalize_package_name(ecosystem: str, name: str) -> str:
     if ecosystem.lower() == "npm":
         return name.strip().lower()
-    from packaging.utils import canonicalize_name
-
     return str(canonicalize_name(name))
 
 
