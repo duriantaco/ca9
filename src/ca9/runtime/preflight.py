@@ -1829,7 +1829,15 @@ def _registry_tarball_path_matches(url_path: str, *, name: str, version: str) ->
     if name.startswith("@"):
         expected.append(f"/{name}/-/{name}-{version}.tgz")
     lowered = path.lower()
-    return any(lowered.endswith(suffix.lower()) for suffix in expected)
+    if any(lowered.endswith(suffix.lower()) for suffix in expected):
+        return True
+    # GitHub Packages serves `/download/@scope/name/<version>/<sha>`.
+    prefix, _, digest = lowered.rpartition("/")
+    return (
+        name.startswith("@")
+        and prefix.endswith(f"/download/{name}/{version}".lower())
+        and bool(re.fullmatch(r"[0-9a-f]{40,128}", digest))
+    )
 
 
 def _safe_relative_lock_path(path: str) -> bool:

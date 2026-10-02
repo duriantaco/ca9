@@ -68,6 +68,17 @@ def test_npm_ci_blocks_resolved_tarball_for_a_different_package(tmp_path):
         ("lodash", "4.17.21", "https://attacker.example/payload.tgz"),
         ("@scope/pkg", "1.0.0", "https://registry.npmjs.org/@evil/pkg/-/pkg-1.0.0.tgz"),
         ("@scope/pkg", "1.0.0", "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz"),
+        (
+            "@scope/pkg",
+            "1.0.0",
+            "https://npm.pkg.github.com/download/@evil/pkg/1.0.0/" + "a" * 40,
+        ),
+        (
+            "@scope/pkg",
+            "1.0.0",
+            "https://npm.pkg.github.com/download/@scope/pkg/1.0.1/" + "a" * 40,
+        ),
+        ("lodash", "4.17.21", "https://npm.pkg.github.com/download/lodash/4.17.21/" + "a" * 40),
     ],
 )
 def test_npm_ci_blocks_mismatched_resolved_paths(name, version, resolved, tmp_path):
@@ -88,6 +99,7 @@ def test_npm_ci_blocks_mismatched_resolved_paths(name, version, resolved, tmp_pa
         ("@scope/pkg", "https://registry.npmjs.org/@scope/pkg/-/pkg-4.17.21.tgz"),
         ("@scope/pkg", "https://registry.npmjs.org/@scope%2fpkg/-/pkg-4.17.21.tgz"),
         ("@scope/pkg", "https://registry.npmjs.org/repo/@scope/pkg/-/@scope/pkg-4.17.21.tgz"),
+        ("@scope/pkg", "https://npm.pkg.github.com/download/@scope/pkg/4.17.21/" + "0f" * 20),
     ],
 )
 def test_npm_ci_accepts_matching_registry_tarball_paths(name, resolved, tmp_path):
