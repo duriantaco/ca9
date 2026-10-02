@@ -1114,16 +1114,20 @@ def test_runtime_preflight_blocks_secret_bearing_install_env():
     )
 
 
-def test_runtime_preflight_allows_npm_ignore_scripts_with_secrets():
+def test_runtime_preflight_allows_npm_ignore_scripts_with_secrets(tmp_path):
     preflight = evaluate_runtime_preflight(
         ("npm", "install", "--ignore-scripts", "left-pad@1.3.0"),
         PackagePolicy(),
         env={"NPM_TOKEN": "secret-value"},
+        feed_cache_dir=tmp_path / "missing-feed",
     )
 
-    assert preflight.action == "pass"
+    # Only the missing-feed warning remains; the secrets gate does not apply.
+    assert preflight.action == "warn"
     assert preflight.secret_names == ("NPM_TOKEN",)
-    assert not preflight.decisions
+    assert [decision.policy_id for decision in preflight.decisions] == [
+        "ca9.malware_feed_unavailable"
+    ]
 
 
 def test_runtime_preflight_blocks_missing_requirement_file_install(tmp_path):

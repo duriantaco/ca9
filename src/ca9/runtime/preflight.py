@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import SpecifierSet
@@ -77,6 +77,26 @@ SUPPORTED_PIP_BOOL_FLAGS = {
     "--no-cache-dir",
     "--disable-pip-version-check",
 }
+# pip general options are accepted before or after the subcommand on the command
+# line, but not inside requirement files.
+PIP_GENERAL_BOOL_FLAGS = {
+    "-q",
+    "-qq",
+    "-qqq",
+    "--quiet",
+    "-v",
+    "-vv",
+    "-vvv",
+    "--verbose",
+    "--isolated",
+    "--disable-pip-version-check",
+    "--no-input",
+    "--no-color",
+    "--no-cache-dir",
+    "--require-virtualenv",
+}
+PIP_GENERAL_FLAGS_WITH_VALUE = {"--cache-dir"}
+PIP_UNSUPPORTED_GENERAL_FLAGS = {"--python"}
 PIP_REQUIREMENT_FLAGS = {"-r", "--requirement"}
 PIP_CONSTRAINT_FLAGS = {"-c", "--constraint"}
 MAX_PIP_REQUIREMENT_DEPTH = 16
@@ -85,6 +105,29 @@ _PIP_HASH_RE = re.compile(
     r"(?P<hash>(?:sha256:[0-9a-fA-F]{64}|sha384:[0-9a-fA-F]{96}|sha512:[0-9a-fA-F]{128}))"
     r"(?=\s|$)"
 )
+# pip's req_file.COMMENT_RE; comment lines are never joined with a following line.
+_PIP_COMMENT_RE = re.compile(r"(^|\s+)#.*$")
+# pip's ARCHIVE_EXTENSIONS: requirement strings ending in one of these are local files.
+_PIP_ARCHIVE_SUFFIXES = (
+    ".zip",
+    ".whl",
+    ".tar.bz2",
+    ".tbz",
+    ".tar.xz",
+    ".txz",
+    ".tlz",
+    ".tar.lz",
+    ".tar.lzma",
+    ".tar.gz",
+    ".tgz",
+    ".tar",
+)
+_PIP_DIRECT_SCHEME_PREFIXES = ("file:", "git+", "hg+", "svn+", "bzr+")
+_PIP_PROGRAM_RE = re.compile(r"^pip(?:3(?:\.\d+)?)?$")
+_PYTHON_PROGRAM_RE = re.compile(r"^python(?:3(?:\.\d+)?)?$")
+# CPython interpreter flags accepted before `-m pip`; X and W take a value.
+_PYTHON_FLAG_CHARS = frozenset("IEsSuBbOq")
+_PYTHON_FLAGS_WITH_VALUE = frozenset("XW")
 SUPPORTED_NPM_FLAGS_WITH_VALUE = {
     "--registry",
     "--tag",
@@ -95,6 +138,20 @@ SUPPORTED_NPM_FLAGS_WITH_VALUE = {
     "--install-strategy",
     "--workspace",
     "-w",
+    "--loglevel",
+}
+# npm shorthands that expand to `--loglevel <level>`. They never consume a value,
+# so a following `true`/`false` stays a package spec.
+NPM_LOGLEVEL_SHORTHANDS = frozenset(
+    {"-s", "--silent", "-q", "--quiet", "-d", "-dd", "-ddd", "--verbose"}
+)
+NPM_PREFIX_FLAGS = frozenset({"--prefix", "-C"})
+NPM_CONFIG_FILE_FLAGS = frozenset({"--userconfig", "--globalconfig"})
+NPM_BOOL_FLAG_ALIASES = {
+    "-g": "--global",
+    "-D": "--save-dev",
+    "-O": "--save-optional",
+    "-E": "--save-exact",
 }
 SUPPORTED_NPM_BOOL_FLAGS = {
     "--save",
@@ -123,10 +180,66 @@ SUPPORTED_NPM_BOOL_FLAGS = {
     "--install-links",
     "--legacy-peer-deps",
 }
-NPM_INSTALL_SUBCOMMANDS = frozenset({"install", "i"})
+NPM_INSTALL_SUBCOMMANDS = frozenset(
+    {
+        "install",
+        "i",
+        "add",
+        "in",
+        "ins",
+        "inst",
+        "insta",
+        "instal",
+        "isnt",
+        "isnta",
+        "isntal",
+        "isntall",
+    }
+)
 NPM_CLEAN_INSTALL_SUBCOMMANDS = frozenset(
     {"ci", "clean-install", "ic", "install-clean", "isntall-clean"}
 )
+# npm commands that can fetch, install, or execute packages through resolution
+# paths ca9 run cannot preflight. They fail closed instead of running unchecked.
+NPM_UNSUPPORTED_INSTALL_SUBCOMMANDS = frozenset(
+    {
+        "update",
+        "up",
+        "upgrade",
+        "udpate",
+        "exec",
+        "x",
+        "init",
+        "create",
+        "innit",
+        "rebuild",
+        "rb",
+        "dedupe",
+        "ddp",
+        "install-test",
+        "it",
+        "install-ci-test",
+        "cit",
+        "clean-install-test",
+        "sit",
+    }
+)
+UNSUPPORTED_COMMAND_FAMILY_MESSAGE = (
+    "unsupported command family; ca9 run supports npm install, npm i, npm ci, "
+    "python -m pip install, and pip install"
+)
+# npm-package-arg classification patterns (see npa() and resolve()).
+_NPM_URL_SPEC_RE = re.compile(r"^(?:git\+)?[a-z]+:", re.IGNORECASE)
+_NPM_GIT_SCP_SPEC_RE = re.compile(r"^[^@]+@[^:.]+\.[^:]+:.+$", re.IGNORECASE)
+_NPM_FILENAME_SPEC_RE = re.compile(r"\.(?:tgz|tar\.gz|tar)$", re.IGNORECASE)
+_NPM_NAME_PART_RE = re.compile(r"^[A-Za-z0-9\-_.!~*'()]+$")
+# Registry versions, ranges, and tags use only these characters. Anything else
+# (`:`, `/`, `#`, `@`, ...) makes npm resolve a URL, git, or local source.
+_NPM_REGISTRY_SPEC_RE = re.compile(r"^[A-Za-z0-9\-_.!~*'()<>=^|+ ]*$")
+_NPM_SEMVER_RE = re.compile(
+    r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$",
+)
+MALWARE_FEED_UNAVAILABLE_POLICY_ID = "ca9.malware_feed_unavailable"
 NPM_REGISTRY_ENV_NAMES = ("NPM_CONFIG_REGISTRY", "npm_config_registry")
 NPM_GATEWAY_UPSTREAM_ENV_NAMES = ("CA9_NPM_UPSTREAM_REGISTRY",)
 NPM_CONFIG_FILE_ENV_NAMES = (
@@ -249,6 +362,7 @@ class RuntimePreflight:
     secret_names: tuple[str, ...] = ()
     stripped_secret_names: tuple[str, ...] = ()
     feed: FeedStatus | None = None
+    warnings: tuple[str, ...] = ()
 
     @property
     def action(self) -> str:
@@ -281,6 +395,7 @@ class RuntimePreflight:
             "stripped_secret_names": list(self.stripped_secret_names),
             "executed": executed,
             "child_exit_code": child_exit_code,
+            "warnings": [redact_sensitive_text(warning) for warning in self.warnings],
         }
         if self.feed:
             data["feed"] = {
@@ -336,18 +451,26 @@ def parse_install_command(
     if not args:
         raise RuntimePreflightError("ca9 run needs a package-manager command after --")
 
-    if _is_npm_install(args):
-        requests, registry_sources = _parse_npm_install(args, cwd=cwd or Path.cwd())
+    if args[0] == "npm":
+        invocation = _parse_npm_invocation(args)
+        requests, registry_sources = _parse_npm_install(invocation, cwd=cwd or Path.cwd())
         return RuntimeCommand(
             family="npm",
             command=args,
             package_requests=tuple(requests),
             registry_sources=tuple(registry_sources),
-            install_scripts_possible=_npm_install_scripts_possible(args[2:]),
+            install_scripts_possible=not invocation.flag_enabled("--ignore-scripts"),
         )
 
-    if _is_pip_install(args):
-        requests, registry_sources = _parse_pip_install(args, cwd=cwd or Path.cwd())
+    if args[0] == "npx":
+        raise RuntimePreflightError(
+            "npx can download and execute packages but is not supported by ca9 run; "
+            "install the package with npm install first"
+        )
+
+    pip_args = _pip_command_arguments(args)
+    if pip_args is not None:
+        requests, registry_sources = _parse_pip_install(pip_args, cwd=cwd or Path.cwd())
         return RuntimeCommand(
             family="pip",
             command=args,
@@ -355,10 +478,7 @@ def parse_install_command(
             registry_sources=tuple(registry_sources),
         )
 
-    raise RuntimePreflightError(
-        "unsupported command family; ca9 run supports npm install, npm i, npm ci, "
-        "python -m pip install, and pip install"
-    )
+    raise RuntimePreflightError(UNSUPPORTED_COMMAND_FAMILY_MESSAGE)
 
 
 def evaluate_runtime_preflight(
@@ -414,6 +534,7 @@ def evaluate_runtime_preflight(
         secret_names=secrets,
         stripped_secret_names=stripped,
         feed=feed,
+        warnings=_feed_warnings(feed, policy),
     )
 
 
@@ -663,49 +784,159 @@ def _redact_authorization_match(match: re.Match[str]) -> str:
     return f"{match.group('name')}{match.group('sep')}{scheme}{space}[redacted]"
 
 
-def _is_npm_install(args: tuple[str, ...]) -> bool:
-    return (
-        len(args) >= 2
-        and args[0] == "npm"
-        and args[1] in NPM_INSTALL_SUBCOMMANDS | NPM_CLEAN_INSTALL_SUBCOMMANDS
-    )
+@dataclass(frozen=True)
+class _NpmInvocation:
+    subcommand: str
+    specs: tuple[str, ...]
+    bool_flags: tuple[tuple[str, bool], ...]
+    registry_sources: tuple[RegistrySource, ...]
+
+    def flag_enabled(self, flag_name: str) -> bool:
+        enabled = False
+        for name, value in self.bool_flags:
+            if name == flag_name:
+                enabled = value
+        return enabled
 
 
-def _is_pip_install(args: tuple[str, ...]) -> bool:
-    if len(args) >= 3 and args[0] == "pip" and args[1] == "install":
-        return True
-    return len(args) >= 5 and args[0] == "python" and args[1:4] == ("-m", "pip", "install")
-
-
-def _parse_npm_install(
-    args: tuple[str, ...],
-    *,
-    cwd: Path,
-) -> tuple[list[PackageRequest], list[RegistrySource]]:
-    subcommand = args[1]
-    clean_install = subcommand in NPM_CLEAN_INSTALL_SUBCOMMANDS
-    if any(arg.split("=", 1)[0] == "--prefix" for arg in args[2:]):
+def _parse_npm_invocation(args: tuple[str, ...]) -> _NpmInvocation:
+    # npm (nopt) accepts options anywhere, including before the subcommand, so
+    # parse the whole argv once and take the first positional as the subcommand.
+    subcommand = _npm_subcommand(args)
+    if subcommand is None:
+        raise RuntimePreflightError("npm command did not include a subcommand")
+    if subcommand in NPM_UNSUPPORTED_INSTALL_SUBCOMMANDS:
+        raise RuntimePreflightError(
+            f"npm {subcommand} can install or execute packages but is not supported by "
+            "ca9 run; use npm install <package> or npm ci"
+        )
+    if subcommand not in NPM_INSTALL_SUBCOMMANDS | NPM_CLEAN_INSTALL_SUBCOMMANDS:
+        raise RuntimePreflightError(UNSUPPORTED_COMMAND_FAMILY_MESSAGE)
+    if any(arg.split("=", 1)[0] in NPM_PREFIX_FLAGS for arg in args[1:]):
         raise RuntimePreflightError(
             "npm --prefix is unsupported because it can select a different project config "
             "or lockfile"
         )
-    specs, registry_sources = _collect_specs(
-        args[2:],
-        bool_flags=SUPPORTED_NPM_BOOL_FLAGS,
-        flags_with_value=SUPPORTED_NPM_FLAGS_WITH_VALUE,
-        registry_flags={"--registry"},
-        manager="npm",
-        ecosystem="npm",
-        require_specs=not clean_install,
+
+    positionals: list[str] = []
+    bool_flags: list[tuple[str, bool]] = []
+    registry_sources: list[RegistrySource] = []
+    terminated = False
+    index = 1
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if terminated or arg == "-" or not arg.startswith("-"):
+            positionals.append(arg)
+            continue
+        if arg == "--":
+            terminated = True
+            continue
+        flag_name, separator, inline_value = arg.partition("=")
+        if flag_name in NPM_CONFIG_FILE_FLAGS:
+            raise RuntimePreflightError(
+                f"npm {flag_name} is unsupported because it can load a different npm config"
+            )
+        if flag_name in SUPPORTED_NPM_FLAGS_WITH_VALUE:
+            if separator:
+                value = inline_value
+            elif index < len(args):
+                value = args[index]
+                index += 1
+            else:
+                raise RuntimePreflightError(f"npm install option needs a value: {flag_name}")
+            if flag_name == "--registry":
+                registry_sources.append(
+                    RegistrySource(
+                        ecosystem="npm",
+                        kind="npm-registry",
+                        url=value,
+                        option=flag_name,
+                    )
+                )
+            continue
+        if flag_name in NPM_LOGLEVEL_SHORTHANDS:
+            if separator:
+                # nopt splits `--silent=x` into `--loglevel silent x`, turning x
+                # into a positional argument.
+                raise RuntimePreflightError(f"npm shorthand option does not take a value: {arg}")
+            continue
+        if flag_name in SUPPORTED_NPM_BOOL_FLAGS:
+            if separator:
+                if inline_value not in {"true", "false"}:
+                    raise RuntimePreflightError(
+                        f"npm boolean option only accepts true or false: {arg}"
+                    )
+                value = inline_value
+            elif index < len(args) and args[index] in {"true", "false"}:
+                # nopt consumes a literal true/false after a boolean flag as its value.
+                value = args[index]
+                index += 1
+            else:
+                value = "true"
+            bool_flags.append((NPM_BOOL_FLAG_ALIASES.get(flag_name, flag_name), value == "true"))
+            continue
+        raise RuntimePreflightError(f"unsupported npm install option: {arg}")
+
+    return _NpmInvocation(
+        subcommand=positionals[0],
+        specs=tuple(positionals[1:]),
+        bool_flags=tuple(bool_flags),
+        registry_sources=tuple(registry_sources),
     )
-    if not _npm_global_mode(args[2:]):
+
+
+def _npm_subcommand(args: tuple[str, ...]) -> str | None:
+    flags_with_value = SUPPORTED_NPM_FLAGS_WITH_VALUE | NPM_CONFIG_FILE_FLAGS | NPM_PREFIX_FLAGS
+    index = 1
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            return args[index + 1] if index + 1 < len(args) else None
+        if arg == "-" or not arg.startswith("-"):
+            return arg
+        flag_name, separator, _ = arg.partition("=")
+        takes_value = flag_name in flags_with_value
+        consumes_bool = (
+            flag_name in SUPPORTED_NPM_BOOL_FLAGS
+            and index + 1 < len(args)
+            and args[index + 1] in {"true", "false"}
+        )
+        index += 2 if not separator and (takes_value or consumes_bool) else 1
+    return None
+
+
+def _parse_npm_install(
+    invocation: _NpmInvocation,
+    *,
+    cwd: Path,
+) -> tuple[list[PackageRequest], list[RegistrySource]]:
+    clean_install = invocation.subcommand in NPM_CLEAN_INSTALL_SUBCOMMANDS
+    if not clean_install and not invocation.specs:
+        raise RuntimePreflightError("npm install command did not include a direct package spec")
+    registry_sources = list(invocation.registry_sources)
+    global_mode = invocation.flag_enabled("--global")
+    if not global_mode:
         registry_sources.extend(_npm_project_config_sources(cwd))
-    if clean_install and specs:
+    if clean_install and invocation.specs:
         raise RuntimePreflightError("npm ci does not accept direct package specs")
     if clean_install:
         locked_requests, locked_sources = _npm_lock_requests(cwd)
         return locked_requests, [*registry_sources, *locked_sources]
-    return [_parse_npm_spec(spec) for spec in specs], registry_sources
+
+    requests = [_parse_npm_spec(spec) for spec in invocation.specs]
+    if not global_mode:
+        # npm install reifies the whole project tree, so locked transitive versions
+        # are fetched too and need the same lockfile preflight as npm ci.
+        seen = {request.key for request in requests}
+        for lock_root in _npm_project_lock_roots(cwd):
+            locked_requests, locked_sources = _npm_lock_requests(lock_root)
+            for request in locked_requests:
+                if request.key not in seen:
+                    seen.add(request.key)
+                    requests.append(request)
+            registry_sources.extend(locked_sources)
+    return requests, registry_sources
 
 
 def _npm_project_config_sources(cwd: Path) -> list[RegistrySource]:
@@ -738,26 +969,6 @@ def _npm_project_config_sources(cwd: Path) -> list[RegistrySource]:
                 )
             )
     return sources
-
-
-def _npm_global_mode(args: tuple[str, ...]) -> bool:
-    enabled = False
-    for arg in args:
-        flag_name, separator, raw_value = arg.partition("=")
-        if flag_name not in {"--global", "-g"}:
-            continue
-        enabled = not separator or raw_value == "true"
-    return enabled
-
-
-def _npm_install_scripts_possible(args: tuple[str, ...]) -> bool:
-    ignore_scripts = False
-    for arg in args:
-        flag_name, separator, raw_value = arg.partition("=")
-        if flag_name != "--ignore-scripts":
-            continue
-        ignore_scripts = not separator or raw_value == "true"
-    return not ignore_scripts
 
 
 def _npmrc_scoped_registry(line: str) -> tuple[str, str] | None:
@@ -811,6 +1022,18 @@ def _npmrc_unsafe_key(raw_key: str) -> str:
 
 
 def _npm_project_config_paths(cwd: Path) -> tuple[Path, ...]:
+    return tuple(root / ".npmrc" for root in _npm_project_roots(cwd) if (root / ".npmrc").is_file())
+
+
+def _npm_project_lock_roots(cwd: Path) -> tuple[Path, ...]:
+    return tuple(
+        root
+        for root in _npm_project_roots(cwd.resolve())
+        if (root / "package-lock.json").is_file() or (root / "npm-shrinkwrap.json").is_file()
+    )
+
+
+def _npm_project_roots(cwd: Path) -> tuple[Path, ...]:
     project_root: Path | None = None
     workspace_roots: list[Path] = []
     for candidate in (cwd, *cwd.parents):
@@ -826,8 +1049,7 @@ def _npm_project_config_paths(cwd: Path) -> tuple[Path, ...]:
             # reproduce npm's evolving glob semantics and risking a missed config.
             workspace_roots.append(candidate)
 
-    roots = [project_root or cwd, *workspace_roots]
-    return tuple(root / ".npmrc" for root in roots if (root / ".npmrc").is_file())
+    return (project_root or cwd, *workspace_roots)
 
 
 def _npm_declares_workspaces(package_path: Path) -> bool:
@@ -849,12 +1071,75 @@ def _npm_declares_workspaces(package_path: Path) -> bool:
     )
 
 
+def _pip_command_arguments(args: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Return the arguments after `pip` or `python -m pip`, or None for other programs."""
+    if _PIP_PROGRAM_RE.fullmatch(args[0]):
+        return args[1:]
+    if not _PYTHON_PROGRAM_RE.fullmatch(args[0]):
+        return None
+
+    index = 1
+    while index < len(args):
+        arg = args[index]
+        if arg == "-" or not arg.startswith("-") or arg.startswith("--"):
+            raise RuntimePreflightError(UNSUPPORTED_COMMAND_FAMILY_MESSAGE)
+        # CPython accepts combined short flags (`-IS`) and attached values
+        # (`-Wignore`, `-mpip`), so walk the flag characters one at a time.
+        position = 1
+        while position < len(arg):
+            flag = arg[position]
+            if flag in _PYTHON_FLAG_CHARS:
+                position += 1
+                continue
+            if flag not in _PYTHON_FLAGS_WITH_VALUE and flag != "m":
+                raise RuntimePreflightError(f"unsupported python option before -m pip: -{flag}")
+            value = arg[position + 1 :]
+            if not value:
+                index += 1
+                if index >= len(args):
+                    raise RuntimePreflightError(f"python option needs a value: -{flag}")
+                value = args[index]
+            if flag == "m":
+                if value != "pip":
+                    raise RuntimePreflightError(UNSUPPORTED_COMMAND_FAMILY_MESSAGE)
+                return args[index + 1 :]
+            break
+        index += 1
+    raise RuntimePreflightError(UNSUPPORTED_COMMAND_FAMILY_MESSAGE)
+
+
+def _pip_subcommand_index(args: tuple[str, ...]) -> int:
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "-" or not arg.startswith("-"):
+            return index
+        flag_name, separator, _ = arg.partition("=")
+        if flag_name in PIP_UNSUPPORTED_GENERAL_FLAGS:
+            raise RuntimePreflightError(
+                f"pip {flag_name} is unsupported because it runs pip for a different interpreter"
+            )
+        if flag_name in PIP_GENERAL_FLAGS_WITH_VALUE:
+            index += 1 if separator else 2
+            continue
+        if flag_name in PIP_GENERAL_BOOL_FLAGS and not separator:
+            index += 1
+            continue
+        raise RuntimePreflightError(f"unsupported pip option before the subcommand: {arg}")
+    raise RuntimePreflightError("pip command did not include a subcommand")
+
+
 def _parse_pip_install(
-    args: tuple[str, ...],
+    pip_args: tuple[str, ...],
     *,
     cwd: Path,
 ) -> tuple[list[PackageRequest], list[RegistrySource]]:
-    start = 2 if args[0] == "pip" else 4
+    subcommand_index = _pip_subcommand_index(pip_args)
+    if pip_args[subcommand_index] != "install":
+        raise RuntimePreflightError(UNSUPPORTED_COMMAND_FAMILY_MESSAGE)
+    # pip re-parses general options given before the subcommand together with the
+    # subcommand's own options.
+    args = (*pip_args[:subcommand_index], *pip_args[subcommand_index + 1 :])
     repo_path = cwd.resolve()
     requirements: list[_ParsedPipRequirement] = []
     constraints: dict[str, list[Requirement]] = {}
@@ -862,7 +1147,7 @@ def _parse_pip_install(
     visited_files: set[tuple[Path, bool]] = set()
     active_files: set[Path] = set()
 
-    index = start
+    index = 0
     while index < len(args):
         arg = args[index]
         if arg == "--":
@@ -896,7 +1181,12 @@ def _parse_pip_install(
                 raise RuntimePreflightError(
                     f"pip source option is not supported by ca9 run yet: {flag_name}"
                 )
-            if flag_name in SUPPORTED_PIP_FLAGS_WITH_VALUE:
+            if flag_name in PIP_UNSUPPORTED_GENERAL_FLAGS:
+                raise RuntimePreflightError(
+                    f"pip {flag_name} is unsupported because it runs pip for a different "
+                    "interpreter"
+                )
+            if flag_name in SUPPORTED_PIP_FLAGS_WITH_VALUE | PIP_GENERAL_FLAGS_WITH_VALUE:
                 inline_value = arg.split("=", 1)[1] if "=" in arg else None
                 value, index = _pip_option_value(args, index, flag_name, inline_value)
                 if flag_name in {"--index-url", "-i"}:
@@ -908,7 +1198,7 @@ def _parse_pip_install(
                             option=flag_name,
                         )
                     )
-            elif flag_name not in SUPPORTED_PIP_BOOL_FLAGS:
+            elif flag_name not in SUPPORTED_PIP_BOOL_FLAGS | PIP_GENERAL_BOOL_FLAGS:
                 raise RuntimePreflightError(f"unsupported pip install option: {arg}")
             index += 1
             continue
@@ -916,14 +1206,11 @@ def _parse_pip_install(
         requirements.append(_parse_pip_requirement(arg))
         index += 1
 
-    active_requirements = [
-        parsed for parsed in requirements if _requirement_marker_applies(parsed.requirement)
-    ]
-    if not active_requirements:
-        raise RuntimePreflightError(
-            "pip install command did not include an applicable direct package spec"
-        )
-    return _apply_pip_constraints(active_requirements, constraints), registry_sources
+    # Environment markers are not evaluated here: ca9's interpreter is not
+    # necessarily the one pip installs for, so every requirement is checked.
+    if not requirements:
+        raise RuntimePreflightError("pip install command did not include a direct package spec")
+    return _apply_pip_constraints(requirements, constraints), registry_sources
 
 
 def _pip_file_option(arg: str) -> tuple[str, str | None] | None:
@@ -1148,28 +1435,33 @@ def _relative_path(path: Path, repo_path: Path) -> str:
 
 
 def _logical_pip_requirement_lines(content: str) -> tuple[tuple[int, str], ...]:
+    # Mirrors pip's req_file.join_lines(): a line ending in a backslash continues
+    # onto the next line, except comment lines, which pip never joins.
     logical_lines: list[tuple[int, str]] = []
-    buffer = ""
+    buffer: list[str] = []
     start_line = 1
-    for line_number, raw_line in enumerate(content.splitlines(), start=1):
-        stripped = raw_line.rstrip()
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        is_comment = _PIP_COMMENT_RE.match(line) is not None
+        if not line.endswith("\\") or is_comment:
+            if is_comment:
+                line = " " + line
+            if buffer:
+                buffer.append(line)
+                logical_lines.append((start_line, "".join(buffer)))
+                buffer = []
+            else:
+                logical_lines.append((line_number, line))
+            continue
         if not buffer:
             start_line = line_number
-        if stripped.endswith("\\"):
-            buffer += stripped[:-1] + " "
-            continue
-        logical_lines.append((start_line, buffer + raw_line))
-        buffer = ""
+        buffer.append(line.strip("\\"))
     if buffer:
-        logical_lines.append((start_line, buffer))
+        logical_lines.append((start_line, "".join(buffer)))
     return tuple(logical_lines)
 
 
 def _strip_pip_requirement_comment(line: str) -> str:
-    stripped = line.strip()
-    if not stripped or stripped.startswith("#"):
-        return ""
-    return re.sub(r"\s+#.*$", "", stripped).strip()
+    return _PIP_COMMENT_RE.sub("", line).strip()
 
 
 def _requirement_line_option_value(
@@ -1217,11 +1509,19 @@ def _apply_pip_constraints(
 ) -> list[PackageRequest]:
     requests: list[PackageRequest] = []
     for parsed in requirements:
+        name_constraints = constraints.get(parsed.request.name, ())
         applicable_constraints = [
-            constraint
-            for constraint in constraints.get(parsed.request.name, ())
-            if _requirement_marker_applies(constraint)
+            constraint for constraint in name_constraints if _requirement_marker_applies(constraint)
         ]
+        # Markers are evaluated with ca9's interpreter, which may not be the one pip
+        # installs for. Exact pins that only apply elsewhere are checked as well.
+        for constraint in name_constraints:
+            if any(constraint is applied for applied in applicable_constraints):
+                continue
+            for pinned in _exact_pip_versions(constraint):
+                requests.append(
+                    replace(parsed.request, version_spec=f"=={pinned}", exact_version=pinned)
+                )
         if not applicable_constraints:
             requests.append(parsed.request)
             continue
@@ -1261,6 +1561,14 @@ def _apply_pip_constraints(
     return requests
 
 
+def _exact_pip_versions(requirement: Requirement) -> tuple[str, ...]:
+    return tuple(
+        item.version
+        for item in requirement.specifier
+        if item.operator in {"==", "==="} and "*" not in item.version
+    )
+
+
 def _requirement_marker_applies(requirement: Requirement) -> bool:
     if requirement.marker is None:
         return True
@@ -1271,77 +1579,16 @@ def _requirement_marker_applies(requirement: Requirement) -> bool:
         return True
 
 
-def _collect_specs(
-    args: tuple[str, ...],
-    *,
-    bool_flags: set[str],
-    flags_with_value: set[str],
-    registry_flags: set[str],
-    manager: str,
-    ecosystem: str,
-    unsupported_source_flags: set[str] | None = None,
-    require_specs: bool = True,
-) -> tuple[list[str], list[RegistrySource]]:
-    specs: list[str] = []
-    registry_sources: list[RegistrySource] = []
-    blocked_source_flags = unsupported_source_flags or set()
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--":
-            index += 1
-            continue
-        if arg in {"-r", "--requirement", "-c", "--constraint"}:
-            raise RuntimePreflightError(
-                f"{manager} requirements or constraint files are not supported by ca9 run yet"
-            )
-        if arg.startswith("-"):
-            flag_name = arg.split("=", 1)[0]
-            if flag_name in blocked_source_flags:
-                raise RuntimePreflightError(
-                    f"{manager} source option is not supported by ca9 run yet: {flag_name}"
-                )
-            if flag_name in flags_with_value:
-                value = None
-                if "=" not in arg:
-                    index += 1
-                    if index >= len(args):
-                        raise RuntimePreflightError(
-                            f"{manager} install option needs a value: {flag_name}"
-                        )
-                    value = args[index]
-                else:
-                    value = arg.split("=", 1)[1]
-                if flag_name in registry_flags:
-                    registry_sources.append(
-                        RegistrySource(
-                            ecosystem=ecosystem,
-                            kind=_registry_source_kind(manager, flag_name),
-                            url=value,
-                            option=flag_name,
-                        )
-                    )
-            elif flag_name in bool_flags:
-                if "=" in arg and arg.split("=", 1)[1] not in {"true", "false"}:
-                    raise RuntimePreflightError(
-                        f"{manager} boolean option only accepts true or false: {arg}"
-                    )
-            else:
-                raise RuntimePreflightError(f"unsupported {manager} install option: {arg}")
-            index += 1
-            continue
-        specs.append(arg)
-        index += 1
-    if require_specs and not specs:
-        raise RuntimePreflightError(
-            f"{manager} install command did not include a direct package spec"
-        )
-    return specs, registry_sources
-
-
 def _npm_lock_requests(cwd: Path) -> tuple[list[PackageRequest], list[RegistrySource]]:
     repo_path = cwd.resolve()
     lock_path = repo_path / "package-lock.json"
+    if (repo_path / "npm-shrinkwrap.json").is_file():
+        # npm prefers npm-shrinkwrap.json over package-lock.json, so preflighting
+        # package-lock.json would check a different tree than npm installs.
+        raise RuntimePreflightError(
+            "npm-shrinkwrap.json is not supported by ca9 run yet",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
     if not lock_path.is_file():
         raise RuntimePreflightError(
             f"npm lock-backed install requires package-lock.json at {lock_path}",
@@ -1455,7 +1702,7 @@ def _validated_external_npm_lock_keys(lock_path: Path, repo_path: Path) -> set[s
                 f"package-lock.json dependency entry {path!r} is missing a name or exact version",
                 policy_id="ca9.runtime.lockfile_unavailable",
             )
-        _validate_external_lock_source(path, entry.get("resolved"))
+        _validate_external_lock_source(path, entry.get("resolved"), name=name, version=version)
         expected_keys.add(
             PackageRequest(
                 ecosystem="npm",
@@ -1540,7 +1787,13 @@ def _validate_workspace_link(
         )
 
 
-def _validate_external_lock_source(path: str, resolved: object) -> None:
+def _validate_external_lock_source(
+    path: str,
+    resolved: object,
+    *,
+    name: str,
+    version: str,
+) -> None:
     if resolved is None:
         return
     if not isinstance(resolved, str) or not resolved.strip():
@@ -1554,6 +1807,29 @@ def _validate_external_lock_source(path: str, resolved: object) -> None:
             f"package-lock.json dependency entry {path!r} uses an unsupported source",
             policy_id="ca9.runtime.lockfile_unavailable",
         )
+    if not _registry_tarball_path_matches(parsed.path, name=name, version=version.strip()):
+        # Policy checks use the entry's name and version, so the tarball npm
+        # actually fetches must be that same registry artifact.
+        raise RuntimePreflightError(
+            f"package-lock.json dependency entry {path!r} resolves to a tarball that does "
+            f"not match {name}@{version}",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+
+
+def _registry_tarball_path_matches(url_path: str, *, name: str, version: str) -> bool:
+    path = unquote(url_path)
+    segments = path.split("/")
+    if "\\" in path or any(segment in {".", ".."} for segment in segments):
+        return False
+    basename = name.rsplit("/", 1)[-1]
+    # Registries may serve from a base path (`/api/npm/repo/...`), so match the
+    # suffix. GitLab names scoped tarballs `/-/@scope/name-<version>.tgz`.
+    expected = [f"/{name}/-/{basename}-{version}.tgz"]
+    if name.startswith("@"):
+        expected.append(f"/{name}/-/{name}-{version}.tgz")
+    lowered = path.lower()
+    return any(lowered.endswith(suffix.lower()) for suffix in expected)
 
 
 def _safe_relative_lock_path(path: str) -> bool:
@@ -1587,44 +1863,87 @@ def _valid_npm_lock_name(name: str | None) -> bool:
     return "/" not in name
 
 
-def _registry_source_kind(manager: str, flag_name: str) -> str:
-    if manager == "npm" and flag_name == "--registry":
-        return "npm-registry"
-    if manager == "pip" and flag_name in {"--index-url", "-i"}:
-        return "pypi-index"
-    return "registry"
-
-
 def _parse_npm_spec(spec: str) -> PackageRequest:
-    if _is_direct_or_local_spec(spec):
-        raise RuntimePreflightError(f"unsupported npm direct or local package spec: {spec}")
+    return _parse_npm_registry_spec(spec, raw_spec=spec, allow_alias=True)
 
-    name = spec
+
+def _parse_npm_registry_spec(spec: str, *, raw_spec: str, allow_alias: bool) -> PackageRequest:
+    # Classify the spec the way npm-package-arg does. Only registry versions,
+    # ranges, tags, and `npm:` aliases resolve through the registry (and so the
+    # gateway); URL, git, hosted-git, file, directory, and tarball specs are
+    # fetched directly by npm and are unsupported.
+    if spec[:4].lower() == "npm:":
+        return _parse_npm_alias(spec, raw_spec=raw_spec, allow_alias=allow_alias)
+    if _NPM_URL_SPEC_RE.match(spec) or _NPM_GIT_SCP_SPEC_RE.match(spec):
+        raise _unsupported_npm_source(raw_spec)
+    name_end = spec.find("@", 1) if spec.startswith("@") else spec.find("@")
+    name = spec[:name_end] if name_end > 0 else spec
+    if not name.startswith("@") and (
+        "/" in name or "\\" in name or _NPM_FILENAME_SPEC_RE.search(name)
+    ):
+        raise _unsupported_npm_source(raw_spec)
+    if not _valid_npm_package_name(name):
+        if name.startswith("."):
+            raise _unsupported_npm_source(raw_spec)
+        raise RuntimePreflightError(f"invalid npm package spec: {raw_spec}")
+
     version_spec: str | None = None
-    exact_version: str | None = None
-    if spec.startswith("@"):
-        slash = spec.find("/")
-        if slash < 0:
-            raise RuntimePreflightError(f"invalid npm scoped package spec: {spec}")
-        remainder = spec[slash + 1 :]
-        at = remainder.rfind("@")
-        if at > 0:
-            name = spec[: slash + 1 + at]
-            version_spec = remainder[at + 1 :]
-    elif "@" in spec:
-        name, version_spec = spec.rsplit("@", 1)
-    if not name or "/" in name.strip("/"):
-        if not name.startswith("@"):
-            raise RuntimePreflightError(f"invalid npm package spec: {spec}")
-    if version_spec and _is_exact_npm_version(version_spec):
-        exact_version = version_spec
+    if name_end > 0:
+        version_spec = spec[name_end + 1 :].strip() or None
+    if version_spec is not None:
+        if version_spec[:4].lower() == "npm:":
+            return _parse_npm_alias(version_spec, raw_spec=raw_spec, allow_alias=allow_alias)
+        if (
+            not _NPM_REGISTRY_SPEC_RE.fullmatch(version_spec)
+            or version_spec.startswith(".")
+            or _NPM_FILENAME_SPEC_RE.search(version_spec)
+        ):
+            raise _unsupported_npm_source(raw_spec)
     return PackageRequest(
         ecosystem="npm",
         name=name.lower(),
-        raw_spec=spec,
+        raw_spec=raw_spec,
         version_spec=version_spec,
-        exact_version=exact_version,
+        exact_version=_exact_npm_spec_version(version_spec),
     )
+
+
+def _parse_npm_alias(spec: str, *, raw_spec: str, allow_alias: bool) -> PackageRequest:
+    # `alias@npm:real@range` installs `real` from the registry, so policy applies
+    # to the real package. npm-package-arg rejects nested aliases.
+    target = spec[4:]
+    if not allow_alias or target[:4].lower() == "npm:":
+        raise RuntimePreflightError(f"nested npm aliases are not supported: {raw_spec}")
+    return _parse_npm_registry_spec(target, raw_spec=raw_spec, allow_alias=False)
+
+
+def _unsupported_npm_source(spec: str) -> RuntimePreflightError:
+    return RuntimePreflightError(
+        f"unsupported npm direct, git, or local package spec: {spec}; ca9 run only "
+        "installs registry packages it can check"
+    )
+
+
+def _valid_npm_package_name(name: str) -> bool:
+    # validate-npm-package-name rules that still allow legacy (old) packages.
+    if not name or name != name.strip() or name.startswith((".", "_")):
+        return False
+    if name.lower() in {"node_modules", "favicon.ico"}:
+        return False
+    if name.startswith("@"):
+        scope, slash, package = name[1:].partition("/")
+        return bool(
+            slash and _NPM_NAME_PART_RE.fullmatch(scope) and _NPM_NAME_PART_RE.fullmatch(package)
+        )
+    return _NPM_NAME_PART_RE.fullmatch(name) is not None
+
+
+def _exact_npm_spec_version(version_spec: str | None) -> str | None:
+    if not version_spec:
+        return None
+    # semver's loose parsing accepts a leading `v` or `=` on an exact version.
+    candidate = re.sub(r"^[=v\s]+", "", version_spec).strip()
+    return candidate if _NPM_SEMVER_RE.fullmatch(candidate) else None
 
 
 def _parse_pip_spec(spec: str) -> PackageRequest:
@@ -1637,12 +1956,15 @@ def _parse_pip_requirement(
     source_path: str | None = None,
     hashes: tuple[str, ...] = (),
 ) -> _ParsedPipRequirement:
-    if _is_direct_or_local_spec(spec) or "://" in spec:
-        raise RuntimePreflightError(f"unsupported pip direct or local package spec: {spec}")
+    if _is_pip_direct_or_local_spec(spec):
+        raise _unsupported_pip_source(spec)
     try:
         requirement = Requirement(spec)
     except InvalidRequirement as exc:
         raise RuntimePreflightError(f"invalid pip package spec {spec!r}: {exc}") from exc
+    if requirement.url is not None:
+        # PEP 508 direct references (`name @ url`) bypass the package index.
+        raise _unsupported_pip_source(spec)
     exact_version = None
     version_spec = str(requirement.specifier) or None
     exact_specs = [
@@ -1663,6 +1985,26 @@ def _parse_pip_requirement(
             hashes=hashes,
         ),
         requirement=requirement,
+    )
+
+
+def _is_pip_direct_or_local_spec(spec: str) -> bool:
+    # Mirrors pip's install_req_from_line(): URLs, anything that looks like a
+    # path, and archive filenames are installed from that location, not the index.
+    text = spec.strip()
+    head = text.split(";", 1)[0].strip()
+    if "://" in text or head.lower().startswith(_PIP_DIRECT_SCHEME_PREFIXES):
+        return True
+    if "/" in head or "\\" in head or head.startswith("."):
+        return True
+    without_extras = re.sub(r"\[[^\]]*\]$", "", head)
+    return without_extras.lower().endswith(_PIP_ARCHIVE_SUFFIXES)
+
+
+def _unsupported_pip_source(spec: str) -> RuntimePreflightError:
+    return RuntimePreflightError(
+        f"unsupported pip direct or local package spec: {spec}; ca9 run only installs "
+        "index packages it can check"
     )
 
 
@@ -1832,20 +2174,48 @@ def _feed_availability_decisions(
                 evidence={"state": status.state},
             )
         )
-    if (
-        policy.malware.enabled
-        and policy.malware.fail_closed
-        and status.state in {"missing", "stale"}
-    ):
-        decisions.append(
-            RuntimeDecision(
-                action="block",
-                policy_id="ca9.malware_feed_unavailable",
-                reason=f"malware policy is fail-closed and feed state is {status.state}",
-                evidence={"state": status.state},
+    if policy.malware.enabled and status.state in {"missing", "stale"}:
+        if policy.malware.fail_closed:
+            decisions.append(
+                RuntimeDecision(
+                    action="block",
+                    policy_id=MALWARE_FEED_UNAVAILABLE_POLICY_ID,
+                    reason=(
+                        f"malware policy is fail-closed and feed state is {status.state}; "
+                        "run `ca9 feed update`"
+                    ),
+                    evidence={"state": status.state},
+                )
             )
-        )
+        else:
+            # Never let a missing or expired feed look like a clean pass.
+            decisions.append(
+                RuntimeDecision(
+                    action=action_for_mode("warn", policy.mode.default),
+                    policy_id=MALWARE_FEED_UNAVAILABLE_POLICY_ID,
+                    reason=_malware_feed_warning(status),
+                    evidence={"state": status.state},
+                )
+            )
     return decisions
+
+
+def _feed_warnings(status: FeedStatus | None, policy: PackagePolicy) -> tuple[str, ...]:
+    if status is None or not policy.malware.enabled or status.state not in {"missing", "stale"}:
+        return ()
+    return (_malware_feed_warning(status),)
+
+
+def _malware_feed_warning(status: FeedStatus) -> str:
+    if status.snapshot is None:
+        return (
+            "malware checks are inactive because no local malware feed is installed; "
+            "run `ca9 feed update` to enable them"
+        )
+    return (
+        f"the local malware feed is stale ({status.reason}); checks use the stale snapshot "
+        "and may miss new malware; run `ca9 feed update` to refresh it"
+    )
 
 
 def _registry_source_decisions(
@@ -2093,16 +2463,6 @@ def _secret_decision(
             evidence={"secret_names": list(secrets)},
         ),
         (),
-    )
-
-
-def _is_direct_or_local_spec(spec: str) -> bool:
-    lowered = spec.lower()
-    return (
-        lowered.startswith((".", "/", "file:", "git+", "git:", "github:", "http:", "https:"))
-        or lowered.endswith(".tgz")
-        or lowered.endswith(".whl")
-        or lowered.endswith(".zip")
     )
 
 
