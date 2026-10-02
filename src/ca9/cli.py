@@ -154,6 +154,21 @@ def _get_config_default(ctx: click.Context, param_name: str, fallback):
     return config.get(param_name, fallback)
 
 
+def _custom_registry_hosts(registries: tuple[str, ...]) -> tuple[str, ...]:
+    from ca9.artifacts.fetch import DEFAULT_ARTIFACT_INDEXES
+
+    public = {_registry_host(value) for value in DEFAULT_ARTIFACT_INDEXES}
+    return tuple(value for value in registries if _registry_host(value) not in public)
+
+
+def _registry_host(value: str) -> str:
+    from urllib.parse import urlparse
+
+    raw = value.strip()
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    return (parsed.hostname or "").lower()
+
+
 def _resolve_option(ctx: click.Context, option_name: str, current_value):
     if ctx.get_parameter_source(option_name) == ParameterSource.DEFAULT:
         return _get_config_default(ctx, option_name, current_value)
@@ -1540,6 +1555,10 @@ def scripts_audit_cmd(
             artifact_config=ArtifactScanConfig(
                 allow_unhashed_downloads=allow_unhashed_downloads,
                 max_artifact_bytes=max_artifact_mb * 1024 * 1024,
+                # Repository policy cannot widen registries.allow, so these hosts come
+                # from trusted policy and may include internal registries.
+                trusted_indexes=package_policy.registries.allow,
+                private_indexes=_custom_registry_hosts(package_policy.registries.allow),
             ),
             fetch_artifacts=not offline,
         )

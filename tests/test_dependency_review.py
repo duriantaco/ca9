@@ -524,3 +524,30 @@ def test_chain_limits_are_reported_only_for_changed_occurrences(registry, monkey
         "head: node_modules/shared: dependency chain count limit reached",
     )
     assert [package["path"] for package in report.packages] == ["node_modules/shared"]
+
+
+def test_review_lets_explicit_trusted_registries_resolve_to_internal_hosts(tmp_path, monkeypatch):
+    import ca9.review.service as service
+
+    captured = {}
+    real_config = service.ArtifactScanConfig
+
+    def recording_config(**kwargs):
+        captured.update(kwargs)
+        return real_config(**kwargs)
+
+    monkeypatch.setattr(service, "ArtifactScanConfig", recording_config)
+    lock = tmp_path / "package-lock.json"
+    lock.write_text(
+        '{"name": "app", "version": "1.0.0", "lockfileVersion": 3,'
+        ' "packages": {"": {"name": "app", "version": "1.0.0"}}}'
+    )
+
+    service.review_lockfiles(
+        lock,
+        lock,
+        trusted_registries=("https://registry.npmjs.org", "https://npm.corp.example"),
+        scan_artifacts=False,
+    )
+
+    assert captured["private_indexes"] == ("https://npm.corp.example",)
