@@ -626,6 +626,11 @@ def run_cmd(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from None
 
+    if output_format != "json":
+        # JSON output carries these in its "warnings" list instead.
+        for warning in preflight.warnings:
+            click.echo(f"ca9 warning: {warning}", err=True)
+
     if output_format == "json" and not dry_run and not preflight.blocked:
         raise click.ClickException("use --dry-run with -f json, or omit -f json to execute")
 
