@@ -8,7 +8,12 @@ from urllib.parse import parse_qs, urlparse
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 
-from ca9.analysis.ast_scanner import discover_declared_dependency_inventory
+from ca9.analysis.ast_scanner import (
+    discover_declared_dependency_inventory,
+    discover_requirement_hashes,
+    requirement_file_lines,
+    split_requirement_options,
+)
 from ca9.config import _load_toml
 from ca9.core.models import (
     Artifact,
@@ -136,6 +141,7 @@ def _dedupe_source_inputs(source_inputs: list[SourceInput]) -> list[SourceInput]
 def _declared_dependency_inventory(repo_path: Path) -> Inventory:
     declared = discover_declared_dependency_inventory(repo_path)
     declared_sources = _declared_direct_sources(repo_path)
+    declared_hashes = discover_requirement_hashes(repo_path)
     source_input = SourceInput(
         kind="manifest",
         path=str(repo_path),
@@ -148,7 +154,13 @@ def _declared_dependency_inventory(repo_path: Path) -> Inventory:
         reader="ca9 native manifest readers",
     )
     packages = tuple(
-        _declared_package(name, version, declared_sources.get(_key), evidence)
+        _declared_package(
+            name,
+            version,
+            declared_sources.get(_key),
+            evidence,
+            declared_hashes.get(_key, ()),
+        )
         for _key, (name, version) in sorted(declared.items())
     )
 
@@ -170,9 +182,13 @@ def _declared_package(
     version: str | None,
     declared_source: _DeclaredSource | None,
     fallback_evidence: SourceEvidence,
+    hashes: tuple[str, ...] = (),
 ) -> Package:
     metadata = {}
     artifacts: tuple[Artifact, ...] = ()
+    if hashes:
+        # pip --hash pins identify the allowed distribution files.
+        metadata["hashes"] = list(hashes)
     evidence = fallback_evidence
     source_registry = None
     if declared_source is not None:
@@ -185,6 +201,7 @@ def _declared_package(
                 Artifact(
                     kind="direct-url" if declared_source.source_kind != "git" else "git-source",
                     url=declared_source.url,
+                    hash=" ".join(hashes) or None,
                     source=_url_origin(declared_source.url),
                     evidence=(declared_source.evidence,),
                 ),
@@ -271,15 +288,11 @@ def _merge_requirements_direct_sources(
         path=str(path),
         reader="ca9 native manifest readers",
     )
-    try:
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
+    lines = _requirement_lines(path)
+    if lines is None:
         return
 
-    for raw_line in lines:
-        line = _strip_requirement_comment(raw_line)
-        if not line:
-            continue
+    for line in lines:
         index_url = _requirement_index_url(line)
         if index_url:
             _record_requirement_file_registry(sources, path, index_url, evidence)
@@ -293,7 +306,7 @@ def _merge_requirements_direct_sources(
         if line.startswith("-e "):
             _record_editable_source(sources, line[3:].strip(), evidence)
         else:
-            _record_requirement_source(sources, line, evidence)
+            _record_requirement_source(sources, split_requirement_options(line)[0], evidence)
 
 
 def _merge_pipfile_direct_sources(
@@ -399,13 +412,11 @@ def _record_registry_source(
     )
 
 
-def _strip_requirement_comment(line: str) -> str:
-    stripped = line.strip()
-    if not stripped or stripped.startswith("#"):
-        return ""
-    if " #" in stripped:
-        stripped = stripped.split(" #", 1)[0].strip()
-    return stripped
+def _requirement_lines(path: Path) -> list[str] | None:
+    try:
+        return requirement_file_lines(path.read_text(encoding="utf-8", errors="ignore"))
+    except OSError:
+        return None
 
 
 def _requirement_include_target(path: Path, line: str) -> Path | None:
@@ -446,13 +457,8 @@ def _record_requirement_file_registry(
     registry: str,
     evidence: SourceEvidence,
 ) -> None:
-    try:
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return
-    for raw_line in lines:
-        line = _strip_requirement_comment(raw_line)
-        if not line or _requirement_index_url(line):
+    for line in _requirement_lines(path) or ():
+        if _requirement_index_url(line):
             continue
         if line.startswith(("-r ", "--requirement ", "-c ", "--constraint ")):
             continue
@@ -460,7 +466,7 @@ def _record_requirement_file_registry(
             name = _egg_name(line[3:].strip())
         else:
             try:
-                parsed = Requirement(line)
+                parsed = Requirement(split_requirement_options(line)[0])
             except InvalidRequirement:
                 name = None
             else:
