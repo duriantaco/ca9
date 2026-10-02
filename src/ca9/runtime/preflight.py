@@ -7,6 +7,7 @@ import shlex
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
@@ -34,19 +35,85 @@ from ca9.readers.package_lock import read_package_lock
 
 RUN_SCHEMA = "ca9.run.v1"
 LEDGER_SCHEMA = "ca9.run.ledger.v1"
+# Matched case-insensitively (fnmatch) against upper-cased variable names.
 SECRET_ENV_PATTERNS = (
     "*_TOKEN",
     "*_SECRET",
     "*_KEY",
+    "*_APIKEY",
+    "*_PASSWORD",
+    "*_PASSWD",
+    "*_PASS",
+    "*_PAT",
+    "*_AUTH",
+    "*_CREDENTIAL",
+    "*_CREDENTIALS",
+    "*_DSN",
+    "*_JWT",
+    "*_ACCESSTOKEN",
+    "*_AUTHTOKEN",
+    "*:_AUTH*",
+    "*:_PASSWORD",
     "AWS_*",
     "GCP_*",
     "GOOGLE_*",
     "AZURE_*",
+    "TWINE_*",
     "NPM_TOKEN",
     "PYPI_TOKEN",
     "GITHUB_TOKEN",
+    "NODE_AUTH_TOKEN",
+    "NPM_CONFIG__AUTH*",
+    "NPM_CONFIG_//*",
+    "PGPASSWORD",
+    "MYSQL_PWD",
+    "SYSTEM_ACCESSTOKEN",
+    "CI_JOB_TOKEN",
+    "CI_JOB_JWT*",
+    "ACTIONS_ID_TOKEN_REQUEST_*",
+    "ACTIONS_RUNTIME_TOKEN",
+    "DOCKER_AUTH_CONFIG",
+    "SSH_AUTH_SOCK",
 )
-_URL_CREDENTIALS_RE = re.compile(r"(?P<prefix>(?:https?|git\+https)://)(?P<creds>[^/@\s]+)@")
+# JWTs such as CI OIDC ID tokens: base64url header.payload.signature
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
+_KNOWN_TOKEN_RE = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9]{30,}"
+    r"|glpat-[A-Za-z0-9_-]{20,}|pypi-[A-Za-z0-9_-]{40,}|xox[abposr]-[A-Za-z0-9-]{10,}"
+    r"|AKIA[0-9A-Z]{16})\b"
+)
+# Values that are secrets whatever the variable is called. Detection reports names only.
+_SECRET_VALUE_RES = (
+    # URL userinfo carrying a password, e.g. postgres://user:pass@db/app
+    re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:]*:[^\s/@]+@"),
+    _JWT_RE,
+    _KNOWN_TOKEN_RE,
+)
+# GitHub Actions file commands: an install script writing to these persists into later steps.
+GITHUB_FILE_COMMAND_ENV_NAMES = (
+    "GITHUB_ENV",
+    "GITHUB_PATH",
+    "GITHUB_OUTPUT",
+    "GITHUB_STATE",
+    "GITHUB_STEP_SUMMARY",
+)
+_URL_CREDENTIALS_RE = re.compile(r"(?P<prefix>\b[A-Za-z][A-Za-z0-9+.-]*://)(?P<creds>[^/@\s]+)@")
+_URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
+_URL_SECRET_QUERY_RE = re.compile(
+    r"(?i)(?P<key>[?&;][\w.-]*(?:token|auth|pass|secret|key|sig|credential)[\w.-]*=)"
+    r"(?P<value>[^&#\s\"']+)"
+)
+_NPM_AUTH_SETTING_RE = re.compile(
+    r"(?i)(?P<key>(?:^|(?<=[\s/:\"'_-]))_(?:authtoken|auth|password)\s*=\s*)"
+    r"(?P<value>[^\s\"']+)"
+)
+_SECRET_OPTION_RE = re.compile(
+    r"(?i)(?P<key>(?:^|(?<=\s))--?[\w.-]*(?:token|password|passwd|secret|otp|api[-_]?key)"
+    r"[\w.-]*=)(?P<value>\S+)"
+)
+_SECRET_OPTION_NAME_RE = re.compile(
+    r"(?i)^--?[\w.-]*(?:token|password|passwd|secret|otp|api[-_]?key|_auth)[\w.-]*$"
+)
 _AUTHORIZATION_RE = re.compile(
     r"(?i)\b(?P<name>authorization|proxy-authorization)"
     r"(?P<sep>\s*[:=]\s*)"
@@ -209,7 +276,7 @@ class RuntimeCommand:
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "family": self.family,
-            "command": [redact_sensitive_text(item) for item in self.command],
+            "command": redact_command_args(self.command),
             "package_requests": [request.to_dict() for request in self.package_requests],
             "install_scripts_possible": self.install_scripts_possible,
         }
@@ -249,6 +316,7 @@ class RuntimePreflight:
     secret_names: tuple[str, ...] = ()
     stripped_secret_names: tuple[str, ...] = ()
     feed: FeedStatus | None = None
+    stripped_env_names: tuple[str, ...] = ()
 
     @property
     def action(self) -> str:
@@ -279,6 +347,7 @@ class RuntimePreflight:
             "decisions": [decision.to_dict() for decision in self.decisions],
             "secret_names": list(self.secret_names),
             "stripped_secret_names": list(self.stripped_secret_names),
+            "stripped_env_names": list(self.stripped_env_names),
             "executed": executed,
             "child_exit_code": child_exit_code,
         }
@@ -414,6 +483,7 @@ def evaluate_runtime_preflight(
         secret_names=secrets,
         stripped_secret_names=stripped,
         feed=feed,
+        stripped_env_names=_ci_file_command_env_names(parsed, policy, active_env),
     )
 
 
@@ -460,9 +530,29 @@ def _apply_runtime_policy_exceptions(
     return applied
 
 
+_INDEX_URL_ENV_NAMES = frozenset(
+    name.upper()
+    for name in (*NPM_REGISTRY_ENV_NAMES, *PIP_INDEX_ENV_NAMES, *PIP_UNSUPPORTED_SOURCE_ENV_NAMES)
+)
+_CA9_OWNED_ENV_NAMES = frozenset(
+    name.upper() for name in (*NPM_GATEWAY_UPSTREAM_ENV_NAMES, *PIP_GATEWAY_UPSTREAM_ENV_NAMES)
+)
+
+
 def child_environment(env: dict[str, str], preflight: RuntimePreflight) -> dict[str, str]:
     child_env = dict(env)
     for name in preflight.stripped_secret_names:
+        value = child_env.get(name)
+        if value is not None and name.upper() in _INDEX_URL_ENV_NAMES:
+            # Keep the configured index so pip/npm cannot fall back to a public registry;
+            # only the embedded credentials are removed.
+            child_env[name] = _URL_CREDENTIALS_RE.sub(r"\g<prefix>", value)
+        else:
+            child_env.pop(name, None)
+    for name in preflight.stripped_env_names:
+        child_env.pop(name, None)
+    # The gateway upstreams are ca9's own settings (and may carry credentials).
+    for name in (*NPM_GATEWAY_UPSTREAM_ENV_NAMES, *PIP_GATEWAY_UPSTREAM_ENV_NAMES):
         child_env.pop(name, None)
     return child_env
 
@@ -546,6 +636,14 @@ def preflight_ledger_events(
                 session_id,
             )
         )
+    if preflight.stripped_env_names:
+        events.append(
+            LedgerEvent(
+                "env_stripped",
+                {"env_names": list(preflight.stripped_env_names)},
+                session_id,
+            )
+        )
     for decision in preflight.decisions:
         events.append(LedgerEvent("decision_emitted", decision.to_dict(), session_id))
     return tuple(events)
@@ -563,8 +661,15 @@ def child_process_exited_event(
     *,
     session_id: str,
     child_exit_code: int,
+    signal_number: int | None = None,
+    forwarded_signals: tuple[str, ...] = (),
 ) -> LedgerEvent:
-    return LedgerEvent("child_process_exited", {"exit_code": child_exit_code}, session_id)
+    payload: dict[str, Any] = {"exit_code": child_exit_code}
+    if signal_number is not None:
+        payload["signal"] = signal_number
+    if forwarded_signals:
+        payload["forwarded_signals"] = list(forwarded_signals)
+    return LedgerEvent("child_process_exited", payload, session_id)
 
 
 def session_ended_event(
@@ -592,18 +697,35 @@ def append_ledger_events(
     ledger_path: Path | None = None,
 ) -> Path:
     path = ledger_path or default_ledger_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        for event in events:
-            f.write(json.dumps(event.to_dict(), sort_keys=True, separators=(",", ":")))
-            f.write("\n")
+    lines = "".join(
+        json.dumps(event.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+        for event in events
+    )
+    _make_private_dirs(path.parent)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a") as f:
+        info = os.fstat(fd)
+        # Tighten ledgers created world-readable by older ca9 versions.
+        if info.st_mode & 0o077 and hasattr(os, "fchmod") and info.st_uid == os.getuid():
+            os.fchmod(fd, 0o600)
+        f.write(lines)
     return path
+
+
+def _make_private_dirs(directory: Path) -> None:
+    missing: list[Path] = []
+    current = directory
+    while not current.exists() and current.parent != current:
+        missing.append(current)
+        current = current.parent
+    for item in reversed(missing):
+        item.mkdir(mode=0o700, exist_ok=True)
 
 
 def format_preflight(preflight: RuntimePreflight) -> str:
     lines = [
         f"ca9 runtime preflight: {preflight.action}",
-        f"Command: {' '.join(redact_sensitive_text(item) for item in preflight.command.command)}",
+        f"Command: {' '.join(redact_command_args(preflight.command.command))}",
     ]
     if preflight.command.package_requests:
         lines.append("Packages:")
@@ -614,6 +736,8 @@ def format_preflight(preflight: RuntimePreflight) -> str:
         lines.append("Secrets detected: " + ", ".join(preflight.secret_names))
     if preflight.stripped_secret_names:
         lines.append("Secrets stripped: " + ", ".join(preflight.stripped_secret_names))
+    if preflight.stripped_env_names:
+        lines.append("CI file-command env removed: " + ", ".join(preflight.stripped_env_names))
     if preflight.feed:
         lines.append(f"Feed: {preflight.feed.state} ({preflight.feed.reason})")
     if preflight.decisions:
@@ -635,14 +759,67 @@ def detect_secret_env(env: dict[str, str]) -> tuple[str, ...]:
         if not value:
             continue
         upper = name.upper()
-        if any(_match_secret_pattern(upper, pattern) for pattern in SECRET_ENV_PATTERNS):
+        if upper in _CA9_OWNED_ENV_NAMES:
+            # Consumed by ca9's gateway and never passed to the child (see child_environment).
+            continue
+        if any(_match_secret_pattern(upper, pattern) for pattern in SECRET_ENV_PATTERNS) or any(
+            pattern.search(value) for pattern in _SECRET_VALUE_RES
+        ):
             names.append(name)
     return tuple(sorted(names))
 
 
 def redact_sensitive_text(value: str) -> str:
     redacted = _URL_CREDENTIALS_RE.sub(r"\g<prefix>[redacted]@", value)
+    redacted = _URL_RE.sub(_redact_url_path_tokens, redacted)
+    redacted = _URL_SECRET_QUERY_RE.sub(r"\g<key>[redacted]", redacted)
+    redacted = _NPM_AUTH_SETTING_RE.sub(r"\g<key>[redacted]", redacted)
+    redacted = _SECRET_OPTION_RE.sub(r"\g<key>[redacted]", redacted)
+    redacted = _JWT_RE.sub("[redacted-jwt]", redacted)
+    redacted = _KNOWN_TOKEN_RE.sub("[redacted]", redacted)
     return _AUTHORIZATION_RE.sub(_redact_authorization_match, redacted)
+
+
+def redact_command_args(args: tuple[str, ...] | list[str]) -> list[str]:
+    redacted: list[str] = []
+    secret_value_next = False
+    for arg in args:
+        if secret_value_next:
+            redacted.append("[redacted]")
+            secret_value_next = False
+            continue
+        redacted.append(redact_sensitive_text(arg))
+        secret_value_next = bool(_SECRET_OPTION_NAME_RE.match(arg))
+    return redacted
+
+
+def _redact_url_path_tokens(match: re.Match[str]) -> str:
+    url = match.group(0)
+    authority_end = url.find("/", url.index("://") + 3)
+    if authority_end < 0:
+        return url
+    path_end = len(url)
+    for marker in ("?", "#"):
+        index = url.find(marker, authority_end)
+        if index >= 0:
+            path_end = min(path_end, index)
+    segments = url[authority_end:path_end].split("/")
+    cleaned = ["[redacted]" if _looks_like_path_token(item) else item for item in segments]
+    return url[:authority_end] + "/".join(cleaned) + url[path_end:]
+
+
+def _looks_like_path_token(segment: str) -> bool:
+    if _KNOWN_TOKEN_RE.fullmatch(segment):
+        return True
+    # Registry tokens embedded in URL paths (e.g. https://host/<token>/org/simple/) are long,
+    # random, and mixed-case; package names, versions, and digests are not.
+    return (
+        len(segment) >= 16
+        and re.fullmatch(r"[A-Za-z0-9_-]+", segment) is not None
+        and re.search(r"[0-9]", segment) is not None
+        and re.search(r"[a-z]", segment) is not None
+        and re.search(r"[A-Z]", segment) is not None
+    )
 
 
 def _redact_value(value: Any) -> Any:
@@ -2204,11 +2381,17 @@ def _index_path(value: str) -> str:
 
 
 def _match_secret_pattern(name: str, pattern: str) -> bool:
-    if pattern.startswith("*"):
-        return name.endswith(pattern[1:])
-    if pattern.endswith("*"):
-        return name.startswith(pattern[:-1])
-    return name == pattern
+    return fnmatchcase(name, pattern)
+
+
+def _ci_file_command_env_names(
+    command: RuntimeCommand,
+    policy: PackagePolicy,
+    env: dict[str, str],
+) -> tuple[str, ...]:
+    if not policy.ci.strip_secret_env_for_installs or not command.install_scripts_possible:
+        return ()
+    return tuple(name for name in GITHUB_FILE_COMMAND_ENV_NAMES if name in env)
 
 
 def _parse_feed_time(value: str) -> datetime:
