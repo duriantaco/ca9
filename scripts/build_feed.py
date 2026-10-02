@@ -408,7 +408,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(bundle, sort_keys=True, indent=2) + "\n")
+    # The bundle holds hundreds of thousands of entries; keep it compact so it stays
+    # well under GitHub's per-file limits on the feed branch.
+    args.output.write_text(json.dumps(bundle, sort_keys=True, separators=(",", ":")) + "\n")
     if args.manifest:
         args.manifest.parent.mkdir(parents=True, exist_ok=True)
         args.manifest.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
