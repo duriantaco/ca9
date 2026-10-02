@@ -395,17 +395,22 @@ def test_removing_a_dependency_does_not_trigger_new_risk(registry):
 
 
 def test_mutated_cached_archive_is_reverified(registry):
+    entry = registry.release("1.0.0")
     base = registry.lock("base.json")
-    head = registry.lock("head.json", registry.release("1.0.0"))
-    assert registry.review(base, head).complete
+    head = registry.lock("head.json", entry)
+    first = registry.review(base, head)
+    assert first.complete
     cached = next((registry.root / "cache" / "downloads").iterdir())
     cached.write_bytes(b"unexpected cached bytes")
 
     report = registry.review(base, head)
 
-    assert report.decision == "block"
-    assert report.exit_code == 1
-    assert len(registry.downloads) == 1
+    # A corrupt cache entry is discarded and fetched again instead of being reported
+    # as a tampered artifact on every later run.
+    assert report.complete
+    assert report.decision == first.decision
+    assert len(registry.downloads) == 2
+    assert cached.read_bytes() == registry.archives[entry["resolved"]]
 
 
 def test_failed_fetch_does_not_copy_redirect_credentials_to_report(registry, monkeypatch):

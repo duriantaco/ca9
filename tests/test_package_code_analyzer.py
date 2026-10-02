@@ -306,7 +306,7 @@ def _analyze_archive(
     inventory = Inventory(repo_path=str(tmp_path), packages=(package,))
     result = collect_artifact_snapshots(
         inventory,
-        ArtifactScanConfig(cache_dir=tmp_path / "cache"),
+        ArtifactScanConfig(cache_dir=tmp_path / "cache", allowed_local_roots=(tmp_path,)),
     )
     assert not result.findings
     return analyze_package_snapshots(result.snapshots)
