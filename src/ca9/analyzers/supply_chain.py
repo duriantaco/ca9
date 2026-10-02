@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from urllib.parse import urlparse
@@ -22,14 +21,6 @@ from ca9.package_policy import PolicyException, action_for_mode, find_policy_exc
 
 DEFAULT_TRUSTED_INDEXES = ("https://pypi.org/simple", "https://registry.npmjs.org")
 BLOCKING_SIGNALS = {"malware", "untrusted_registry"}
-_MALWARE_TEXT_RE = re.compile(
-    r"\bmalware\b|"
-    r"\bmalicious\s+(?:package|code|payload|release|version|dependency|dropper|artifact)\b|"
-    r"\bcontains\s+malicious\b|"
-    r"\bcredential\s+exfiltration\b|"
-    r"\bexfiltrat(?:e|es|ed|ing|ion)\b",
-    re.I,
-)
 
 
 @dataclass(frozen=True)
@@ -584,24 +575,13 @@ def _is_malware_advisory_id(value: str) -> bool:
 
 
 def _is_malware_advisory(vuln: Vulnerability) -> bool:
+    # Structured evidence only (an explicit flag or a MAL- id/alias): advisory text
+    # such as "malicious URL" or "exfiltrate" also describes ordinary CVEs.
     if vuln.malicious:
         return True
 
     advisory_ids = {vuln.id, *vuln.aliases}
-    if any(_is_malware_advisory_id(advisory_id) for advisory_id in advisory_ids):
-        return True
-
-    haystack = "\n".join(
-        item
-        for item in (
-            vuln.title,
-            vuln.description,
-            " ".join(vuln.references),
-            vuln.advisory_url,
-        )
-        if item
-    )
-    return bool(_MALWARE_TEXT_RE.search(haystack))
+    return any(_is_malware_advisory_id(advisory_id) for advisory_id in advisory_ids)
 
 
 def _default_reason(finding: Finding) -> str:

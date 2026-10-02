@@ -275,6 +275,7 @@ def test_malware_advisory_classifier_blocks_ghsa_malicious_package():
         severity="critical",
         title="Malicious dropper in PyPI package",
         ecosystem="pypi",
+        aliases=("MAL-2026-0001",),
         advisory_url="https://github.com/advisories/GHSA-wx9m-wx4f-4cmg",
     )
 
@@ -283,6 +284,22 @@ def test_malware_advisory_classifier_blocks_ghsa_malicious_package():
     assert len(findings) == 1
     assert findings[0].signal_type == "malware"
     assert findings[0].package_key == "pypi:mistralai@2.4.6"
+
+
+def test_malware_advisory_classifier_ignores_malware_words_in_ordinary_advisories():
+    vuln = Vulnerability(
+        id="GHSA-3p68-rc4w-qgx5",
+        package_name="axios",
+        package_version="1.7.0",
+        severity="high",
+        title="axios Requests Vulnerable To Possible SSRF and Credential Leakage",
+        description="An attacker can exfiltrate credentials via a malicious package of requests.",
+        ecosystem="npm",
+        aliases=("CVE-2025-27152",),
+        advisory_url="https://osv.dev/vulnerability/GHSA-3p68-rc4w-qgx5",
+    )
+
+    assert findings_from_malware_advisories([vuln]) == []
 
 
 def test_malware_advisory_classifier_honors_explicit_vendor_malicious_flag():
