@@ -6,7 +6,7 @@ import posixpath
 from dataclasses import dataclass
 from pathlib import Path
 
-from ca9.analysis.ast_scanner import pypi_to_import_name
+from ca9.analysis.ast_scanner import pypi_to_import_names
 
 
 def load_coverage(coverage_path: Path) -> dict:
@@ -100,8 +100,8 @@ def observe_coverage(
     file_hints: tuple[str, ...] = (),
 ) -> CoverageObservation:
     """Describe the affected scope present in this report, not global reachability."""
-    import_name = pypi_to_import_name(package_name)
-    targets = submodule_paths or (import_name,)
+    import_names = pypi_to_import_names(package_name)
+    targets = submodule_paths or import_names
     matched: set[str] = set()
     unmeasured: list[str] = []
     for target in targets:
@@ -117,7 +117,7 @@ def observe_coverage(
     # It cannot fill in an unreported target for a negative observation.
     for path in measured_files:
         normalized = path.replace("\\", "/").lower()
-        if _matches_import_path(path, import_name) and any(
+        if any(_matches_import_path(path, name) for name in import_names) and any(
             normalized.endswith("/" + hint.replace("\\", "/").lower()) for hint in file_hints
         ):
             matched.add(path)
@@ -151,11 +151,11 @@ def is_package_executed(
     package_name: str,
     covered_files: dict[str, list[int]],
 ) -> tuple[bool, list[str]]:
-    import_name = pypi_to_import_name(package_name)
+    import_names = pypi_to_import_names(package_name)
     matching_files = [
         filepath
         for filepath, lines in covered_files.items()
-        if lines and _matches_import_path(filepath, import_name)
+        if lines and any(_matches_import_path(filepath, name) for name in import_names)
     ]
 
     return bool(matching_files), matching_files

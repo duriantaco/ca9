@@ -59,8 +59,12 @@ inputs:
     description: OTLP JSON export for production runtime evidence.
     required: false
     default: ""
+  auto-coverage:
+    description: Discover coverage.json in the repo, or run the repo's pytest suite to generate it. This executes repository code.
+    required: false
+    default: "false"
   no-auto-coverage:
-    description: Disable automatic coverage discovery and generation.
+    description: Deprecated; automatic coverage is already off by default. Kept for compatibility, and overrides auto-coverage when true.
     required: false
     default: "false"
   accepted-risks:
@@ -120,6 +124,7 @@ runs:
         CA9_TRACE_PATHS: ${{ inputs.trace-paths }}
         CA9_THREAT_INTEL: ${{ inputs.threat-intel }}
         CA9_OTEL_TRACES: ${{ inputs.otel-traces }}
+        CA9_AUTO_COVERAGE: ${{ inputs.auto-coverage }}
         CA9_NO_AUTO_COVERAGE: ${{ inputs.no-auto-coverage }}
         CA9_ACCEPTED_RISKS: ${{ inputs.accepted-risks }}
         CA9_BASELINE: ${{ inputs.baseline }}
@@ -160,6 +165,8 @@ runs:
           fi
           if [[ "$CA9_NO_AUTO_COVERAGE" == "true" ]]; then
             cmd+=(--no-auto-coverage)
+          elif [[ "$CA9_AUTO_COVERAGE" == "true" ]]; then
+            cmd+=(--auto-coverage)
           fi
           if [[ -n "$CA9_ACCEPTED_RISKS" ]]; then
             cmd+=(--accepted-risks "$CA9_ACCEPTED_RISKS")

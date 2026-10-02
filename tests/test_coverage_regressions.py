@@ -67,7 +67,8 @@ def test_analyze_observed_submodule_overrides_sibling_only_source_import(tmp_pat
     monkeypatch.setattr("ca9.engine.extract_affected_component", lambda _: component)
     monkeypatch.setattr("ca9.engine.resolve_transitive_deps", lambda _: ({}, False))
     report = analyze([VULN], tmp_path, coverage)
-    assert report.results[0].evidence.submodule_imported is False
+    # samplelib's source is not installed, so its own imports of alpha are unknown.
+    assert report.results[0].evidence.submodule_imported is None
     assert report.results[0].evidence.coverage_seen is True
     assert report.results[0].verdict == Verdict.REACHABLE
     assert report.exit_code == 1

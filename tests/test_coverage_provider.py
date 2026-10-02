@@ -149,7 +149,7 @@ class TestResolveCoverage:
 
     def test_discovers_existing(self, tmp_path, capsys):
         (tmp_path / "coverage.json").write_text("{}")
-        result = resolve_coverage(None, tmp_path)
+        result = resolve_coverage(None, tmp_path, auto_generate=True)
         assert result == tmp_path / "coverage.json"
         assert "Found coverage data" in capsys.readouterr().err
 
@@ -165,7 +165,7 @@ class TestResolveCoverage:
             patch("ca9.coverage_provider.shutil.which", return_value="/usr/bin/pytest"),
             patch("ca9.coverage_provider.subprocess.run", side_effect=fake_run),
         ):
-            result = resolve_coverage(None, tmp_path)
+            result = resolve_coverage(None, tmp_path, auto_generate=True)
 
         assert result == output_path
 
@@ -180,8 +180,19 @@ class TestResolveCoverage:
 
     def test_falls_back_to_none(self, tmp_path):
         with patch("ca9.coverage_provider.shutil.which", return_value=None):
+            result = resolve_coverage(None, tmp_path, auto_generate=True)
+        assert result is None
+
+    def test_default_neither_discovers_nor_runs_tests(self, tmp_path):
+        (tmp_path / "coverage.json").write_text("{}")
+        with (
+            patch("ca9.coverage_provider.shutil.which", return_value="/usr/bin/pytest"),
+            patch("ca9.coverage_provider.subprocess.run") as run,
+        ):
             result = resolve_coverage(None, tmp_path)
         assert result is None
+        run.assert_not_called()
+        assert not (tmp_path / ".ca9").exists()
 
 
 class TestCLINoAutoCoverage:
@@ -217,3 +228,89 @@ class TestCLINoAutoCoverage:
         data = json.loads(result.output)
         verdicts = {r["package"]: r["verdict"] for r in data["results"]}
         assert verdicts["requests"] == "reachable"
+
+
+def _conftest_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    marker = tmp_path / "PWNED"
+    (repo / "conftest.py").write_text(f"open({str(marker)!r}, 'w').write('ran')\n")
+    (repo / "app.py").write_text("import requests\n")
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "dependencies": [
+                    {
+                        "name": "requests",
+                        "version": "2.0.0",
+                        "vulns": [{"id": "X-1", "description": "d", "fix_versions": ["2.31.0"]}],
+                    }
+                ]
+            }
+        )
+    )
+    return repo, report, marker
+
+
+class TestCLIAutoCoverageOptIn:
+    def test_check_does_not_run_repo_tests_by_default(self, tmp_path):
+        repo, report, marker = _conftest_repo(tmp_path)
+        with (
+            patch("ca9.coverage_provider.shutil.which", return_value="/usr/bin/pytest"),
+            patch("ca9.coverage_provider.subprocess.run") as run,
+        ):
+            result = CliRunner().invoke(main, ["check", str(report), "--repo", str(repo)])
+        assert result.exit_code in (0, 1, 2), result.output
+        run.assert_not_called()
+        assert not marker.exists()
+        assert not (repo / ".ca9").exists()
+
+    def test_check_ignores_repo_coverage_json_by_default(self, tmp_path):
+        repo, report, _marker = _conftest_repo(tmp_path)
+        (repo / "coverage.json").write_text(json.dumps({"files": {}}))
+        result = CliRunner().invoke(main, ["check", str(report), "--repo", str(repo), "-f", "json"])
+        assert json.loads(result.output)["coverage_path"] is None
+
+    def test_check_auto_coverage_flag_opts_in(self, tmp_path):
+        repo, report, _marker = _conftest_repo(tmp_path)
+        with patch("ca9.cli.resolve_coverage", return_value=None) as resolve:
+            CliRunner().invoke(main, ["check", str(report), "--repo", str(repo), "--auto-coverage"])
+        assert resolve.call_args.kwargs["auto_generate"] is True
+
+    def test_no_auto_coverage_is_accepted_and_wins(self, tmp_path):
+        repo, report, _marker = _conftest_repo(tmp_path)
+        with patch("ca9.cli.resolve_coverage", return_value=None) as resolve:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "check",
+                    str(report),
+                    "--repo",
+                    str(repo),
+                    "--auto-coverage",
+                    "--no-auto-coverage",
+                ],
+            )
+        assert result.exit_code in (0, 1, 2), result.output
+        assert resolve.call_args.kwargs["auto_generate"] is False
+
+    def test_auto_coverage_config_key_opts_in(self, tmp_path, monkeypatch):
+        repo, report, _marker = _conftest_repo(tmp_path)
+        (tmp_path / ".ca9.toml").write_text("auto_coverage = true\n")
+        monkeypatch.chdir(tmp_path)
+        with patch("ca9.cli.resolve_coverage", return_value=None) as resolve:
+            CliRunner().invoke(main, ["check", str(report), "--repo", str(repo)])
+        assert resolve.call_args.kwargs["auto_generate"] is True
+
+    def test_scan_does_not_run_repo_tests_by_default(self, tmp_path):
+        repo, _report, marker = _conftest_repo(tmp_path)
+        with (
+            patch("ca9.coverage_provider.shutil.which", return_value="/usr/bin/pytest"),
+            patch("ca9.coverage_provider.subprocess.run") as run,
+            patch("ca9.cli.resolve_coverage", wraps=resolve_coverage) as resolve,
+        ):
+            CliRunner().invoke(main, ["scan", "--repo", str(repo), "--offline"])
+        run.assert_not_called()
+        assert resolve.call_args.kwargs["auto_generate"] is False
+        assert not marker.exists()

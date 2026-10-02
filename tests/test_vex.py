@@ -49,7 +49,8 @@ class TestVEXStatusMapping:
         data = json.loads(write_openvex(report))
         stmt = data["statements"][0]
         assert stmt["status"] == "not_affected"
-        assert stmt["justification"] == "component_not_present"
+        # Not imported is not the same as absent; installation was never checked.
+        assert stmt["justification"] == "vulnerable_code_not_in_execute_path"
 
     def test_unreachable_dynamic_maps_to_under_investigation(self):
         report = Report(
@@ -93,7 +94,8 @@ class TestVEXJustifications:
             repo_path=".",
         )
         data = json.loads(write_openvex(report))
-        assert data["statements"][0]["justification"] == "component_not_present"
+        # The component is installed; only the affected code is absent from this version.
+        assert data["statements"][0]["justification"] == "vulnerable_code_not_present"
 
     def test_submodule_not_imported(self):
         report = Report(
@@ -108,7 +110,8 @@ class TestVEXJustifications:
             repo_path=".",
         )
         data = json.loads(write_openvex(report))
-        assert data["statements"][0]["justification"] == "vulnerable_code_not_present"
+        # The affected submodule ships with the package; it is just not executed.
+        assert data["statements"][0]["justification"] == "vulnerable_code_not_in_execute_path"
 
     def test_unreachable_static_no_evidence(self):
         report = Report(
@@ -123,7 +126,81 @@ class TestVEXJustifications:
             repo_path=".",
         )
         data = json.loads(write_openvex(report))
-        assert data["statements"][0]["justification"] == "component_not_present"
+        # Without evidence ca9 cannot claim the component is absent.
+        assert data["statements"][0]["justification"] == "vulnerable_code_not_in_execute_path"
+
+    def _static(self, evidence):
+        report = Report(
+            results=[
+                VerdictResult(
+                    vulnerability=_vuln(),
+                    verdict=Verdict.UNREACHABLE_STATIC,
+                    reason="test",
+                    evidence=evidence,
+                )
+            ],
+            repo_path=".",
+        )
+        return json.loads(write_openvex(report))["statements"][0]
+
+    def test_installed_but_not_imported_is_not_in_execute_path(self):
+        stmt = self._static(
+            Evidence(
+                package_imported=False,
+                package_installed=True,
+                declared_direct_dependency=True,
+                import_name_source="metadata",
+            )
+        )
+        assert stmt["status"] == "not_affected"
+        assert stmt["justification"] == "vulnerable_code_not_in_execute_path"
+        assert stmt["ca9"]["evidence_summary"]["package_installed"] is True
+        assert stmt["ca9"]["evidence_summary"]["import_name_source"] == "metadata"
+
+    def test_declared_dependency_is_present_even_if_not_installed_here(self):
+        stmt = self._static(
+            Evidence(
+                package_imported=False, package_installed=False, declared_direct_dependency=True
+            )
+        )
+        assert stmt["justification"] == "vulnerable_code_not_in_execute_path"
+
+    def test_report_chain_marks_component_present(self):
+        stmt = self._static(
+            Evidence(
+                package_imported=False,
+                package_installed=False,
+                report_dependency_chain=("django", "sqlparse"),
+            )
+        )
+        assert stmt["justification"] == "vulnerable_code_not_in_execute_path"
+
+    def test_absent_from_environment_and_graph_is_component_not_present(self):
+        stmt = self._static(
+            Evidence(
+                package_imported=False,
+                package_installed=False,
+                dependency_graph_available=True,
+                dependency_graph_source="environment",
+            )
+        )
+        assert stmt["justification"] == "component_not_present"
+
+    def test_inconclusive_has_no_not_affected_justification(self):
+        report = Report(
+            results=[
+                VerdictResult(
+                    vulnerability=_vuln(),
+                    verdict=Verdict.INCONCLUSIVE,
+                    reason="declared but no import found",
+                    evidence=Evidence(package_imported=False, declared_direct_dependency=True),
+                )
+            ],
+            repo_path=".",
+        )
+        stmt = json.loads(write_openvex(report))["statements"][0]
+        assert stmt["status"] == "under_investigation"
+        assert "justification" not in stmt
 
     def test_unreachable_dynamic_no_evidence(self):
         report = Report(

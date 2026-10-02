@@ -37,7 +37,11 @@ def generate_coverage(repo_path: Path) -> Path | None:
     output_path = output_dir / "coverage.json"
     output_path.unlink(missing_ok=True)
 
-    print("ca9: No coverage data found. Running pytest to generate it...", file=sys.stderr)
+    print(
+        "ca9: No coverage data found. Running pytest to generate it "
+        "(--auto-coverage executes the repository's tests)...",
+        file=sys.stderr,
+    )
 
     try:
         result = subprocess.run(
@@ -90,8 +94,14 @@ def generate_coverage(repo_path: Path) -> Path | None:
 def resolve_coverage(
     explicit_path: Path | None,
     repo_path: Path,
-    auto_generate: bool = True,
+    auto_generate: bool = False,
 ) -> Path | None:
+    """Return coverage data to use for analysis.
+
+    Discovery and generation only happen when ``auto_generate`` is requested:
+    generation runs the repository's pytest suite (and its conftest.py), which
+    a scanner must not do implicitly.
+    """
     if explicit_path is not None:
         return explicit_path
 

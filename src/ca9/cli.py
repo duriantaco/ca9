@@ -121,6 +121,7 @@ def _load_cli_config() -> dict:
         "format": "output_format",
         "output": "output_path",
         "verbose": "verbose",
+        "auto_coverage": "auto_coverage",
         "no_auto_coverage": "no_auto_coverage",
         "proof_standard": "proof_standard",
         "accepted_risks": "accepted_risks_path",
@@ -1471,10 +1472,19 @@ def ingest_sarif_cmd(
     "-v", "--verbose", is_flag=True, default=False, help="Show reasoning trace for each verdict."
 )
 @click.option(
+    "--auto-coverage",
+    is_flag=True,
+    default=False,
+    help=(
+        "Discover coverage.json in the repo, or run the repo's pytest suite to generate it. "
+        "Executes repository code; off by default."
+    ),
+)
+@click.option(
     "--no-auto-coverage",
     is_flag=True,
     default=False,
-    help="Disable automatic coverage discovery and generation.",
+    help="Deprecated no-op: automatic coverage is off unless --auto-coverage is given.",
 )
 @click.option(
     "--show-confidence",
@@ -1556,6 +1566,7 @@ def check(
     output_format: str,
     output_path: Path | None,
     verbose: bool,
+    auto_coverage: bool,
     no_auto_coverage: bool,
     show_confidence: bool,
     show_evidence_source: bool,
@@ -1575,13 +1586,19 @@ def check(
     output_format = _resolve_option(ctx, "output_format", output_format)
     output_path = _resolve_option(ctx, "output_path", output_path)
     verbose = _resolve_option(ctx, "verbose", verbose)
+    auto_coverage = _resolve_option(ctx, "auto_coverage", auto_coverage)
     no_auto_coverage = _resolve_option(ctx, "no_auto_coverage", no_auto_coverage)
     proof_standard = _resolve_option(ctx, "proof_standard", proof_standard)
     accepted_risks_path = _resolve_option(ctx, "accepted_risks_path", accepted_risks_path)
     baseline_path = _resolve_option(ctx, "baseline_path", baseline_path)
     new_only = _resolve_option(ctx, "new_only", new_only)
 
-    coverage_path = resolve_coverage(coverage_path, repo_path, auto_generate=not no_auto_coverage)
+    # Generating coverage runs the repo's tests, so it happens only on request.
+    coverage_path = resolve_coverage(
+        coverage_path,
+        repo_path,
+        auto_generate=bool(auto_coverage) and not no_auto_coverage,
+    )
 
     try:
         data = json.loads(sca_report.read_text())
@@ -1696,10 +1713,19 @@ def check(
     "-v", "--verbose", is_flag=True, default=False, help="Show reasoning trace for each verdict."
 )
 @click.option(
+    "--auto-coverage",
+    is_flag=True,
+    default=False,
+    help=(
+        "Discover coverage.json in the repo, or run the repo's pytest suite to generate it. "
+        "Executes repository code; off by default."
+    ),
+)
+@click.option(
     "--no-auto-coverage",
     is_flag=True,
     default=False,
-    help="Disable automatic coverage discovery and generation.",
+    help="Deprecated no-op: automatic coverage is off unless --auto-coverage is given.",
 )
 @click.option(
     "--offline",
@@ -1804,6 +1830,7 @@ def scan(
     output_format: str,
     output_path: Path | None,
     verbose: bool,
+    auto_coverage: bool,
     no_auto_coverage: bool,
     offline: bool,
     refresh_cache: bool,
@@ -1829,13 +1856,19 @@ def scan(
     output_format = _resolve_option(ctx, "output_format", output_format)
     output_path = _resolve_option(ctx, "output_path", output_path)
     verbose = _resolve_option(ctx, "verbose", verbose)
+    auto_coverage = _resolve_option(ctx, "auto_coverage", auto_coverage)
     no_auto_coverage = _resolve_option(ctx, "no_auto_coverage", no_auto_coverage)
     proof_standard = _resolve_option(ctx, "proof_standard", proof_standard)
     accepted_risks_path = _resolve_option(ctx, "accepted_risks_path", accepted_risks_path)
     baseline_path = _resolve_option(ctx, "baseline_path", baseline_path)
     new_only = _resolve_option(ctx, "new_only", new_only)
 
-    coverage_path = resolve_coverage(coverage_path, repo_path, auto_generate=not no_auto_coverage)
+    # Generating coverage runs the repo's tests, so it happens only on request.
+    coverage_path = resolve_coverage(
+        coverage_path,
+        repo_path,
+        auto_generate=bool(auto_coverage) and not no_auto_coverage,
+    )
 
     inventory = resolve_scan_inventory(
         repo_path,

@@ -96,11 +96,22 @@ def _score_reachable(ev: Evidence) -> int:
     return score
 
 
+def _import_mapping_adjustment(ev: Evidence) -> int:
+    # Installed metadata confirms the import names and lets ca9 check entry
+    # points; a curated mapping cannot, and a guessed one proves nothing.
+    if ev.package_imported or ev.import_name_source in ("", "metadata"):
+        return 0
+    if ev.import_name_source == "curated":
+        return -5
+    return -15
+
+
 def _score_unreachable_static(ev: Evidence) -> int:
     score = 60
 
     if not ev.package_imported:
         score += 25
+        score += _import_mapping_adjustment(ev)
     else:
         score -= 10
 
