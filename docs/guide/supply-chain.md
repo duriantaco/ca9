@@ -104,20 +104,39 @@ By default, ca9 only downloads artifacts that have hashes in the inventory. It v
 hash, safely unpacks Python wheels/sdists and npm tarballs, rejects path traversal or
 unsafe archive links, and scans files statically.
 
+Lockfile URLs are untrusted input. ca9 fetches only `https` URLs on public registries or
+on `--trusted-index` / `--private-index` hosts, checks every redirect the same way, and
+refuses hosts that resolve to loopback, private, or link-local addresses unless they are a
+configured `--private-index`. Local artifact paths are read only inside `--repo` or a
+`--local-artifact-root` directory. Archives are unpacked only in the format their type
+implies (npm tarballs and sdists as tar, wheels as zip); bytes that parse as both are
+blocked. Entry counts, total size, and expansion ratio are capped, and downloads are
+verified before they are cached.
+
 Current blocking rules include:
 
-- `.pth` startup execution
+- `.pth` startup lines that execute suspicious code (decoded payloads, process or network
+  calls, credential reads); benign setuptools, editable-install, and virtualenv `.pth`
+  files produce no finding, and other import lines are marked for investigation
 - `sitecustomize.py` / `usercustomize.py` suspicious startup behavior
 - install-time `setup.py` process/network/eval/exec behavior
-- encoded payload decode plus execution
-- credential access near outbound network code
+- encoded payload decode plus execution, in either order and at any nesting level
+  (Python files are analyzed with the AST, resolving import aliases and simple string
+  building)
+- credential harvesting (dumping the environment or reading credential files) near
+  outbound network code
 - top-level import-time risky behavior
 - npm install lifecycle hooks
 - npm install hooks that shell out, fetch, decode, or eval
-- npm encoded payload execution, including base64 and hex decoding
-- npm credential access near network or process execution
+- npm encoded payload execution, including base64 and hex decoding, `new Function`, and
+  dynamically built `require('child_' + 'process')`
+- npm credential harvesting near network or process execution
 
-Suspicious process execution outside setup/import startup paths is marked for investigation.
+Suspicious process execution outside setup/import startup paths is marked for
+investigation, as are install hooks that run a bundled downloader or runtime installer,
+native `.node`/`.so`/`.dll` binaries in npm packages, and files too large to inspect fully
+(the first and last 1 MiB are still scanned). `sha1`/`md5`-only integrity is reported as
+weak evidence rather than a mismatch.
 
 Use this only if you want ca9 to download package artifacts:
 
@@ -213,22 +232,43 @@ Scan workflow files for risky token and trust-boundary patterns:
 ca9 vet --repo . --scan-workflows
 ```
 
-The workflow scanner flags:
+The workflow scanner reads `.github/workflows/*`, composite actions under
+`.github/actions/`, and a root `action.yml`. It recognizes triggers in every YAML form
+(`on: pull_request_target`, `on: [push, pull_request_target]`, and mappings), ignores
+YAML comments, and flags:
 
-- `pull_request_target` workflows that check out pull request-controlled code
+- `pull_request_target`, `workflow_run`, and `issue_comment` workflows that check out
+  pull request-controlled code, including `github.head_ref`, PR head refs/SHAs, and
+  `gh pr checkout`
+- template injection: untrusted `${{ github.event.* }}` fields (titles, bodies, branch
+  names, commit messages) or `${{ github.head_ref }}` interpolated into `run:` scripts
+- `workflow_run` workflows that consume artifacts from the triggering run
 - broad write-capable `GITHUB_TOKEN` permissions
 - `id-token: write` OIDC token minting
-- mutable action references such as `@main`
+- mutable action references such as `@main`, and third-party actions not pinned to a full
+  commit SHA (`actions/*` and `github/*` tags are not flagged)
 - cache use across `pull_request_target` trust boundaries
 - source-clone commands such as `gh repo clone`
 - encoded shell payloads such as `base64 -d | bash`
 - cloud metadata, OIDC request token, and broad credential-file harvest patterns
 
-High-risk combinations such as pull request-code checkout, broad write permissions, and
-source-clone commands with write-capable token scope are blocking by default.
-Encoded shell execution, cloud metadata probing, and broad local credential-file access
-are also blocking because they match common CI/CD credential-stealing behavior.
-Lower-confidence cases such as OIDC write scope alone are marked for investigation.
+High-risk combinations such as pull request-code checkout, template injection under an
+untrusted trigger, workflow-wide write permissions, and source-clone commands with
+write-capable token scope are blocking by default. Encoded shell execution, cloud
+metadata probing, and broad local credential-file access are also blocking because they
+match common CI/CD credential-stealing behavior. Job-scoped write permissions and OIDC
+write scope without an untrusted trigger are lower-severity warnings.
+
+## Policy Trust
+
+ca9 merges built-in defaults, the user policy (`~/.config/ca9/policy.toml`), and
+`CA9_POLICY`, and trusts all of them, as well as any file passed with `--policy`. A
+`ca9.toml` discovered in the working directory is repository content and may only tighten
+that policy: settings that would relax it (a lower mode, a disabled check, a wider
+`registries.allow`, a lower `package_age.minimum_hours`, new exceptions) are ignored with a
+warning naming the key. Trust a repository policy explicitly with `--policy ca9.toml` or
+`CA9_POLICY=ca9.toml`. `ca9 policy explain` lists ignored settings, and `ca9 run` records
+them in the audit log.
 
 ## Dependency Confusion
 

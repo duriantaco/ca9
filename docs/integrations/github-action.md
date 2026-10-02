@@ -91,6 +91,11 @@ jobs:
     output: ca9.sarif
 ```
 
+The action never runs your test suite unless you set `auto-coverage: "true"`, which lets
+ca9 discover `coverage.json` or generate it by running pytest. That executes repository
+code, so only enable it on trusted refs. Pass a `coverage` file you produced yourself
+instead when you can.
+
 ## Strict release gate
 
 By default, the action records ca9's exit code but does not fail before

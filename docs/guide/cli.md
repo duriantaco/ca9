@@ -51,7 +51,8 @@ Common options:
 | `-f, --format FORMAT` | `table`, `json`, `sarif`, `vex`, `remediation`, `action-plan`, `markdown`, or `html`. |
 | `-o, --output PATH` | Write output to a file. |
 | `-v, --verbose` | Show reasoning trace in table output. |
-| `--no-auto-coverage` | Disable automatic coverage discovery/generation. |
+| `--auto-coverage` | Discover existing coverage data or generate it by running pytest. Off by default; ca9 never runs repository tests unless asked. |
+| `--no-auto-coverage` | Accepted for compatibility; this is the default behavior. |
 | `--show-confidence` | Show confidence scores in table output. |
 | `--show-evidence-source` | Show affected component extraction source in table output. |
 | `--proof-standard strict\|balanced` | Controls how aggressively ca9 allows suppressions. Defaults to `strict`. |
@@ -219,6 +220,7 @@ Options:
 | `--scan-workflows` | Scan GitHub Actions workflows for risky token, OIDC, and trust-boundary patterns. |
 | `--allow-unhashed-downloads` | Allow artifact scanning when the lockfile has no artifact hash. |
 | `--max-artifact-mb N` | Maximum artifact download size for `--scan-artifacts`. Defaults to `100`. |
+| `--local-artifact-root DIR` | Extra directory whose local lockfile artifacts `--scan-artifacts` may read. Artifacts inside `--repo` are always readable. Can be repeated. |
 | `--deny-license ID` | Denied license identifier. Can be repeated. |
 | `--require-known-license` | Warn when scanned artifact metadata has no known license. |
 | `--offline` | Use cached OSV data only for `--malware-query`; incompatible with `--scan-publisher-changes`. |
@@ -284,7 +286,8 @@ Options:
 
 | Option | Description |
 |---|---|
-| `--from PATH_OR_URL` | Feed bundle URL, JSON file, or directory containing `snapshot.json`. Optional for `update`. |
+| `--from PATH_OR_URL` | Feed bundle `https://` URL, JSON file, or directory containing `snapshot.json`. Optional for `update`. |
+| `--allow-downgrade` | Install a snapshot older than the one already installed (otherwise refused as a possible rollback). |
 | `--policy PATH` | ca9 package policy TOML for `status` offline/stale behavior. |
 | `-f, --format table\|json` | Output format. Defaults to `table`. |
 
@@ -294,7 +297,11 @@ built-in default feed URL on the project's published `feed` branch. Use `--from`
 
 Feed bundles use schema `ca9.feed.v1` with `npm-malware`, `pypi-malware`,
 `npm-releases`, and `pypi-releases`. ca9 stores snapshots under `~/.cache/ca9/feed/` and
-verifies per-dataset SHA-256 hashes before use.
+verifies per-dataset SHA-256 hashes before use. `http://` sources are refused, downloads
+are capped at 256 MiB, snapshots dated more than a day in the future are rejected, and a
+snapshot is treated as stale no later than 30 days after it was built. A missing or stale
+feed produces a warning on every `vet`, `protect`, `scripts audit`, and `run`; a stale
+snapshot is still used for matching.
 
 Examples:
 
