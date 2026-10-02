@@ -118,10 +118,8 @@ def supply_chain_report_to_table(report: SupplyChainReport) -> str:
         for finding in report.findings:
             decision = decisions_by_fingerprint.get(finding.fingerprint)
             action = decision.action.upper() if decision else "WARN"
-            package = finding.metadata.get("package") or finding.package_key
-            version = finding.metadata.get("version") or "unknown"
             lines.append(
-                f"  [{action}] {finding.signal_type} {finding.severity} {package}@{version}"
+                f"  [{action}] {finding.signal_type} {finding.severity} {_finding_subject(finding)}"
             )
             lines.append(f"    {finding.title}")
             if decision and decision.reason:
@@ -159,8 +157,25 @@ def remediation_hint(finding: Finding) -> str:
         "github_actions_encoded_shell_payload": "block the change and inspect recent workflow runs for credential exposure",
         "github_actions_cloud_metadata_probe": "block the change and audit cloud role assumptions from affected workflow runs",
         "github_actions_credential_file_harvest": "block the change and rotate any credential type the workflow could read",
+        "github_actions_template_injection": "pass the untrusted value through an env: variable and quote it in the script instead of interpolating ${{ }}",
+        "github_actions_unpinned_action": "pin the third-party action to a full-length commit SHA and let a dependency bot update it",
+        "github_actions_untrusted_checkout": "do not check out or run pull request code in privileged workflow_run or issue_comment jobs",
+        "github_actions_workflow_run_artifact": "treat artifacts from the triggering run as untrusted data and never execute them with write access",
     }
     return hints.get(finding.signal_type, "")
+
+
+_SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
+
+
+def _finding_subject(finding: Finding) -> str:
+    workflow_path = finding.metadata.get("workflow_path")
+    if workflow_path:
+        line = finding.metadata.get("line")
+        return f"{workflow_path}:{line}" if line else str(workflow_path)
+    package = finding.metadata.get("package") or finding.package_key
+    version = finding.metadata.get("version") or "unknown"
+    return f"{package}@{version}"
 
 
 def _dedupe_findings(findings: list[Finding]) -> list[Finding]:
@@ -169,5 +184,9 @@ def _dedupe_findings(findings: list[Finding]) -> list[Finding]:
         deduped[finding.fingerprint] = finding
     return sorted(
         deduped.values(),
-        key=lambda finding: (finding.severity, finding.signal_type, finding.package_key),
+        key=lambda finding: (
+            _SEVERITY_RANK.get(finding.severity, 5),
+            finding.signal_type,
+            finding.package_key,
+        ),
     )

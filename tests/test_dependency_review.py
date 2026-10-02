@@ -9,6 +9,7 @@ import tarfile
 import pytest
 
 from ca9.artifacts import fetch
+from ca9.review import locks
 from ca9.review.behavior import BehaviorFact
 from ca9.review.service import (
     Inspection,
@@ -466,3 +467,60 @@ def test_invalid_registry_configuration_is_an_input_error(origin):
 def test_default_https_port_is_equivalent():
     assert _registry_origin("https://REGISTRY.NPMJS.ORG:443/") == "https://registry.npmjs.org"
     assert _permitted_url("https://registry.npmjs.org:443/pkg.tgz", ("https://registry.npmjs.org",))
+
+
+def _shared_graph(registry, shared_version):
+    dependency = {"dependencies": {"shared": "^1"}}
+    return {
+        "node_modules/a": {
+            **registry.release("1.0.0", name="a", manifest=dependency),
+            **dependency,
+        },
+        "node_modules/b": {
+            **registry.release("1.0.0", name="b", manifest=dependency),
+            **dependency,
+        },
+        "node_modules/shared": registry.release(shared_version, name="shared"),
+    }
+
+
+def test_identical_lockfiles_pass_despite_truncated_chains(registry, monkeypatch):
+    monkeypatch.setattr(locks, "MAX_CHAINS_PER_OCCURRENCE", 1)
+    lock = registry.lock("lock.json", entries=_shared_graph(registry, "1.0.0"))
+
+    report = registry.review(lock, lock)
+
+    assert any("count limit" in issue for issue in locks.load_lock(lock).issues)
+    assert (report.decision, report.complete, report.exit_code) == ("pass", True, 0)
+    assert report.issues == ()
+
+
+def test_root_only_version_bump_passes(registry, monkeypatch):
+    monkeypatch.setattr(locks, "MAX_CHAINS_PER_OCCURRENCE", 1)
+    entries = _shared_graph(registry, "1.0.0")
+    old = registry.lock("base.json", entries=entries)
+    data = json.loads(old.read_text())
+    data["packages"][""]["version"] = "1.1.0"
+    new = registry.root / "head.json"
+    new.write_text(json.dumps(data))
+
+    report = registry.review(old, new)
+
+    assert (report.decision, report.exit_code) == ("pass", 0)
+    assert report.summary["packages_reviewed"] == 0
+    assert not registry.downloads
+
+
+def test_chain_limits_are_reported_only_for_changed_occurrences(registry, monkeypatch):
+    monkeypatch.setattr(locks, "MAX_CHAINS_PER_OCCURRENCE", 1)
+    old = registry.lock("base.json", entries=_shared_graph(registry, "1.0.0"))
+    new = registry.lock("head.json", entries=_shared_graph(registry, "1.0.1"))
+
+    report = registry.review(old, new)
+
+    assert report.decision == "incomplete"
+    assert report.issues == (
+        "base: node_modules/shared: dependency chain count limit reached",
+        "head: node_modules/shared: dependency chain count limit reached",
+    )
+    assert [package["path"] for package in report.packages] == ["node_modules/shared"]

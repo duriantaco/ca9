@@ -238,6 +238,63 @@ def _load_toml(path: Path) -> dict:
         return {}
 
 
+# pip treats "#" at line start or after whitespace as a comment.
+_REQ_COMMENT_RE = re.compile(r"(^|\s+)#.*$")
+
+
+def requirement_file_lines(text: str) -> list[str]:
+    """Return logical requirement-file lines the way pip reads them.
+
+    Backslash continuations are joined first, except that a comment line never
+    continues; comments are stripped after joining.
+    """
+    logical: list[str] = []
+    pending: list[str] = []
+    for line in text.splitlines():
+        if not line.endswith("\\") or _REQ_COMMENT_RE.match(line):
+            if _REQ_COMMENT_RE.match(line):
+                # Keep a leading space so a comment that ends a continuation
+                # is still removed below.
+                line = " " + line
+            pending.append(line)
+            logical.append("".join(pending))
+            pending = []
+        else:
+            pending.append(line.strip("\\"))
+    if pending:
+        logical.append("".join(pending))
+    return [stripped for line in logical if (stripped := _REQ_COMMENT_RE.sub("", line).strip())]
+
+
+def split_requirement_options(line: str) -> tuple[str, tuple[str, ...]]:
+    """Split a requirement line into the requirement and its --hash values.
+
+    Like pip, the requirement ends at the first token starting with "-"; the
+    remaining per-requirement options are dropped after collecting hashes.
+    """
+    tokens = line.split()
+    index = 0
+    while index < len(tokens) and not tokens[index].startswith("-"):
+        index += 1
+    requirement = " ".join(tokens[:index])
+    options = tokens[index:]
+    hashes: list[str] = []
+    position = 0
+    while position < len(options):
+        token = options[position]
+        position += 1
+        if token.startswith("--hash="):
+            value = token[len("--hash=") :]
+        elif token == "--hash" and position < len(options):
+            value = options[position]
+            position += 1
+        else:
+            continue
+        if value:
+            hashes.append(value)
+    return requirement, tuple(dict.fromkeys(hashes))
+
+
 def _extract_req_name_from_line(line: str) -> str | None:
     req = line.strip()
     if not req or req.startswith("#"):
@@ -258,6 +315,8 @@ def _extract_req_name_from_line(line: str) -> str | None:
             return editable.split("#egg=", 1)[1].strip() or None
         return None
 
+    req, _hashes = split_requirement_options(req)
+
     if " @ " in req:
         req = req.split(" @ ", 1)[0].strip()
 
@@ -274,6 +333,8 @@ def _extract_req_exact_version_from_line(line: str) -> str | None:
 
     if req.startswith(("-c ", "--constraint ", "-r ", "--requirement ", "-e ")):
         return None
+
+    req, _hashes = split_requirement_options(req)
 
     if " @ " in req:
         return None
@@ -300,6 +361,7 @@ def _merge_declared_dependency(
 def _iter_requirement_inventory(
     path: Path,
     seen: set[Path],
+    hashes: dict[str, tuple[str, ...]] | None = None,
 ) -> dict[str, tuple[str, str | None]]:
     try:
         resolved = path.resolve()
@@ -312,7 +374,7 @@ def _iter_requirement_inventory(
 
     declared: dict[str, tuple[str, str | None]] = {}
     try:
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        lines = requirement_file_lines(path.read_text(encoding="utf-8", errors="ignore"))
     except OSError:
         return declared
 
@@ -335,19 +397,20 @@ def _iter_requirement_inventory(
             constraint_target = path.parent / line[len("--constraint ") :].strip()
 
         if include_target is not None:
-            nested = _iter_requirement_inventory(include_target, seen)
+            nested = _iter_requirement_inventory(include_target, seen, hashes)
             for nested_name, nested_data in nested.items():
                 declared[nested_name] = nested_data
             continue
 
         if constraint_target is not None:
-            constraints.update(_iter_constraint_inventory(constraint_target, seen))
+            constraints.update(_iter_constraint_inventory(constraint_target, seen, hashes))
             continue
 
         name = _extract_req_name_from_line(line)
         if name:
             version = _extract_req_exact_version_from_line(line)
             _merge_declared_dependency(declared, name, version)
+            _record_requirement_hashes(hashes, name, line)
 
     _apply_constraint_versions(declared, constraints)
     return declared
@@ -356,6 +419,7 @@ def _iter_requirement_inventory(
 def _iter_constraint_inventory(
     path: Path,
     seen: set[Path],
+    hashes: dict[str, tuple[str, ...]] | None = None,
 ) -> dict[str, tuple[str, str | None]]:
     try:
         resolved = path.resolve()
@@ -368,7 +432,7 @@ def _iter_constraint_inventory(
 
     constraints: dict[str, tuple[str, str | None]] = {}
     try:
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        lines = requirement_file_lines(path.read_text(encoding="utf-8", errors="ignore"))
     except OSError:
         return constraints
 
@@ -378,11 +442,15 @@ def _iter_constraint_inventory(
             continue
 
         if line.startswith("-c "):
-            constraints.update(_iter_constraint_inventory(path.parent / line[3:].strip(), seen))
+            constraints.update(
+                _iter_constraint_inventory(path.parent / line[3:].strip(), seen, hashes)
+            )
             continue
         if line.startswith("--constraint "):
             constraints.update(
-                _iter_constraint_inventory(path.parent / line[len("--constraint ") :].strip(), seen)
+                _iter_constraint_inventory(
+                    path.parent / line[len("--constraint ") :].strip(), seen, hashes
+                )
             )
             continue
 
@@ -392,8 +460,22 @@ def _iter_constraint_inventory(
         version = _extract_req_exact_version_from_line(line)
         if version:
             _merge_declared_dependency(constraints, name, version)
+        _record_requirement_hashes(hashes, name, line)
 
     return constraints
+
+
+def _record_requirement_hashes(
+    hashes: dict[str, tuple[str, ...]] | None,
+    name: str,
+    line: str,
+) -> None:
+    if hashes is None or line.startswith("-"):
+        return
+    _requirement, line_hashes = split_requirement_options(line)
+    if line_hashes:
+        key = canonicalize_name(name)
+        hashes[key] = tuple(dict.fromkeys([*hashes.get(key, ()), *line_hashes]))
 
 
 def _apply_constraint_versions(
@@ -408,7 +490,17 @@ def _apply_constraint_versions(
             declared[key] = (name, version)
 
 
+def discover_requirement_hashes(repo_path: Path) -> dict[str, tuple[str, ...]]:
+    """Map canonical names to the --hash pins in requirements*.txt files."""
+    hashes: dict[str, tuple[str, ...]] = {}
+    seen: set[Path] = set()
+    for req_file in sorted(repo_path.glob("requirements*.txt")):
+        _iter_requirement_inventory(req_file, seen, hashes)
+    return hashes
+
+
 def _parse_dependency_requirement(req: str) -> tuple[str | None, str | None]:
+    req, _hashes = split_requirement_options(req.strip())
     try:
         parsed = Requirement(req)
     except InvalidRequirement:
@@ -719,7 +811,7 @@ def _iter_requirement_names(path: Path, seen: set[Path]) -> set[str]:
 
     names: set[str] = set()
     try:
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        lines = requirement_file_lines(path.read_text(encoding="utf-8", errors="ignore"))
     except OSError:
         return names
 
