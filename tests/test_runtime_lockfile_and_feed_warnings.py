@@ -157,6 +157,45 @@ def test_npm_install_with_lockfile_checks_locked_packages(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "command", [("npm", "install"), ("npm", "i"), ("npm", "--silent", "install")]
+)
+def test_bare_npm_install_checks_the_project_lockfile(command, tmp_path):
+    (tmp_path / "package.json").write_text('{"name": "demo-app"}\n')
+    _lock(
+        tmp_path,
+        {
+            "node_modules/left-pad": _entry(
+                "1.3.0", "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+            )
+        },
+    )
+    cache = _feed(tmp_path)
+
+    preflight = evaluate_runtime_preflight(
+        command, PackagePolicy(), env={}, feed_cache_dir=cache, cwd=tmp_path
+    )
+
+    assert [request.key for request in preflight.command.package_requests] == ["npm:left-pad@1.3.0"]
+    assert preflight.action == "block"
+    assert any(
+        item.policy_id == "ca9.malware" and item.package == "left-pad"
+        for item in preflight.decisions
+    )
+
+
+@pytest.mark.parametrize("command", [("npm", "install"), ("npm", "install", "-g")])
+def test_bare_npm_install_without_a_project_lockfile_is_blocked(command, tmp_path):
+    (tmp_path / "package.json").write_text('{"name": "demo-app"}\n')
+    if "-g" in command:
+        _lock(tmp_path, {})
+
+    preflight = evaluate_runtime_preflight(command, NO_FEED_CHECKS, env={}, cwd=tmp_path)
+
+    assert preflight.action == "block"
+    assert "needs a project package-lock.json" in preflight.decisions[0].reason
+
+
 def test_npm_install_from_project_subdirectory_uses_project_lockfile(tmp_path):
     (tmp_path / "package.json").write_text('{"name": "demo-app"}\n')
     _lock(

@@ -1089,10 +1089,13 @@ def _parse_npm_install(
     cwd: Path,
 ) -> tuple[list[PackageRequest], list[RegistrySource]]:
     clean_install = invocation.subcommand in NPM_CLEAN_INSTALL_SUBCOMMANDS
-    if not clean_install and not invocation.specs:
-        raise RuntimePreflightError("npm install command did not include a direct package spec")
-    registry_sources = list(invocation.registry_sources)
     global_mode = invocation.flag_enabled("--global")
+    if not clean_install and not invocation.specs and (global_mode or not _has_npm_lock(cwd)):
+        raise RuntimePreflightError(
+            "npm install without a package spec needs a project package-lock.json "
+            "(v2 or v3) so ca9 can check the dependency tree it installs"
+        )
+    registry_sources = list(invocation.registry_sources)
     if not global_mode:
         registry_sources.extend(_npm_project_config_sources(cwd))
     if clean_install and invocation.specs:
@@ -1208,6 +1211,10 @@ def _npm_project_lock_roots(cwd: Path) -> tuple[Path, ...]:
         for root in _npm_project_roots(cwd.resolve())
         if (root / "package-lock.json").is_file() or (root / "npm-shrinkwrap.json").is_file()
     )
+
+
+def _has_npm_lock(cwd: Path) -> bool:
+    return bool(_npm_project_lock_roots(cwd))
 
 
 def _npm_project_roots(cwd: Path) -> tuple[Path, ...]:
