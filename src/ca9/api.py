@@ -1,0 +1,807 @@
+"""Stable library interface for supply-chain checks (used by Skylos).
+
+``API_VERSION`` changes only when a name, key or value set below changes
+incompatibly; new optional keys may be added within a version.
+
+Package input (plain dict): ``ecosystem`` ("npm"|"pypi"), ``name``, ``version``,
+``direct``, ``dev``, ``registry``, ``registry_mode`` ("exclusive"|"merged"|None),
+``source_kind`` ("registry"|"git"|"url"|"path"), ``source_url``, ``integrity``,
+``file``, ``line``. Optional: ``registries`` (every index of a merged setup; when
+given, the public default is not added) and ``lockfile`` (bool; otherwise inferred
+from ``file``).
+
+Finding dict: ``signal_type``, ``severity`` (CRITICAL|HIGH|MEDIUM|LOW), ``action``
+(block|warn|investigate), ``ecosystem``, ``name``, ``version``, ``title``,
+``reason``, ``remediation``, ``evidence`` (dict), ``file``, ``line``.
+
+Signal types: dependency_confusion, untrusted_registry, git_dependency,
+direct_url_dependency, mutable_source, missing_integrity, malware,
+new_package_version, provenance_regression. Git and URL findings carry
+``evidence.mutable`` plus ``pinned_commit``/``ref`` (git) or ``has_hash`` (URL).
+"""
+
+from __future__ import annotations
+
+import importlib
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+from pathlib import Path, PurePath
+from typing import Any
+
+from ca9.analyzers.supply_chain import (
+    DEFAULT_TRUSTED_INDEXES,
+    SupplyChainPolicy,
+    analyze_supply_chain,
+)
+from ca9.core.models import (
+    Artifact,
+    Evidence,
+    Finding,
+    Inventory,
+    Package,
+    SourceEvidence,
+    package_key,
+)
+from ca9.npm_publisher import REGISTRY_ORIGIN, check_npm_provenance
+from ca9.readers.requirements import valid_hash_pins
+
+API_VERSION = 1
+DEFAULT_MAX_LOOKUPS = 200
+
+_ECOSYSTEMS = frozenset({"npm", "pypi"})
+_REGISTRY_MODES = frozenset({"exclusive", "merged"})
+_SOURCE_KINDS = {"registry": "registry", "git": "git", "url": "direct_url", "path": "path"}
+_PUBLIC_REGISTRIES = {"npm": REGISTRY_ORIGIN, "pypi": "https://pypi.org/simple"}
+_LOCKFILES_WITH_INTEGRITY = frozenset(
+    {
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lock",
+        "poetry.lock",
+        "uv.lock",
+        "pipfile.lock",
+        "pdm.lock",
+        "fyn.lock",
+    }
+)
+_STATIC_SIGNALS = frozenset(
+    {
+        "dependency_confusion",
+        "untrusted_registry",
+        "git_dependency",
+        "direct_url_dependency",
+        "mutable_source",
+    }
+)
+_SEVERITIES = {"critical": "CRITICAL", "high": "HIGH", "medium": "MEDIUM", "low": "LOW"}
+_SEVERITY_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+_ACTIONS = frozenset({"block", "warn", "investigate"})
+_AGE_STATUSES = frozenset({"old_enough", "too_new", "unknown"})
+_REMEDIATION = {
+    "dependency_confusion": (
+        "Install internal packages only from the private index: make it the only index "
+        "(--index-url, not --extra-index-url) or scope the name to the private registry, "
+        "and reserve the name on the public registry."
+    ),
+    "untrusted_registry": (
+        "Install from a trusted registry, or add this registry to the trusted list after review."
+    ),
+    "git_dependency": (
+        "Pin the Git dependency to a full commit SHA, or publish it to a registry you control."
+    ),
+    "direct_url_dependency": (
+        "Pin the file with a hash (pip --hash or lockfile integrity), or install a registry "
+        "release instead."
+    ),
+    "mutable_source": (
+        "Publish the package to a registry or pin it by hash; local paths change without review."
+    ),
+    "missing_integrity": (
+        "Regenerate the lockfile so every registry entry records an integrity hash."
+    ),
+    "malware": (
+        "Remove the package, rotate credentials exposed to installs on affected machines, "
+        "and pin a clean version."
+    ),
+    "new_package_version": (
+        "Wait until the release is older than the cooldown, or pin the older version."
+    ),
+    "provenance_regression": (
+        "Do not install this version until the maintainers confirm it; pin the previous "
+        "version that was published with provenance."
+    ),
+}
+
+
+class FeedUnavailable(RuntimeError):
+    """The local malware feed or its matcher is not available in this installation."""
+
+
+@dataclass
+class _Receipt:
+    checked: int = 0
+    lookups: int = 0
+    cache_hits: int = 0
+    skipped: dict[str, int] = field(default_factory=dict)
+
+    def skip(self, reason: str, count: int = 1) -> None:
+        if count > 0:
+            self.skipped[reason] = self.skipped.get(reason, 0) + count
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "checked": self.checked,
+            "lookups": self.lookups,
+            "cache_hits": self.cache_hits,
+            "skipped": [
+                {"reason": reason, "count": count} for reason, count in sorted(self.skipped.items())
+            ],
+            "complete": not self.skipped,
+        }
+
+
+@dataclass(frozen=True)
+class _Options:
+    internal_packages: tuple[str, ...] = ()
+    private_registries: tuple[str, ...] = ()
+    trusted_registries: tuple[str, ...] = ()
+    min_release_age_hours: int | None = None
+    check_provenance: bool = False
+    network: bool = False
+    max_lookups: int = DEFAULT_MAX_LOOKUPS
+    cache_dir: Path | None = None
+    feed_dir: Path | None = None
+
+
+@dataclass(frozen=True)
+class _Entry:
+    raw: Mapping[str, Any]
+    package: Package
+    ecosystem: str
+    name: str
+    version: str | None
+    source_kind: str
+    registry: str | None
+    integrity: str | None
+    file: str | None
+    line: int | None
+
+
+def evaluate_packages(
+    packages: Iterable[Mapping[str, Any]],
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run ca9's package checks over plain package dicts.
+
+    Never raises on malformed input: bad entries and options are skipped and
+    counted in the receipt, whose ``complete`` is false whenever anything that was
+    asked for was not checked. Malware uses the installed ca9 feed (``feed_dir``
+    option, else the default feed); release age and provenance run only with
+    ``network`` and stop after ``max_lookups`` registry requests.
+    """
+    receipt = _Receipt()
+    active = _parse_options(options, receipt)
+    entries = _parse_entries(packages, receipt)
+    receipt.checked = len(entries)
+
+    findings: list[dict[str, Any]] = []
+    policy = SupplyChainPolicy(
+        trusted_indexes=active.trusted_registries or DEFAULT_TRUSTED_INDEXES,
+        private_indexes=active.private_registries,
+        internal_package_patterns=active.internal_packages,
+    )
+    for entry in entries:
+        findings.extend(_static_findings(entry, policy, active, receipt))
+    findings.extend(_malware_findings(entries, active, receipt))
+    findings.extend(_release_age_findings(entries, active, receipt))
+    findings.extend(_provenance_findings(entries, active, receipt))
+    findings.sort(
+        key=lambda item: (
+            _SEVERITY_RANK.get(item["severity"], 4),
+            item["signal_type"],
+            item["ecosystem"],
+            item["name"],
+            str(item["file"] or ""),
+            item["line"] or 0,
+        )
+    )
+    return {"findings": findings, "receipt": receipt.to_dict()}
+
+
+def check_release_age(
+    ecosystem: str,
+    name: str,
+    version: str,
+    *,
+    min_hours: int,
+    cache_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Release age from registry publish times; unknown when it cannot be decided."""
+    checker = _optional_function("ca9.release_age", "check_release_age")
+    if checker is None:
+        return _unknown_age("ca9.release_age is not available in this ca9")
+    try:
+        result = checker(ecosystem, name, version, min_hours=min_hours, cache_dir=cache_dir)
+    except Exception as exc:
+        return _unknown_age(f"release age check failed: {exc}")
+    return _normalized_age(result)
+
+
+def malware_matches(
+    packages: Iterable[Mapping[str, Any]],
+    *,
+    feed_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Match packages against the installed ca9 malware feed, offline.
+
+    Malformed entries are ignored. Raises FeedUnavailable when the feed or its
+    matcher is missing, so an empty list always means "checked, no match".
+    """
+    receipt = _Receipt()
+    entries = _parse_entries(packages, receipt)
+    finder = _optional_function("ca9.package_feed", "find_malware_matches")
+    if finder is None:
+        raise FeedUnavailable("ca9.package_feed.find_malware_matches is not available")
+    try:
+        matches = finder(
+            [entry.package for entry in entries],
+            cache_dir=_optional_path(feed_dir),
+        )
+    except Exception as exc:
+        raise FeedUnavailable(str(exc)) from exc
+    return _malware_dicts(matches, entries)
+
+
+def check_provenance(
+    ecosystem: str,
+    name: str,
+    version: str,
+    *,
+    cache_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Compare an npm release's provenance with the stable releases before it.
+
+    Returns ``status`` ok|regressed|unknown|not_applicable and ``evidence``.
+    Network and registry errors return unknown.
+    """
+    if not isinstance(ecosystem, str) or ecosystem.strip().lower() != "npm":
+        return {
+            "status": "not_applicable",
+            "evidence": {},
+            "reason": "provenance is checked for npm packages only",
+        }
+    return check_npm_provenance(name, version, cache_dir=_optional_path(cache_dir))
+
+
+def _parse_options(options: Mapping[str, Any] | None, receipt: _Receipt) -> _Options:
+    if options is None:
+        return _Options()
+    if not isinstance(options, Mapping):
+        receipt.skip("invalid_option")
+        return _Options()
+    values: dict[str, Any] = {}
+    for key in ("internal_packages", "private_registries", "trusted_registries"):
+        if key in options and options[key] is not None:
+            parsed = _string_tuple(options[key])
+            if parsed is None:
+                receipt.skip("invalid_option")
+            else:
+                values[key] = parsed
+    hours = options.get("min_release_age_hours")
+    if hours is not None:
+        if isinstance(hours, int) and not isinstance(hours, bool) and hours >= 0:
+            values["min_release_age_hours"] = hours or None
+        else:
+            receipt.skip("invalid_option")
+    for key in ("check_provenance", "network"):
+        value = options.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            values[key] = value
+        else:
+            receipt.skip("invalid_option")
+    max_lookups = options.get("max_lookups")
+    if max_lookups is not None:
+        if isinstance(max_lookups, int) and not isinstance(max_lookups, bool) and max_lookups >= 0:
+            values["max_lookups"] = max_lookups
+        else:
+            receipt.skip("invalid_option")
+    for key in ("cache_dir", "feed_dir"):
+        value = options.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (str, PurePath)) and str(value):
+            values[key] = Path(value)
+        else:
+            receipt.skip("invalid_option")
+    return _Options(**values)
+
+
+def _string_tuple(value: object) -> tuple[str, ...] | None:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        return None
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            return None
+        items.append(item.strip())
+    return tuple(items)
+
+
+def _parse_entries(packages: object, receipt: _Receipt) -> list[_Entry]:
+    if isinstance(packages, (str, bytes, Mapping)) or not isinstance(packages, Iterable):
+        receipt.skip("malformed_input")
+        return []
+    entries: list[_Entry] = []
+    try:
+        for raw in packages:
+            entry, reason = _entry(raw)
+            if entry is None:
+                receipt.skip(reason)
+            else:
+                entries.append(entry)
+    except Exception:
+        receipt.skip("malformed_input")
+    return entries
+
+
+def _entry(raw: object) -> tuple[_Entry | None, str]:
+    if not isinstance(raw, Mapping):
+        return None, "malformed_package"
+    ecosystem = raw.get("ecosystem")
+    name = raw.get("name")
+    version = raw.get("version")
+    if not isinstance(ecosystem, str) or not isinstance(name, str) or not name.strip():
+        return None, "malformed_package"
+    ecosystem = ecosystem.strip().lower()
+    if ecosystem not in _ECOSYSTEMS:
+        return None, "unsupported_ecosystem"
+    if version is not None and (not isinstance(version, str) or not version.strip()):
+        return None, "malformed_package"
+    registry = _optional_string(raw.get("registry"))
+    source_url = _optional_string(raw.get("source_url"))
+    integrity = _optional_string(raw.get("integrity"))
+    file = _optional_string(raw.get("file"))
+    line = raw.get("line")
+    if not isinstance(line, int) or isinstance(line, bool):
+        line = None
+    mode = raw.get("registry_mode")
+    if mode is not None and mode not in _REGISTRY_MODES:
+        return None, "malformed_package"
+    source_kind = raw.get("source_kind") or "registry"
+    if source_kind not in _SOURCE_KINDS:
+        return None, "malformed_package"
+    extra_registries: tuple[str, ...] = ()
+    if raw.get("registries") is not None:
+        parsed = _string_tuple(raw.get("registries"))
+        if parsed is None:
+            return None, "malformed_package"
+        extra_registries = parsed
+
+    clean_name = name.strip()
+    clean_version = None
+    if isinstance(version, str):
+        clean_version = version.strip()
+    dependency_kind = "transitive"
+    if raw.get("direct") is True:
+        dependency_kind = "direct"
+    internal_kind = _SOURCE_KINDS[source_kind]
+    metadata: dict[str, Any] = {"source_kind": internal_kind}
+    source_registry = registry
+    if mode == "merged":
+        candidates = [item for item in (registry, *extra_registries) if item]
+        if raw.get("registries") is None:
+            candidates.append(_PUBLIC_REGISTRIES[ecosystem])
+        metadata["registry_mode"] = "merged"
+        metadata["candidate_registries"] = list(dict.fromkeys(candidates))
+        source_registry = None
+    elif mode == "exclusive":
+        metadata["registry_mode"] = "exclusive"
+    artifacts: tuple[Artifact, ...] = ()
+    evidence = SourceEvidence(source=file or "skylos inventory", reader="ca9.api")
+    if source_url:
+        metadata["source_url"] = source_url
+    if internal_kind == "git" and source_url:
+        artifacts = (Artifact(kind="git-source", url=source_url, evidence=(evidence,)),)
+    elif internal_kind == "direct_url":
+        has_hash = _usable_integrity(integrity)
+        metadata["has_hash"] = has_hash
+        if source_url and has_hash:
+            artifacts = (
+                Artifact(kind="direct-url", url=source_url, hash=integrity, evidence=(evidence,)),
+            )
+    package = Package(
+        name=clean_name,
+        version=clean_version,
+        ecosystem=ecosystem,
+        dependency_kind=dependency_kind,
+        source_registry=source_registry,
+        artifacts=artifacts,
+        evidence=(evidence,),
+        metadata=metadata,
+    )
+    return (
+        _Entry(
+            raw=raw,
+            package=package,
+            ecosystem=ecosystem,
+            name=clean_name,
+            version=clean_version,
+            source_kind=source_kind,
+            registry=registry,
+            integrity=integrity,
+            file=file,
+            line=line,
+        ),
+        "",
+    )
+
+
+def _static_findings(
+    entry: _Entry,
+    policy: SupplyChainPolicy,
+    options: _Options,
+    receipt: _Receipt,
+) -> list[dict[str, Any]]:
+    try:
+        findings = analyze_supply_chain(
+            Inventory(repo_path=".", packages=(entry.package,)), policy=policy
+        )
+    except (TypeError, ValueError, AttributeError, KeyError):
+        receipt.skip("malformed_package")
+        return []
+    results: list[dict[str, Any]] = []
+    for finding in findings:
+        if finding.signal_type not in _STATIC_SIGNALS:
+            continue
+        if finding.signal_type == "untrusted_registry" and not options.trusted_registries:
+            continue
+        converted = _finding_dict(finding, entry)
+        if converted is not None:
+            results.append(converted)
+    if _missing_integrity(entry):
+        results.append(
+            _finding_dict(
+                Finding(
+                    title=f"Lockfile entry without integrity for {entry.name}",
+                    signal_type="missing_integrity",
+                    package_key=entry.package.key,
+                    severity="medium",
+                    evidence=(
+                        Evidence(
+                            kind="artifact_integrity",
+                            description=f"{entry.file} records no integrity for {entry.name}",
+                            source=SourceEvidence(
+                                source=entry.file or "lockfile", reader="ca9.api"
+                            ),
+                            metadata={"file": entry.file, "registry": entry.registry},
+                        ),
+                    ),
+                    metadata={
+                        "action": "warn",
+                        "reason": (
+                            "the lockfile does not pin this registry package by hash, so a "
+                            "changed or substituted tarball installs without notice"
+                        ),
+                    },
+                ),
+                entry,
+            )
+        )
+    return results
+
+
+def _missing_integrity(entry: _Entry) -> bool:
+    if entry.source_kind != "registry" or entry.integrity:
+        return False
+    declared = entry.raw.get("lockfile")
+    if isinstance(declared, bool):
+        return declared
+    if not entry.file:
+        return False
+    return PurePath(entry.file.replace("\\", "/")).name.lower() in _LOCKFILES_WITH_INTEGRITY
+
+
+def _malware_findings(
+    entries: list[_Entry],
+    options: _Options,
+    receipt: _Receipt,
+) -> list[dict[str, Any]]:
+    if not entries:
+        return []
+    finder = _optional_function("ca9.package_feed", "find_malware_matches")
+    if finder is None:
+        receipt.skip("malware_feed_unsupported", len(entries))
+        return []
+    try:
+        matches = finder([entry.package for entry in entries], cache_dir=options.feed_dir)
+    except Exception:
+        receipt.skip("malware_feed_unavailable", len(entries))
+        return []
+    return _malware_dicts(matches, entries)
+
+
+def _malware_dicts(matches: object, entries: list[_Entry]) -> list[dict[str, Any]]:
+    by_key: dict[str, list[_Entry]] = {}
+    by_name: dict[str, list[_Entry]] = {}
+    for entry in entries:
+        by_key.setdefault(entry.package.key, []).append(entry)
+        by_name.setdefault(package_key(entry.ecosystem, entry.name), []).append(entry)
+    results: list[dict[str, Any]] = []
+    if not isinstance(matches, Iterable):
+        return results
+    for finding in matches:
+        if not isinstance(finding, Finding):
+            continue
+        targets = by_key.get(finding.package_key) or by_name.get(finding.package_key) or ()
+        for entry in targets:
+            converted = _finding_dict(finding, entry)
+            if converted is not None:
+                results.append(converted)
+    return results
+
+
+def _release_age_findings(
+    entries: list[_Entry],
+    options: _Options,
+    receipt: _Receipt,
+) -> list[dict[str, Any]]:
+    if not options.min_release_age_hours:
+        return []
+    eligible = [entry for entry in entries if entry.source_kind == "registry"]
+    unpinned = [entry for entry in eligible if not entry.version]
+    receipt.skip("release_age_no_version", len(unpinned))
+    eligible = [entry for entry in eligible if entry.version]
+    if not eligible:
+        return []
+    if not options.network:
+        receipt.skip("network_disabled", len(eligible))
+        return []
+    checker = _optional_function("ca9.release_age", "check_release_age")
+    if checker is None:
+        receipt.skip("release_age_unsupported", len(eligible))
+        return []
+    results: dict[tuple[str, str, str], dict[str, Any] | None] = {}
+    findings: list[dict[str, Any]] = []
+    for entry in eligible:
+        identity = (entry.ecosystem, entry.package.normalized_name, entry.version or "")
+        if identity not in results:
+            if receipt.lookups >= options.max_lookups:
+                results[identity] = None
+            else:
+                results[identity] = _call_release_age(checker, entry, options, receipt)
+        result = results[identity]
+        if result is None:
+            receipt.skip("max_lookups")
+            continue
+        if result["status"] == "unknown":
+            receipt.skip("release_age_unknown")
+            continue
+        if result["status"] != "too_new":
+            continue
+        findings.append(_release_age_dict(entry, result, options.min_release_age_hours))
+    return findings
+
+
+def _call_release_age(
+    checker: Callable[..., Any],
+    entry: _Entry,
+    options: _Options,
+    receipt: _Receipt,
+) -> dict[str, Any]:
+    try:
+        raw = checker(
+            entry.ecosystem,
+            entry.name,
+            entry.version,
+            min_hours=options.min_release_age_hours,
+            cache_dir=options.cache_dir,
+        )
+    except Exception as exc:
+        receipt.lookups += 1
+        return _unknown_age(f"release age check failed: {exc}")
+    result = _normalized_age(raw)
+    if "cache" in str(result.get("source") or "").lower():
+        receipt.cache_hits += 1
+    else:
+        receipt.lookups += 1
+    return result
+
+
+def _release_age_dict(entry: _Entry, result: dict[str, Any], min_hours: int) -> dict[str, Any]:
+    suggested = result.get("suggested_version")
+    remediation = _REMEDIATION["new_package_version"]
+    if isinstance(suggested, str) and suggested:
+        remediation = (
+            f"Wait until the release is older than {min_hours}h, or pin {entry.name} {suggested}."
+        )
+    age = result.get("age_hours")
+    age_text = "less than the cooldown"
+    if isinstance(age, (int, float)) and not isinstance(age, bool):
+        age_text = f"{age:.1f}h old"
+    return {
+        "signal_type": "new_package_version",
+        "severity": "HIGH",
+        "action": "block",
+        "ecosystem": entry.ecosystem,
+        "name": entry.name,
+        "version": entry.version,
+        "title": f"{entry.name} {entry.version} is newer than the {min_hours}h cooldown",
+        "reason": (
+            f"{entry.name} {entry.version} was published {age_text}; fresh releases are "
+            "where hijacked and malicious versions are caught before they spread"
+        ),
+        "remediation": remediation,
+        "evidence": {**result, "min_release_age_hours": min_hours},
+        "file": entry.file,
+        "line": entry.line,
+    }
+
+
+def _provenance_findings(
+    entries: list[_Entry],
+    options: _Options,
+    receipt: _Receipt,
+) -> list[dict[str, Any]]:
+    if not options.check_provenance:
+        return []
+    npm_entries = [
+        entry for entry in entries if entry.ecosystem == "npm" and entry.source_kind == "registry"
+    ]
+    public: list[_Entry] = []
+    for entry in npm_entries:
+        if entry.registry and entry.registry.rstrip("/").lower() != REGISTRY_ORIGIN:
+            receipt.skip("provenance_private_registry")
+        elif not entry.version:
+            receipt.skip("provenance_no_version")
+        else:
+            public.append(entry)
+    if not public:
+        return []
+    if not options.network:
+        receipt.skip("network_disabled", len(public))
+        return []
+    documents: dict[str, dict[str, Any] | None] = {}
+    results: dict[tuple[str, str], dict[str, Any]] = {}
+    findings: list[dict[str, Any]] = []
+    for entry in public:
+        identity = (entry.package.normalized_name, entry.version or "")
+        if identity not in results:
+            fetched_before = identity[0] in documents
+            allow_fetch = fetched_before or receipt.lookups < options.max_lookups
+            result = check_npm_provenance(
+                entry.name,
+                entry.version or "",
+                cache_dir=options.cache_dir,
+                documents=documents,
+                allow_fetch=allow_fetch,
+            )
+            if result.get("source") == "cache" or fetched_before:
+                receipt.cache_hits += 1
+            elif result.get("reason") != "lookup budget exhausted":
+                receipt.lookups += 1
+            results[identity] = result
+        result = results[identity]
+        if result.get("reason") == "lookup budget exhausted":
+            receipt.skip("max_lookups")
+            continue
+        if result["status"] == "unknown":
+            receipt.skip("provenance_unknown")
+            continue
+        if result["status"] != "regressed":
+            continue
+        findings.append(
+            {
+                "signal_type": "provenance_regression",
+                "severity": "HIGH",
+                "action": "block",
+                "ecosystem": entry.ecosystem,
+                "name": entry.name,
+                "version": entry.version,
+                "title": f"npm provenance regression for {entry.name}",
+                "reason": str(result.get("reason") or "release lost provenance"),
+                "remediation": _REMEDIATION["provenance_regression"],
+                "evidence": dict(result.get("evidence") or {}),
+                "file": entry.file,
+                "line": entry.line,
+            }
+        )
+    return findings
+
+
+def _finding_dict(finding: Finding, entry: _Entry) -> dict[str, Any] | None:
+    action = str(finding.metadata.get("action") or "warn")
+    if action == "pass":
+        return None
+    if action not in _ACTIONS:
+        action = "warn"
+    evidence: dict[str, Any] = {}
+    if finding.evidence:
+        evidence = dict(finding.evidence[0].metadata)
+        evidence["description"] = finding.evidence[0].description
+    for key in ("advisory_id", "aliases", "malicious"):
+        if key in finding.metadata and key not in evidence:
+            evidence[key] = finding.metadata[key]
+    return {
+        "signal_type": finding.signal_type,
+        "severity": _SEVERITIES.get(finding.severity, "MEDIUM"),
+        "action": action,
+        "ecosystem": entry.ecosystem,
+        "name": entry.name,
+        "version": entry.version,
+        "title": finding.title,
+        "reason": str(finding.metadata.get("reason") or finding.title),
+        "remediation": _remediation(finding, evidence),
+        "evidence": evidence,
+        "file": entry.file,
+        "line": entry.line,
+    }
+
+
+def _remediation(finding: Finding, evidence: dict[str, Any]) -> str:
+    if finding.signal_type == "git_dependency" and evidence.get("pinned_commit"):
+        return "Prefer a registry release with integrity hashes over a Git source."
+    if finding.signal_type == "direct_url_dependency" and evidence.get("has_hash"):
+        return "Prefer a registry release over a direct URL; keep the hash pin."
+    return _REMEDIATION.get(finding.signal_type, "Review this package before installing it.")
+
+
+def _usable_integrity(value: str | None) -> bool:
+    if not value:
+        return False
+    if valid_hash_pins(value.split()):
+        return True
+    for token in value.split():
+        algorithm, separator, digest = token.partition("-")
+        if separator and algorithm in {"sha256", "sha384", "sha512"} and len(digest) >= 40:
+            return True
+    return False
+
+
+def _unknown_age(reason: str) -> dict[str, Any]:
+    return {
+        "status": "unknown",
+        "published_at": None,
+        "age_hours": None,
+        "suggested_version": None,
+        "source": "unavailable",
+        "reason": reason,
+    }
+
+
+def _normalized_age(result: object) -> dict[str, Any]:
+    if not isinstance(result, Mapping):
+        return _unknown_age("release age check returned no result")
+    normalized = dict(result)
+    if normalized.get("status") not in _AGE_STATUSES:
+        normalized["status"] = "unknown"
+    for key in ("published_at", "age_hours", "suggested_version", "source"):
+        normalized.setdefault(key, None)
+    return normalized
+
+
+def _optional_function(module_name: str, attribute: str) -> Callable[..., Any] | None:
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        return None
+    function = getattr(module, attribute, None)
+    if not callable(function):
+        return None
+    return function
+
+
+def _optional_path(value: str | Path | None) -> Path | None:
+    if value is None or not str(value):
+        return None
+    return Path(value)
+
+
+def _optional_string(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
