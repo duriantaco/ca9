@@ -475,6 +475,9 @@ def provenance_from_document(
             return _provenance_result("unknown", reason="version has no valid publish time")
         ordered = _earlier_by_publish_time(times, versions, version, published_at)
         ordering = "publish_time"
+    same_line = [item for item in ordered if _release_line(item) == _release_line(version)]
+    if same_line:
+        ordered = same_line
     window = ordered[:PROVENANCE_HISTORY_WINDOW]
     with_provenance = [item for item in window if _has_provenance(versions[item])]
     current = _provenance_state(metadata)
@@ -538,6 +541,16 @@ def _earlier_by_version_number(versions: dict[str, Any], version: str) -> list[s
             earlier.append((number, other))
     earlier.sort(reverse=True)
     return [item for _, item in earlier]
+
+
+def _release_line(version: str) -> tuple[int, ...] | None:
+    """Major version, or ``0.minor`` for 0.x, so backports compare with their own line."""
+    number = _version_tuple(version)
+    if number is None:
+        return None
+    if number[0] == 0:
+        return (0, number[1])
+    return (number[0],)
 
 
 def _version_tuple(version: str) -> tuple[int, int, int] | None:
