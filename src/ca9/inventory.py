@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
@@ -25,6 +26,58 @@ from ca9.core.models import (
 )
 from ca9.readers.fyn_lock import read_fyn_lock
 from ca9.readers.package_lock import read_package_lock
+from ca9.readers.requirements import (
+    RequirementReference,
+    parse_requirement_reference,
+    valid_hash_pins,
+    vcs_reference,
+)
+
+PYPI_SIMPLE_INDEX = "https://pypi.org/simple"
+_COMMIT_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+_REQUIREMENT_LONG_OPTIONS = (
+    "--index-url",
+    "--extra-index-url",
+    "--no-index",
+    "--find-links",
+    "--constraint",
+    "--requirement",
+    "--editable",
+    "--trusted-host",
+    "--pre",
+    "--prefer-binary",
+    "--require-hashes",
+    "--only-binary",
+    "--no-binary",
+    "--use-feature",
+    "--global-option",
+    "--config-settings",
+    "--hash",
+)
+_REQUIREMENT_SHORT_OPTIONS = {
+    "-i": "--index-url",
+    "-f": "--find-links",
+    "-c": "--constraint",
+    "-r": "--requirement",
+    "-e": "--editable",
+}
+_VALUE_OPTIONS = frozenset(
+    {
+        "--index-url",
+        "--extra-index-url",
+        "--find-links",
+        "--constraint",
+        "--requirement",
+        "--editable",
+        "--trusted-host",
+        "--only-binary",
+        "--no-binary",
+        "--use-feature",
+        "--global-option",
+        "--config-settings",
+        "--hash",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -33,6 +86,47 @@ class _DeclaredSource:
     url: str | None
     source_registry: str | None
     evidence: SourceEvidence
+    reference: RequirementReference | None = None
+    registry_mode: str | None = None
+    candidate_registries: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _RequirementIndexes:
+    """The package indexes one requirements file tells pip to search."""
+
+    index_url: str | None = None
+    extra_index_urls: tuple[str, ...] = ()
+    find_links: tuple[str, ...] = ()
+    no_index: bool = False
+
+    @property
+    def declared(self) -> bool:
+        return bool(self.index_url or self.extra_index_urls or self.find_links or self.no_index)
+
+    @property
+    def candidates(self) -> tuple[str, ...]:
+        indexes: list[str] = []
+        if not self.no_index:
+            indexes.append(self.index_url or PYPI_SIMPLE_INDEX)
+            indexes.extend(self.extra_index_urls)
+        indexes.extend(self.find_links)
+        unique: dict[str, str] = {}
+        for index in indexes:
+            unique.setdefault(_normalized_index(index), index)
+        return tuple(unique.values())
+
+    @property
+    def mode(self) -> str | None:
+        """exclusive: one index serves every package; merged: pip picks the best match."""
+        if not self.declared:
+            return None
+        candidates = self.candidates
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return "exclusive"
+        return "merged"
 
 
 def build_inventory(repo_path: Path) -> Inventory:
@@ -186,6 +280,13 @@ def _declared_package(
 ) -> Package:
     metadata = {}
     artifacts: tuple[Artifact, ...] = ()
+    reference = None
+    if declared_source is not None:
+        reference = declared_source.reference
+    if reference is not None:
+        hashes = valid_hash_pins((*hashes, *reference.fragment_hashes))
+    else:
+        hashes = valid_hash_pins(hashes)
     if hashes:
         # pip --hash pins identify the allowed distribution files.
         metadata["hashes"] = list(hashes)
@@ -195,17 +296,14 @@ def _declared_package(
         evidence = declared_source.evidence
         source_registry = declared_source.source_registry
         metadata["source_kind"] = declared_source.source_kind
+        if declared_source.registry_mode:
+            metadata["registry_mode"] = declared_source.registry_mode
+            metadata["candidate_registries"] = list(declared_source.candidate_registries)
+        if reference is not None:
+            metadata.update(_reference_metadata(reference, hashes, version))
         if declared_source.url:
             metadata["source_url"] = declared_source.url
-            artifacts = (
-                Artifact(
-                    kind="direct-url" if declared_source.source_kind != "git" else "git-source",
-                    url=declared_source.url,
-                    hash=" ".join(hashes) or None,
-                    source=_url_origin(declared_source.url),
-                    evidence=(declared_source.evidence,),
-                ),
-            )
+            artifacts = (_declared_artifact(declared_source, reference, hashes),)
     return Package(
         name=name,
         version=version,
@@ -214,6 +312,54 @@ def _declared_package(
         artifacts=artifacts,
         evidence=(evidence,),
         metadata=metadata,
+    )
+
+
+def _reference_metadata(
+    reference: RequirementReference,
+    hashes: tuple[str, ...],
+    version: str | None,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {}
+    if reference.source_kind in {"git", "vcs"}:
+        metadata["vcs_ref"] = reference.vcs_ref
+        metadata["pinned_commit"] = reference.pinned_commit
+    else:
+        metadata["has_hash"] = bool(hashes)
+    if reference.name_inferred:
+        metadata["name_inferred"] = True
+    if reference.version and reference.version == version:
+        metadata["version_source"] = "filename"
+    return metadata
+
+
+def _declared_artifact(
+    declared_source: _DeclaredSource,
+    reference: RequirementReference | None,
+    hashes: tuple[str, ...],
+) -> Artifact:
+    url = declared_source.url or ""
+    kind = "direct-url"
+    if declared_source.source_kind in {"git", "vcs"}:
+        kind = "git-source"
+    if (
+        reference is not None
+        and reference.source_kind == "path"
+        and reference.local_path is not None
+        and reference.artifact_kind in {"wheel", "sdist"}
+    ):
+        return Artifact(
+            kind=reference.artifact_kind,
+            url=reference.local_path.as_uri(),
+            hash=" ".join(hashes) or None,
+            evidence=(declared_source.evidence,),
+        )
+    return Artifact(
+        kind=kind,
+        url=url,
+        hash=" ".join(hashes) or None,
+        source=_url_origin(url),
+        evidence=(declared_source.evidence,),
     )
 
 
@@ -244,18 +390,19 @@ def _merge_pyproject_direct_sources(
         path=str(pyproject_path),
         reader="ca9 native manifest readers",
     )
+    base_dir = pyproject_path.parent
     project = data.get("project", {})
     if isinstance(project, dict):
         for req in project.get("dependencies", []):
             if isinstance(req, str):
-                _record_requirement_source(sources, req, evidence)
+                _record_requirement_source(sources, req, evidence, base_dir)
         optional_deps = project.get("optional-dependencies", {})
         if isinstance(optional_deps, dict):
             for reqs in optional_deps.values():
                 if isinstance(reqs, list):
                     for req in reqs:
                         if isinstance(req, str):
-                            _record_requirement_source(sources, req, evidence)
+                            _record_requirement_source(sources, req, evidence, base_dir)
 
     tool = data.get("tool", {})
     if not isinstance(tool, dict):
@@ -267,7 +414,7 @@ def _merge_pyproject_direct_sources(
     if isinstance(poetry_deps, dict):
         for name, spec in poetry_deps.items():
             if isinstance(name, str) and name.lower() != "python":
-                _record_mapping_source(sources, name, spec, evidence)
+                _record_mapping_source(sources, name, spec, evidence, base_dir)
 
 
 def _merge_requirements_direct_sources(
@@ -292,21 +439,28 @@ def _merge_requirements_direct_sources(
     if lines is None:
         return
 
+    indexes = _requirement_file_indexes(lines)
     for line in lines:
-        index_url = _requirement_index_url(line)
-        if index_url:
-            _record_requirement_file_registry(sources, path, index_url, evidence)
+        option = _requirement_option(line)
+        if option is not None:
+            option_name, value = option
+            if option_name == "--requirement" and value:
+                _merge_requirements_direct_sources(sources, path.parent / value, seen)
+            elif option_name == "--editable" and value:
+                _record_editable_source(sources, value, evidence, path.parent)
             continue
-        include_target = _requirement_include_target(path, line)
-        if include_target is not None:
-            _merge_requirements_direct_sources(sources, include_target, seen)
+        requirement = split_requirement_options(line)[0]
+        reference = parse_requirement_reference(requirement, base_dir=path.parent)
+        if reference is not None:
+            _record_reference(sources, reference, evidence)
             continue
-        if line.startswith(("-c ", "--constraint ")):
+        if indexes.mode is None:
             continue
-        if line.startswith("-e "):
-            _record_editable_source(sources, line[3:].strip(), evidence)
-        else:
-            _record_requirement_source(sources, split_requirement_options(line)[0], evidence)
+        try:
+            parsed = Requirement(requirement)
+        except InvalidRequirement:
+            continue
+        _record_index_source(sources, parsed.name, indexes, evidence)
 
 
 def _merge_pipfile_direct_sources(
@@ -326,7 +480,7 @@ def _merge_pipfile_direct_sources(
             continue
         for name, spec in section.items():
             if isinstance(name, str):
-                _record_mapping_source(sources, name, spec, evidence)
+                _record_mapping_source(sources, name, spec, evidence, pipfile_path.parent)
                 registry = _pipfile_registry_for_spec(spec, source_indexes)
                 if registry:
                     _record_registry_source(sources, name, registry, evidence)
@@ -336,15 +490,11 @@ def _record_requirement_source(
     sources: dict[str, _DeclaredSource],
     requirement: str,
     evidence: SourceEvidence,
+    base_dir: Path | None = None,
 ) -> None:
-    try:
-        parsed = Requirement(requirement)
-    except InvalidRequirement:
-        _record_editable_source(sources, requirement, evidence)
-        return
-    if not parsed.url:
-        return
-    _record_source(sources, parsed.name, parsed.url, evidence)
+    reference = parse_requirement_reference(requirement, base_dir=base_dir)
+    if reference is not None:
+        _record_reference(sources, reference, evidence)
 
 
 def _record_mapping_source(
@@ -352,24 +502,105 @@ def _record_mapping_source(
     name: str,
     spec: object,
     evidence: SourceEvidence,
+    base_dir: Path | None = None,
 ) -> None:
     if not isinstance(spec, dict):
         return
     for key in ("git", "url", "path"):
         value = spec.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        location = value.strip()
+        if key == "git":
+            reference = _mapping_git_reference(name, location, spec)
+        elif key == "path":
+            reference = parse_requirement_reference(f"{name} @ {location}", base_dir=base_dir)
+            if reference is None or reference.source_kind != "path":
+                reference = _mapping_path_reference(name, location, base_dir)
+        else:
+            reference = parse_requirement_reference(f"{name} @ {location}", base_dir=base_dir)
+        if reference is None:
+            _record_source(sources, name, location, evidence, source_kind=key)
+        else:
+            _record_reference(sources, reference, evidence)
+        return
+
+
+def _mapping_git_reference(name: str, location: str, spec: dict) -> RequirementReference:
+    """Git sources in poetry/Pipfile tables name the revision in rev/ref/tag/branch."""
+    revision = None
+    pinned = False
+    for field_name in ("rev", "ref", "tag", "branch"):
+        value = spec.get(field_name)
         if isinstance(value, str) and value.strip():
-            _record_source(sources, name, value.strip(), evidence, source_kind=key)
-            return
+            revision = value.strip()
+            pinned = field_name in {"rev", "ref"} and bool(_COMMIT_RE.fullmatch(revision))
+            break
+    if revision is None:
+        vcs_url = location
+        if "+" not in location.split(":", 1)[0]:
+            vcs_url = f"git+{location}"
+        revision = vcs_reference(vcs_url)
+        pinned = bool(revision and _COMMIT_RE.fullmatch(revision))
+    return RequirementReference(
+        name=name,
+        source_kind="git",
+        url=location,
+        vcs_ref=revision,
+        pinned_commit=pinned,
+    )
+
+
+def _mapping_path_reference(
+    name: str,
+    location: str,
+    base_dir: Path | None,
+) -> RequirementReference | None:
+    path_value = location
+    if not location.startswith(("./", "../", "/", "~/")):
+        path_value = f"./{location}"
+    parsed = parse_requirement_reference(path_value, base_dir=base_dir)
+    if parsed is None:
+        return None
+    return RequirementReference(
+        name=name,
+        source_kind="path",
+        url=location,
+        version=parsed.version,
+        local_path=parsed.local_path,
+        artifact_kind=parsed.artifact_kind,
+    )
 
 
 def _record_editable_source(
     sources: dict[str, _DeclaredSource],
     value: str,
     evidence: SourceEvidence,
+    base_dir: Path | None = None,
 ) -> None:
     name = _egg_name(value)
-    if name:
-        _record_source(sources, name, value, evidence)
+    if not name:
+        return
+    reference = parse_requirement_reference(value, base_dir=base_dir)
+    if reference is not None and canonicalize_name(reference.name) == canonicalize_name(name):
+        _record_reference(sources, reference, evidence)
+        return
+    _record_source(sources, name, value, evidence)
+
+
+def _record_reference(
+    sources: dict[str, _DeclaredSource],
+    reference: RequirementReference,
+    evidence: SourceEvidence,
+) -> None:
+    key = canonicalize_name(reference.name)
+    sources[key] = _DeclaredSource(
+        source_kind=reference.source_kind,
+        url=reference.url,
+        source_registry=None,
+        evidence=evidence,
+        reference=reference,
+    )
 
 
 def _record_source(
@@ -397,18 +628,38 @@ def _record_registry_source(
     key = canonicalize_name(name)
     existing = sources.get(key)
     if existing and existing.url:
-        sources[key] = _DeclaredSource(
-            source_kind=existing.source_kind,
-            url=existing.url,
-            source_registry=registry,
-            evidence=existing.evidence,
-        )
         return
     sources[key] = _DeclaredSource(
         source_kind="registry",
         url=None,
         source_registry=registry,
         evidence=evidence,
+        registry_mode="exclusive",
+        candidate_registries=(registry,),
+    )
+
+
+def _record_index_source(
+    sources: dict[str, _DeclaredSource],
+    name: str,
+    indexes: _RequirementIndexes,
+    evidence: SourceEvidence,
+) -> None:
+    key = canonicalize_name(name)
+    existing = sources.get(key)
+    if existing and existing.url:
+        return
+    candidates = indexes.candidates
+    registry = None
+    if indexes.mode == "exclusive":
+        registry = candidates[0]
+    sources[key] = _DeclaredSource(
+        source_kind="registry",
+        url=None,
+        source_registry=registry,
+        evidence=evidence,
+        registry_mode=indexes.mode,
+        candidate_registries=candidates,
     )
 
 
@@ -419,60 +670,88 @@ def _requirement_lines(path: Path) -> list[str] | None:
         return None
 
 
-def _requirement_include_target(path: Path, line: str) -> Path | None:
-    if line.startswith("-r "):
-        return path.parent / line[3:].strip()
-    if line.startswith("--requirement "):
-        return path.parent / line[len("--requirement ") :].strip()
-    return None
+def _requirement_option(line: str) -> tuple[str, str | None] | None:
+    """Return (canonical option, value) for a pip requirements-file option line.
 
-
-def _requirement_index_url(line: str) -> str | None:
-    prefixes = (
-        "--index-url=",
-        "--extra-index-url=",
-        "--find-links=",
-        "-i=",
-        "-f=",
-    )
-    for prefix in prefixes:
-        if line.startswith(prefix):
-            return line[len(prefix) :].strip() or None
-    option_prefixes = (
-        "--index-url ",
-        "--extra-index-url ",
-        "--find-links ",
-        "-i ",
-        "-f ",
-    )
-    for prefix in option_prefixes:
-        if line.startswith(prefix):
-            return line[len(prefix) :].strip() or None
-    return None
-
-
-def _record_requirement_file_registry(
-    sources: dict[str, _DeclaredSource],
-    path: Path,
-    registry: str,
-    evidence: SourceEvidence,
-) -> None:
-    for line in _requirement_lines(path) or ():
-        if _requirement_index_url(line):
-            continue
-        if line.startswith(("-r ", "--requirement ", "-c ", "--constraint ")):
-            continue
-        if line.startswith("-e "):
-            name = _egg_name(line[3:].strip())
+    Long options may be abbreviated to any unique prefix, as optparse allows, and
+    take their value after "=" or whitespace.
+    """
+    if not line.startswith("-"):
+        return None
+    if line.startswith("--"):
+        token = re.match(r"--[A-Za-z0-9-]*", line).group(0)
+        rest = line[len(token) :]
+        if token in _REQUIREMENT_LONG_OPTIONS:
+            option = token
         else:
-            try:
-                parsed = Requirement(split_requirement_options(line)[0])
-            except InvalidRequirement:
-                name = None
-            else:
-                name = parsed.name
-        if name:
-            _record_registry_source(sources, name, registry, evidence)
+            matches = [name for name in _REQUIREMENT_LONG_OPTIONS if name.startswith(token)]
+            if len(matches) != 1:
+                return (token, None)
+            option = matches[0]
+    else:
+        option = _REQUIREMENT_SHORT_OPTIONS.get(line[:2])
+        if option is None:
+            return (line[:2], None)
+        rest = line[2:]
+    if option not in _VALUE_OPTIONS:
+        return (option, None)
+    if rest.startswith("="):
+        rest = rest[1:]
+    value = rest.strip()
+    if option != "--editable":
+        parts = value.split()
+        if parts:
+            value = parts[0]
+        else:
+            value = ""
+    return (option, value or None)
+
+
+def _requirement_file_indexes(lines: list[str]) -> _RequirementIndexes:
+    index_url: str | None = None
+    extra: list[str] = []
+    find_links: list[str] = []
+    no_index = False
+    for line in lines:
+        option = _requirement_option(line)
+        if option is None:
+            continue
+        option_name, value = option
+        if value:
+            value = _without_credentials(value)
+        if option_name == "--index-url" and value:
+            index_url = value
+        elif option_name == "--extra-index-url" and value:
+            extra.append(value)
+        elif option_name == "--find-links" and value:
+            find_links.append(value)
+        elif option_name == "--no-index":
+            no_index = True
+    return _RequirementIndexes(
+        index_url=index_url,
+        extra_index_urls=tuple(extra),
+        find_links=tuple(find_links),
+        no_index=no_index,
+    )
+
+
+def _without_credentials(value: str) -> str:
+    """Drop user:token from an index URL so it is neither reported nor compared."""
+    try:
+        split = urlsplit(value)
+        if not split.netloc or "@" not in split.netloc:
+            return value
+        host = split.netloc.rsplit("@", 1)[1]
+    except ValueError:
+        return value
+    return split._replace(netloc=host).geturl()
+
+
+def _normalized_index(value: str) -> str:
+    split = urlsplit(value.strip())
+    if split.scheme and split.netloc:
+        return f"{split.scheme.lower()}://{split.netloc.lower()}{split.path.rstrip('/')}"
+    return value.strip().rstrip("/")
 
 
 def _egg_name(value: str) -> str | None:

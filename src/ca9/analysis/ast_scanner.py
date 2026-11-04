@@ -17,6 +17,10 @@ from ca9.analysis.import_names import (
     environment_index,
     resolve_import_names,
 )
+from ca9.readers.requirements import (
+    looks_like_source_reference,
+    parse_requirement_reference,
+)
 
 # Primary import names for distributions whose module name differs from the
 # distribution name. Kept for compatibility; see ca9.analysis.import_names.
@@ -317,6 +321,12 @@ def _extract_req_name_from_line(line: str) -> str | None:
 
     req, _hashes = split_requirement_options(req)
 
+    if looks_like_source_reference(req):
+        reference = parse_requirement_reference(req)
+        if reference is None:
+            return None
+        return reference.name
+
     if " @ " in req:
         req = req.split(" @ ", 1)[0].strip()
 
@@ -336,8 +346,11 @@ def _extract_req_exact_version_from_line(line: str) -> str | None:
 
     req, _hashes = split_requirement_options(req)
 
-    if " @ " in req:
-        return None
+    if " @ " in req or looks_like_source_reference(req):
+        reference = parse_requirement_reference(req)
+        if reference is None:
+            return None
+        return reference.version
 
     try:
         parsed = Requirement(req)
