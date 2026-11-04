@@ -335,9 +335,13 @@ trusted publishing and publishers who maintain another package with at least
 100,000 weekly downloads are exempt. This is a review signal, not a malware
 verdict. The same scan blocks a provenance regression: the locked version has
 no registry attestation (`dist.attestations`) and no trusted publisher, while
-at least one of the five stable releases published before it had one. Packages
-that never published with provenance are not flagged. The check requires
-network access and cannot be combined with `--offline`.
+at least one of the five stable releases published before it on the same
+release line (major, or `0.minor`) had one. A first release on a new line is
+compared with the releases before it. A release on a line that never had
+provenance is still flagged when newer lines published before it had it; the
+evidence marks that `line: "newer"` because a hand-published backport looks the
+same. Packages that never published with provenance are not flagged. The check
+requires network access and cannot be combined with `--offline`.
 
 With `--scan-artifacts`, ca9 downloads only lockfile artifacts with hashes by
 default, verifies the hash, safely unpacks Python wheels/sdists and npm tarballs
@@ -1052,7 +1056,10 @@ result["receipt"]   # checked, lookups, cache_hits, skipped reasons, complete
 it skips bad entries and counts them in the receipt. Network checks (release
 age, npm provenance) run only with `network: True` and stop at `max_lookups`.
 `api.check_provenance`, `api.check_release_age`, and `api.malware_matches`
-expose the single checks.
+expose the single checks, and `api.feed_status` reports whether the malware feed
+is ready, stale, missing, or tampered. Names matching `internal_packages`, or
+hosted only on a private registry, are never sent to a public registry for the
+release-age or provenance lookups.
 
 ## Zero heavy dependencies
 
