@@ -620,6 +620,7 @@ def run_cmd(
         new_ledger_session_id,
         preflight_ledger_events,
         primary_registry_url,
+        runtime_release_age_policy,
         session_ended_event,
     )
     from ca9.runtime.pypi_gateway import (
@@ -638,10 +639,12 @@ def run_cmd(
             if policy_path is not None
             else load_effective_package_policy(cwd=Path.cwd())
         )
+        package_policy, release_age_defaulted = runtime_release_age_policy(package_policy)
         preflight = evaluate_runtime_preflight(
             command,
             package_policy,
             env=dict(os.environ),
+            release_age_defaulted=release_age_defaulted,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from None
@@ -691,6 +694,7 @@ def run_cmd(
             with NpmMetadataGateway(
                 upstream_registry=upstream_registry,
                 policy=package_policy,
+                release_age_defaulted=release_age_defaulted,
             ) as gateway:
                 completed = _run_child(
                     list(gateway_child_command(preflight.command)),
@@ -711,6 +715,7 @@ def run_cmd(
             with PyPISimpleGateway(
                 upstream_base=upstream_base,
                 policy=package_policy,
+                release_age_defaulted=release_age_defaulted,
             ) as gateway:
                 completed = _run_child(
                     list(
@@ -1303,6 +1308,7 @@ def vet_cmd(
             policy_findings, feed_warnings = package_age_findings(
                 inventory.packages,
                 package_policy,
+                network=not offline,
             )
         except FeedError as exc:
             raise click.ClickException(str(exc)) from None

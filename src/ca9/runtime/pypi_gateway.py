@@ -6,6 +6,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
@@ -21,6 +22,7 @@ from packaging.utils import (
 )
 from packaging.version import InvalidVersion, Version
 
+from ca9 import release_age as release_age_module
 from ca9.package_feed import (
     FeedSnapshot,
     FeedStatus,
@@ -30,6 +32,7 @@ from ca9.package_feed import (
     release_window_covers,
 )
 from ca9.package_policy import PackagePolicy, action_for_mode, find_policy_exception
+from ca9.release_age import check_release_age, prime_release_times
 
 DEFAULT_PYPI_UPSTREAM = "https://pypi.org"
 GATEWAY_SCHEMA = "ca9.pypi.gateway.v1"
@@ -98,12 +101,18 @@ class PyPIGatewayState:
     removed_links: list[PyPIGatewayDecision] | None = None
     applied_exceptions: list[dict[str, Any]] | None = None
     evaluation_failures: list[PyPIGatewayEvaluationFailure] | None = None
+    release_age_defaulted: bool = False
+    release_fetch: Callable[[str], Any] | None = None
+    release_memo: dict[str, Any] | None = None
+    primed_projects: set[str] | None = None
 
     def __post_init__(self) -> None:
         self.upstream_base = _normalize_upstream_base(self.upstream_base)
         self.removed_links = []
         self.applied_exceptions = []
         self.evaluation_failures = []
+        self.release_memo = {}
+        self.primed_projects = set()
 
 
 class PyPISimpleGateway:
@@ -114,12 +123,16 @@ class PyPISimpleGateway:
         policy: PackagePolicy,
         feed_cache_dir: Path | None = None,
         now: datetime | None = None,
+        release_age_defaulted: bool = False,
+        release_fetch: Callable[[str], Any] | None = None,
     ) -> None:
         self.state = PyPIGatewayState(
             upstream_base=upstream_base,
             policy=policy,
             feed_cache_dir=feed_cache_dir,
             now=now,
+            release_age_defaulted=release_age_defaulted,
+            release_fetch=release_fetch,
         )
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -484,6 +497,14 @@ def _denied_version(
                 snapshot, "pypi", now=now, minimum_hours=policy.package_age.minimum_hours
             ):
                 return None
+            result = _registry_release_age(package_name, version, state, now=now)
+            if result["status"] == "old_enough":
+                return None
+            if result["status"] == "too_new" and result.get("published_at"):
+                released_at = str(result["published_at"])
+        if not released_at:
+            if state.release_age_defaulted:
+                return None
             if action_for_mode("block", policy.mode.offline) == "block":
                 return _apply_gateway_exception(
                     PyPIGatewayDecision(
@@ -516,6 +537,52 @@ def _denied_version(
                     state,
                 )
     return None
+
+
+def _registry_release_age(
+    package_name: str,
+    version: str,
+    state: PyPIGatewayState,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    """Release age from PyPI metadata, fetching each URL at most once per gateway run."""
+    memo = state.release_memo
+    if memo is None:
+        memo = {}
+    upstream_fetch = state.release_fetch
+
+    def fetch_once(url: str) -> Any:
+        if url not in memo:
+            try:
+                if upstream_fetch is not None:
+                    memo[url] = ("ok", upstream_fetch(url))
+                else:
+                    memo[url] = ("ok", release_age_module._default_fetch(url))
+            except Exception as exc:
+                memo[url] = ("error", exc)
+        outcome, value = memo[url]
+        if outcome == "error":
+            raise value
+        return value
+
+    cache_root = None
+    if state.feed_cache_dir is not None:
+        cache_root = Path(state.feed_cache_dir).parent
+    primed = state.primed_projects
+    project = str(canonicalize_name(package_name))
+    if primed is not None and project not in primed:
+        primed.add(project)
+        prime_release_times("pypi", package_name, cache_dir=cache_root, fetch=fetch_once)
+    return check_release_age(
+        "pypi",
+        package_name,
+        version,
+        min_hours=state.policy.package_age.minimum_hours,
+        cache_dir=cache_root,
+        fetch=fetch_once,
+        now=now,
+    )
 
 
 def _apply_gateway_exception(
