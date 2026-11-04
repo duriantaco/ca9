@@ -485,7 +485,21 @@ def feed_group() -> None:
     default=False,
     help="Install a snapshot even if it is older than the installed one (rollback).",
 )
-def feed_update_cmd(source: str | None, output_format: str, allow_downgrade: bool) -> None:
+@click.option(
+    "--require-attestation",
+    is_flag=True,
+    default=False,
+    help=(
+        "Verify the downloaded bundle with `gh attestation verify` against the ca9 feed "
+        "workflow before installing it; fail if gh is missing or verification fails."
+    ),
+)
+def feed_update_cmd(
+    source: str | None,
+    output_format: str,
+    allow_downgrade: bool,
+    require_attestation: bool,
+) -> None:
     """Install a package intelligence feed snapshot into the local ca9 cache."""
     import os
 
@@ -494,7 +508,11 @@ def feed_update_cmd(source: str | None, output_format: str, allow_downgrade: boo
     resolved_source = source or os.environ.get("CA9_FEED_URL") or DEFAULT_FEED_URL
 
     try:
-        snapshot = update_feed_from_source(resolved_source, allow_downgrade=allow_downgrade)
+        snapshot = update_feed_from_source(
+            resolved_source,
+            allow_downgrade=allow_downgrade,
+            require_attestation=require_attestation,
+        )
     except FeedError as exc:
         raise click.ClickException(str(exc)) from None
 
@@ -505,6 +523,7 @@ def feed_update_cmd(source: str | None, output_format: str, allow_downgrade: boo
                     "schema_version": "ca9.feed.update.v1",
                     "cache_dir": str(snapshot.cache_dir),
                     "source": resolved_source,
+                    "attestation_verified": require_attestation,
                     "snapshot": snapshot.to_dict(),
                 },
                 indent=2,
@@ -513,6 +532,8 @@ def feed_update_cmd(source: str | None, output_format: str, allow_downgrade: boo
     else:
         click.echo(f"Feed updated: {snapshot.snapshot_id}")
         click.echo(f"Source: {resolved_source}")
+        if require_attestation:
+            click.echo("Attestation: verified (gh attestation verify)")
         click.echo(f"Cache: {snapshot.cache_dir}")
         click.echo(f"Expires: {snapshot.expires_at}")
 

@@ -27,6 +27,13 @@ inputs:
     description: Scan local GitHub Actions workflows when command is protect.
     required: false
     default: "true"
+  update-feed:
+    description: >-
+      Install the hosted ca9 malware feed before command protect. The bundle is
+      checked with `gh attestation verify` against the ca9 feed workflow, and the
+      step fails if it cannot be verified.
+    required: false
+    default: "true"
   coverage:
     description: coverage.py JSON path for dynamic evidence.
     required: false
@@ -106,6 +113,13 @@ runs:
     - name: Install ca9
       shell: bash
       run: python -m pip install "${{ github.action_path }}[cli]"
+
+    - name: Update ca9 feed (attested)
+      if: inputs.command == 'protect' && inputs.update-feed == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: ca9 feed update --require-attestation
 
     - name: Run ca9
       id: ca9
