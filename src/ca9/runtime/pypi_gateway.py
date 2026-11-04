@@ -573,7 +573,7 @@ def _registry_release_age(
     project = str(canonicalize_name(package_name))
     if primed is not None and project not in primed:
         primed.add(project)
-        prime_release_times("pypi", package_name, cache_dir=cache_root, fetch=fetch_once)
+        prime_release_times("pypi", package_name, cache_dir=cache_root, fetch=fetch_once, now=now)
     return check_release_age(
         "pypi",
         package_name,

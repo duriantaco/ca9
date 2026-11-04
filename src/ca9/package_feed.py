@@ -32,6 +32,7 @@ REQUIRED_DATASETS = ("npm-malware", "pypi-malware", "npm-releases", "pypi-releas
 OPTIONAL_DATASETS = ("npm-malware-ranges", "pypi-malware-ranges")
 FEED_ATTESTATION_REPO = "duriantaco/ca9"
 FEED_SIGNER_WORKFLOW = "duriantaco/ca9/.github/workflows/feed.yml"
+FEED_SIGNER_REF = "refs/heads/main"
 ATTESTATION_TIMEOUT_SECONDS = 120
 MAX_RELEASE_AGE_LOOKUPS = 1000
 RELEASE_AGE_WORKERS = 8
@@ -702,6 +703,7 @@ def registry_release_ages(
                 "age_hours": None,
                 "suggested_version": None,
                 "source": "lookup_limit",
+                "reason": "the release-age lookup limit was reached",
             }
         )
     return results
@@ -941,13 +943,17 @@ def verify_feed_attestation(
     *,
     repo: str = FEED_ATTESTATION_REPO,
     signer_workflow: str = FEED_SIGNER_WORKFLOW,
+    signer_ref: str = FEED_SIGNER_REF,
     gh: str | None = None,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> None:
     """Check ``path`` with ``gh attestation verify``; raise FeedError unless it passes.
 
-    The attestation must come from ``repo`` and be signed by the feed
-    publishing workflow, so a bundle attested by any other workflow fails.
+    The signing certificate must name exactly the feed publishing workflow at
+    ``signer_ref`` (``https://github.com/<signer_workflow>@<signer_ref>``), the
+    source ref must be ``signer_ref``, and the runner must be GitHub-hosted. A
+    bundle attested by another workflow, or by ``feed.yml`` dispatched from a
+    different branch, fails.
     """
     executable = gh or shutil.which("gh")
     if not executable:
@@ -962,8 +968,11 @@ def verify_feed_attestation(
         str(path),
         "--repo",
         repo,
-        "--signer-workflow",
-        signer_workflow,
+        "--cert-identity",
+        f"https://github.com/{signer_workflow}@{signer_ref}",
+        "--source-ref",
+        signer_ref,
+        "--deny-self-hosted-runners",
     ]
     try:
         completed = run(

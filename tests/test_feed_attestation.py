@@ -55,9 +55,12 @@ def test_attested_update_verifies_the_exact_bytes_it_installs(tmp_path):
     assert command[:3] == ["/usr/bin/gh", "attestation", "verify"]
     assert command[command.index("--repo") + 1] == "duriantaco/ca9"
     assert (
-        command[command.index("--signer-workflow") + 1]
-        == "duriantaco/ca9/.github/workflows/feed.yml"
+        command[command.index("--cert-identity") + 1]
+        == "https://github.com/duriantaco/ca9/.github/workflows/feed.yml@refs/heads/main"
     )
+    assert command[command.index("--source-ref") + 1] == "refs/heads/main"
+    assert "--deny-self-hosted-runners" in command
+    assert "--signer-workflow" not in command
     assert load_current_snapshot(cache_dir=tmp_path / "feed").snapshot_id
 
 

@@ -12,8 +12,14 @@ from ca9 import release_age
 from ca9.cli import main
 from ca9.core.models import Package
 from ca9.package_feed import load_current_snapshot, package_age_findings, update_feed_from_source
-from ca9.package_policy import ModePolicy, PackageAgePolicy, PackagePolicy
+from ca9.package_policy import (
+    ModePolicy,
+    PackageAgePolicy,
+    PackagePolicy,
+    load_effective_package_policy,
+)
 from ca9.release_age import check_release_age
+from ca9.runtime.preflight import runtime_release_age_policy
 from ca9.runtime.pypi_gateway import PyPIGatewayState, _denied_version
 
 NOW = datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc)
@@ -119,7 +125,7 @@ def test_fresh_pypi_version_skips_yanked_and_prerelease_suggestions(tmp_path):
     )
 
     assert result["status"] == "too_new"
-    assert result["published_at"] == _ago(hours=2)
+    assert result["published_at"] == _ago(hours=1)
     assert result["suggested_version"] == "1.9.0"
 
 
@@ -150,6 +156,7 @@ def test_registry_down_is_unknown_and_never_cached(tmp_path):
         "age_hours": None,
         "suggested_version": None,
         "source": "npm",
+        "reason": "registry metadata could not be fetched or parsed",
     }
     assert later["status"] == "too_new"
 
@@ -366,3 +373,208 @@ def _ago_from(now):
         return (now - timedelta(**delta)).isoformat().replace("+00:00", "Z")
 
     return ago
+
+
+OLD = "2020-01-01T00:00:00Z"
+
+
+def _pypi_release(files):
+    return _Registry(
+        {
+            "https://pypi.org/pypi/pkg/1.0.0/json": {
+                "info": {"name": "pkg", "version": "1.0.0"},
+                "urls": files,
+            },
+            "https://pypi.org/pypi/pkg/json": {
+                "info": {"name": "pkg"},
+                "releases": {"0.9.0": [{"upload_time_iso_8601": OLD}], "1.0.0": files},
+            },
+        }
+    )
+
+
+def test_new_file_in_an_old_pypi_release_is_held(tmp_path):
+    files = [
+        {"filename": "pkg-1.0.0.tar.gz", "upload_time_iso_8601": OLD, "yanked": False},
+        {
+            "filename": "pkg-1.0.0-1-py3-none-any.whl",
+            "upload_time_iso_8601": _ago(minutes=30),
+            "yanked": False,
+        },
+    ]
+
+    result = check_release_age(
+        "pypi",
+        "pkg",
+        "1.0.0",
+        min_hours=24,
+        cache_dir=tmp_path,
+        fetch=_pypi_release(files),
+        now=NOW,
+    )
+
+    assert result["status"] == "too_new"
+    assert result["published_at"] == _ago(minutes=30)
+    assert result["suggested_version"] == "0.9.0"
+
+
+def test_yanked_new_file_does_not_hold_an_old_pypi_release(tmp_path):
+    files = [
+        {"filename": "pkg-1.0.0.tar.gz", "upload_time_iso_8601": OLD, "yanked": False},
+        {
+            "filename": "pkg-1.0.0-py3-none-any.whl",
+            "upload_time_iso_8601": _ago(minutes=30),
+            "yanked": True,
+        },
+    ]
+
+    result = check_release_age(
+        "pypi",
+        "pkg",
+        "1.0.0",
+        min_hours=24,
+        cache_dir=tmp_path,
+        fetch=_pypi_release(files),
+        now=NOW,
+    )
+
+    assert result["status"] == "old_enough"
+
+
+def test_cached_pypi_release_is_rechecked_for_new_files(tmp_path):
+    old_files = [{"filename": "pkg-1.0.0.tar.gz", "upload_time_iso_8601": OLD, "yanked": False}]
+    first = check_release_age(
+        "pypi",
+        "pkg",
+        "1.0.0",
+        min_hours=24,
+        cache_dir=tmp_path,
+        fetch=_pypi_release(old_files),
+        now=NOW,
+    )
+    later = NOW + timedelta(minutes=11)
+    new_file = {
+        "filename": "pkg-1.0.0-1-py3-none-any.whl",
+        "upload_time_iso_8601": (later - timedelta(minutes=1)).isoformat(),
+        "yanked": False,
+    }
+    second = check_release_age(
+        "pypi",
+        "pkg",
+        "1.0.0",
+        min_hours=24,
+        cache_dir=tmp_path,
+        fetch=_pypi_release([*old_files, new_file]),
+        now=later,
+    )
+    within_window = check_release_age(
+        "pypi",
+        "pkg",
+        "1.0.0",
+        min_hours=24,
+        cache_dir=tmp_path,
+        fetch=_Registry({}),
+        now=later + timedelta(minutes=1),
+    )
+
+    assert first["status"] == "old_enough"
+    assert second["status"] == "too_new"
+    assert (within_window["status"], within_window["source"]) == ("too_new", "cache")
+
+
+@pytest.mark.parametrize(
+    "min_hours", [None, "24", -1, -0.5, float("nan"), float("inf"), True, 1e30]
+)
+def test_invalid_min_hours_is_unknown_not_old_enough(tmp_path, min_hours):
+    registry = _registry()
+
+    result = check_release_age(
+        "npm",
+        "fresh-lib",
+        "1.2.0",
+        min_hours=min_hours,
+        cache_dir=tmp_path,
+        fetch=registry,
+        now=NOW,
+    )
+
+    assert result["status"] == "unknown"
+    assert "min_hours" in result["reason"]
+    assert registry.calls == []
+
+
+def test_zero_min_hours_still_answers_from_the_registry(tmp_path):
+    result = check_release_age(
+        "npm", "fresh-lib", "1.2.0", min_hours=0, cache_dir=tmp_path, fetch=_registry(), now=NOW
+    )
+
+    assert (result["status"], result["reason"]) == ("old_enough", None)
+
+
+@pytest.mark.parametrize(
+    "repo_policy",
+    [
+        "[package_age]\nenabled = true\nminimum_hours = 0\n",
+        "[package_age]\nminimum_hours = 1\n",
+        '[package_age]\nenabled = true\nexclusions = ["*"]\n',
+        '[package_age]\nexclusions = ["fresh-*"]\n',
+        '[package_age]\nenabled = false\nexclusions = ["fresh-lib"]\n',
+    ],
+)
+def test_repository_policy_cannot_relax_the_runtime_hold(tmp_path, monkeypatch, repo_policy):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "ca9.toml").write_text(repo_policy)
+
+    result = _run(tmp_path, monkeypatch, cwd=repo)
+
+    assert result.exit_code == 1, result.output
+    data = json.loads(result.stdout)
+    assert any(item["policy_id"] == "ca9.package_age" for item in data["decisions"])
+    assert any("ignored relaxing setting package_age" in item for item in data["policy_warnings"])
+
+
+def test_repository_policy_can_raise_the_runtime_hold(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "ca9.toml").write_text("[package_age]\nminimum_hours = 72\n")
+    policy = load_effective_package_policy(cwd=repo, env={}, home=tmp_path / "home")
+
+    effective, _ = runtime_release_age_policy(policy)
+
+    assert (effective.package_age.enabled, effective.package_age.minimum_hours) == (True, 72)
+
+
+@pytest.mark.parametrize(
+    "user_policy",
+    ['[package_age]\nexclusions = ["fresh-*"]\n', "[package_age]\nminimum_hours = 1\n"],
+)
+def test_trusted_user_policy_may_exclude_or_lower_the_hold(tmp_path, monkeypatch, user_policy):
+    config = tmp_path / "home" / ".config" / "ca9"
+    config.mkdir(parents=True)
+    (config / "policy.toml").write_text(user_policy)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "ca9.toml").write_text("[package_age]\nminimum_hours = 0\n")
+
+    result = _run(tmp_path, monkeypatch, cwd=repo)
+
+    assert result.exit_code == 0, result.output
+
+
+def test_pypi_gateway_holds_an_old_release_that_gained_a_new_file(tmp_path):
+    update_feed_from_source(_empty_feed(tmp_path), cache_dir=tmp_path / "cache" / "feed", now=NOW)
+    snapshot = load_current_snapshot(cache_dir=tmp_path / "cache" / "feed")
+    files = [
+        {"filename": "pkg-1.0.0.tar.gz", "upload_time_iso_8601": OLD, "yanked": False},
+        {
+            "filename": "pkg-1.0.0-1-py3-none-any.whl",
+            "upload_time_iso_8601": _ago(minutes=30),
+            "yanked": False,
+        },
+    ]
+    state = _pypi_state(tmp_path, defaulted=True, registry=_pypi_release(files))
+
+    decision = _denied_version("pkg", "1.0.0", "pkg-1.0.0.tar.gz", state.policy, snapshot, state)
+
+    assert decision is not None and decision.policy_id == "ca9.package_age"

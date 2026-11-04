@@ -289,7 +289,7 @@ Options:
 |---|---|
 | `--from PATH_OR_URL` | Feed bundle `https://` URL, JSON file, or directory containing `snapshot.json`. Optional for `update`. |
 | `--allow-downgrade` | Install a snapshot older than the one already installed (otherwise refused as a possible rollback). |
-| `--require-attestation` | Verify the downloaded bundle with `gh attestation verify --repo duriantaco/ca9 --signer-workflow duriantaco/ca9/.github/workflows/feed.yml` before installing it. Fails, installing nothing, when `gh` is missing, verification fails, or the source is a snapshot directory. |
+| `--require-attestation` | Verify the downloaded bundle with `gh attestation verify --repo duriantaco/ca9 --cert-identity https://github.com/duriantaco/ca9/.github/workflows/feed.yml@refs/heads/main --source-ref refs/heads/main --deny-self-hosted-runners` before installing it. Fails, installing nothing, when `gh` is missing, verification fails, or the source is a snapshot directory. |
 | `--policy PATH` | ca9 package policy TOML for `status` offline/stale behavior. |
 | `-f, --format table\|json` | Output format. Defaults to `table`. |
 

@@ -9,7 +9,8 @@ name: Publish package feed
 # published bundle carries a GitHub artifact attestation signed by this
 # workflow. `ca9 feed update --require-attestation` checks it with:
 #   gh attestation verify latest.json --repo duriantaco/ca9 \
-#     --signer-workflow duriantaco/ca9/.github/workflows/feed.yml
+#     --cert-identity https://github.com/duriantaco/ca9/.github/workflows/feed.yml@refs/heads/main \
+#     --source-ref refs/heads/main --deny-self-hosted-runners
 
 on:
   schedule:
