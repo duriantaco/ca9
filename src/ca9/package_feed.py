@@ -702,6 +702,7 @@ def registry_release_ages(
                 "age_hours": None,
                 "suggested_version": None,
                 "source": "lookup_limit",
+                "reason": "the release-age lookup limit was reached",
             }
         )
     return results
