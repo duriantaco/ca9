@@ -28,10 +28,13 @@ from ca9.package_feed import (
     release_window_covers,
 )
 from ca9.package_policy import (
+    IgnoredPolicySetting,
     PackagePolicy,
     _load_policy_root,
     action_for_mode,
     find_policy_exception,
+    load_effective_package_policy,
+    tighten_package_policy,
 )
 from ca9.readers.package_lock import read_package_lock
 from ca9.release_age import DEFAULT_NPM_REGISTRY, check_release_age
@@ -561,36 +564,74 @@ def runtime_release_age_policy(policy: PackagePolicy) -> tuple[PackagePolicy, bo
 
     ``ca9 run`` holds versions published less than ``RUNTIME_RELEASE_AGE_HOURS``
     ago unless a trusted policy (user policy, ``CA9_POLICY`` or ``--policy``)
-    sets ``package_age.enabled = false`` or ``package_age.minimum_hours = 0``. A
-    tighten-only repository ``ca9.toml`` cannot switch the default off or lower
-    it. Returns the effective policy and whether the age check comes from this
+    sets ``package_age.enabled = false`` or ``package_age.minimum_hours = 0``.
+    A trusted policy may also lower the hold with ``minimum_hours`` or add
+    ``exclusions``. A tighten-only repository ``ca9.toml`` is merged against the
+    hold itself, so it can raise ``minimum_hours`` but cannot disable the hold,
+    lower it, or add exclusions; those settings are ignored with a warning.
+    Returns the effective policy and whether the age check comes from this
     default rather than from policy; defaulted checks never block a version just
     because its release time is unknown.
     """
+    trusted_paths = tuple(
+        Path(source) for source in policy.sources if source not in policy.tighten_only_sources
+    )
+    trusted_table = _package_age_table(trusted_paths)
+    if not policy.tighten_only_sources:
+        return _trusted_release_age(policy, trusted_table)
+    try:
+        trusted_policy = load_effective_package_policy(paths=trusted_paths)
+    except ValueError:
+        trusted_policy = PackagePolicy()
+    base, defaulted = _trusted_release_age(trusted_policy, trusted_table)
+    if not base.package_age.enabled:
+        return _trusted_release_age(policy, trusted_table)
+    tightened = base
+    ignored: list[IgnoredPolicySetting] = []
+    repo_enables = False
+    for source in policy.tighten_only_sources:
+        try:
+            root = _load_policy_root(Path(source))
+        except ValueError:
+            continue
+        table = root.get("package_age")
+        if isinstance(table, dict) and table.get("enabled") is True:
+            repo_enables = True
+        tightened, repo_ignored = tighten_package_policy(tightened, root, source=source)
+        ignored.extend(item for item in repo_ignored if item.key.startswith("package_age."))
+    known = {(item.key, item.source) for item in policy.ignored_settings}
+    added = tuple(item for item in ignored if (item.key, item.source) not in known)
+    effective = replace(
+        policy,
+        package_age=tightened.package_age,
+        ignored_settings=(*policy.ignored_settings, *added),
+    )
+    return effective, defaulted and not repo_enables
+
+
+def _trusted_release_age(
+    policy: PackagePolicy, trusted: dict[str, Any]
+) -> tuple[PackagePolicy, bool]:
     age = policy.package_age
-    trusted = _trusted_package_age_settings(policy)
     if age.enabled:
         if age.minimum_hours <= 0:
             return replace(policy, package_age=replace(age, enabled=False)), False
-        if "minimum_hours" not in trusted and age.minimum_hours < RUNTIME_RELEASE_AGE_HOURS:
-            return (
-                replace(policy, package_age=replace(age, minimum_hours=RUNTIME_RELEASE_AGE_HOURS)),
-                False,
-            )
         return policy, False
     if trusted.get("enabled") is False or trusted.get("minimum_hours") == 0:
         return policy, False
-    defaulted = replace(age, enabled=True, minimum_hours=RUNTIME_RELEASE_AGE_HOURS)
+    hours = RUNTIME_RELEASE_AGE_HOURS
+    requested = trusted.get("minimum_hours")
+    if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0:
+        hours = requested
+    defaulted = replace(age, enabled=True, minimum_hours=hours)
     return replace(policy, package_age=defaulted), True
 
 
-def _trusted_package_age_settings(policy: PackagePolicy) -> dict[str, Any]:
+def _package_age_table(paths: tuple[Path, ...]) -> dict[str, Any]:
     settings: dict[str, Any] = {}
-    for source in policy.sources:
-        if source in policy.tighten_only_sources:
-            continue
+    for path in paths:
         try:
-            root = _load_policy_root(Path(source))
+            root = _load_policy_root(path)
         except ValueError:
             continue
         table = root.get("package_age")
