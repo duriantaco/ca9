@@ -52,6 +52,8 @@ def is_pypi_resolution_candidate(
         return False, "version is not pinned"
     if package.metadata.get("registry_mode") == "merged":
         return False, "merged index setup; the serving index is not known"
+    if package.metadata.get("registry_mode") == "local":
+        return False, "installs from local find-links only"
     if package.source_registry and _normalized(package.source_registry) not in PYPI_SIMPLE_INDEXES:
         return False, f"installs from {package.source_registry}, not PyPI"
     normalized_name = _glob_name(package.name)

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlsplit
 
@@ -28,56 +29,15 @@ from ca9.readers.fyn_lock import read_fyn_lock
 from ca9.readers.package_lock import read_package_lock
 from ca9.readers.requirements import (
     RequirementReference,
+    is_local_location,
     parse_requirement_reference,
+    requirement_option,
     valid_hash_pins,
     vcs_reference,
 )
 
 PYPI_SIMPLE_INDEX = "https://pypi.org/simple"
 _COMMIT_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
-_REQUIREMENT_LONG_OPTIONS = (
-    "--index-url",
-    "--extra-index-url",
-    "--no-index",
-    "--find-links",
-    "--constraint",
-    "--requirement",
-    "--editable",
-    "--trusted-host",
-    "--pre",
-    "--prefer-binary",
-    "--require-hashes",
-    "--only-binary",
-    "--no-binary",
-    "--use-feature",
-    "--global-option",
-    "--config-settings",
-    "--hash",
-)
-_REQUIREMENT_SHORT_OPTIONS = {
-    "-i": "--index-url",
-    "-f": "--find-links",
-    "-c": "--constraint",
-    "-r": "--requirement",
-    "-e": "--editable",
-}
-_VALUE_OPTIONS = frozenset(
-    {
-        "--index-url",
-        "--extra-index-url",
-        "--find-links",
-        "--constraint",
-        "--requirement",
-        "--editable",
-        "--trusted-host",
-        "--only-binary",
-        "--no-binary",
-        "--use-feature",
-        "--global-option",
-        "--config-settings",
-        "--hash",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -92,41 +52,69 @@ class _DeclaredSource:
 
 
 @dataclass(frozen=True)
-class _RequirementIndexes:
-    """The package indexes one requirements file tells pip to search."""
+class _IndexExposure:
+    """Which indexes may serve a package: none declared, local only, one, or several."""
 
-    index_url: str | None = None
+    mode: str | None
+    candidates: tuple[str, ...] = ()
+    implicit: bool = False
+
+
+@dataclass(frozen=True)
+class _RequirementIndexes:
+    """Index options pip applies to one install, gathered from a file and its includes."""
+
+    index_urls: tuple[str, ...] = ()
     extra_index_urls: tuple[str, ...] = ()
     find_links: tuple[str, ...] = ()
     no_index: bool = False
 
     @property
     def declared(self) -> bool:
-        return bool(self.index_url or self.extra_index_urls or self.find_links or self.no_index)
+        return bool(self.index_urls or self.extra_index_urls or self.find_links or self.no_index)
 
-    @property
-    def candidates(self) -> tuple[str, ...]:
-        indexes: list[str] = []
-        if not self.no_index:
-            indexes.append(self.index_url or PYPI_SIMPLE_INDEX)
-            indexes.extend(self.extra_index_urls)
-        indexes.extend(self.find_links)
-        unique: dict[str, str] = {}
-        for index in indexes:
-            unique.setdefault(_normalized_index(index), index)
-        return tuple(unique.values())
+    def merged_with(self, other: _RequirementIndexes) -> _RequirementIndexes:
+        return _RequirementIndexes(
+            index_urls=(*self.index_urls, *other.index_urls),
+            extra_index_urls=(*self.extra_index_urls, *other.extra_index_urls),
+            find_links=(*self.find_links, *other.find_links),
+            no_index=self.no_index or other.no_index,
+        )
 
-    @property
-    def mode(self) -> str | None:
-        """exclusive: one index serves every package; merged: pip picks the best match."""
+    def exposure(self) -> _IndexExposure:
+        """Remote indexes pip may pick a release from.
+
+        Every --index-url seen counts, since the last one processed wins. Local
+        --find-links directories and file:// locations are not remote indexes.
+        """
         if not self.declared:
-            return None
-        candidates = self.candidates
+            return _IndexExposure(None, (PYPI_SIMPLE_INDEX,), implicit=True)
+        remote: list[str] = []
+        if not self.no_index:
+            if self.index_urls:
+                remote.extend(self.index_urls)
+            else:
+                remote.append(PYPI_SIMPLE_INDEX)
+            remote.extend(self.extra_index_urls)
+        remote.extend(self.find_links)
+        candidates = _unique_indexes(item for item in remote if not is_local_location(item))
         if not candidates:
-            return None
+            return _IndexExposure("local")
+        if not self.index_urls and _only_default_index(candidates):
+            return _IndexExposure(None, candidates, implicit=True)
         if len(candidates) == 1:
-            return "exclusive"
-        return "merged"
+            return _IndexExposure("exclusive", candidates)
+        return _IndexExposure("merged", candidates)
+
+
+@dataclass(frozen=True)
+class _RequirementFile:
+    path: Path
+    evidence: SourceEvidence
+    indexes: _RequirementIndexes
+    includes: tuple[Path, ...]
+    registry_names: tuple[str, ...]
+    references: tuple[RequirementReference, ...]
 
 
 def build_inventory(repo_path: Path) -> Inventory:
@@ -369,9 +357,7 @@ def _declared_direct_sources(repo_path: Path) -> dict[str, _DeclaredSource]:
     if pyproject_path.is_file():
         _merge_pyproject_direct_sources(sources, pyproject_path)
 
-    seen: set[Path] = set()
-    for req_file in sorted(repo_path.glob("requirements*.txt")):
-        _merge_requirements_direct_sources(sources, req_file, seen)
+    _merge_requirements_direct_sources(sources, sorted(repo_path.glob("requirements*.txt")))
 
     pipfile_path = repo_path / "Pipfile"
     if pipfile_path.is_file():
@@ -419,48 +405,163 @@ def _merge_pyproject_direct_sources(
 
 def _merge_requirements_direct_sources(
     sources: dict[str, _DeclaredSource],
-    path: Path,
-    seen: set[Path],
+    roots: list[Path],
 ) -> None:
+    """Record requirement-file sources and the index exposure of each package.
+
+    pip applies index options from every -r/-c file of one install to the whole
+    install, so each top-level file is read with its include closure. A package
+    listed by several top-level files takes the widest exposure: merged beats
+    exclusive, and a file without index options adds the default PyPI index.
+    """
+    files: dict[Path, _RequirementFile] = {}
+    root_keys: list[Path] = []
+    for root in roots:
+        key = _load_requirement_file(root, files)
+        if key is not None:
+            root_keys.append(key)
+
+    for parsed in files.values():
+        for reference in parsed.references:
+            _record_reference(sources, reference, parsed.evidence)
+
+    exposures: dict[str, list[tuple[str, SourceEvidence, _IndexExposure]]] = {}
+    for root_key in root_keys:
+        closure = _requirement_closure(root_key, files)
+        indexes = _RequirementIndexes()
+        for member in closure:
+            indexes = indexes.merged_with(files[member].indexes)
+        exposure = indexes.exposure()
+        for member in closure:
+            parsed = files[member]
+            for name in parsed.registry_names:
+                exposures.setdefault(canonicalize_name(name), []).append(
+                    (name, parsed.evidence, exposure)
+                )
+
+    for entries in exposures.values():
+        combined = _combine_exposures([entry[2] for entry in entries])
+        if combined.mode is None:
+            continue
+        _record_index_source(sources, entries[0][0], combined, entries[0][1])
+
+
+def _load_requirement_file(path: Path, files: dict[Path, _RequirementFile]) -> Path | None:
     try:
         resolved = path.resolve()
     except OSError:
         resolved = path
-    if resolved in seen or not path.is_file():
-        return
-    seen.add(resolved)
-
+    if resolved in files:
+        return resolved
+    if not path.is_file():
+        return None
+    lines = _requirement_lines(path)
+    if lines is None:
+        return None
     evidence = SourceEvidence(
         source="requirements.txt",
         path=str(path),
         reader="ca9 native manifest readers",
     )
-    lines = _requirement_lines(path)
-    if lines is None:
-        return
-
-    indexes = _requirement_file_indexes(lines)
+    index_urls: list[str] = []
+    extra: list[str] = []
+    find_links: list[str] = []
+    no_index = False
+    include_paths: list[Path] = []
+    registry_names: list[str] = []
+    references: list[RequirementReference] = []
     for line in lines:
-        option = _requirement_option(line)
+        option = requirement_option(line)
         if option is not None:
             option_name, value = option
-            if option_name == "--requirement" and value:
-                _merge_requirements_direct_sources(sources, path.parent / value, seen)
+            if value and option_name in {"--index-url", "--extra-index-url", "--find-links"}:
+                value = _without_credentials(value)
+            if option_name in {"--requirement", "--constraint"} and value:
+                include_paths.append(path.parent / value)
             elif option_name == "--editable" and value:
-                _record_editable_source(sources, value, evidence, path.parent)
+                reference = _editable_reference(value, path.parent)
+                if reference is not None:
+                    references.append(reference)
+            elif option_name == "--index-url" and value:
+                index_urls.append(value)
+            elif option_name == "--extra-index-url" and value:
+                extra.append(value)
+            elif option_name == "--find-links" and value:
+                find_links.append(value)
+            elif option_name == "--no-index":
+                no_index = True
             continue
         requirement = split_requirement_options(line)[0]
         reference = parse_requirement_reference(requirement, base_dir=path.parent)
         if reference is not None:
-            _record_reference(sources, reference, evidence)
-            continue
-        if indexes.mode is None:
+            references.append(reference)
             continue
         try:
             parsed = Requirement(requirement)
         except InvalidRequirement:
             continue
-        _record_index_source(sources, parsed.name, indexes, evidence)
+        registry_names.append(parsed.name)
+    files[resolved] = _RequirementFile(
+        path=path,
+        evidence=evidence,
+        indexes=_RequirementIndexes(
+            index_urls=tuple(index_urls),
+            extra_index_urls=tuple(extra),
+            find_links=tuple(find_links),
+            no_index=no_index,
+        ),
+        includes=(),
+        registry_names=tuple(registry_names),
+        references=tuple(references),
+    )
+    includes: list[Path] = []
+    for include in include_paths:
+        key = _load_requirement_file(include, files)
+        if key is not None:
+            includes.append(key)
+    files[resolved] = replace(files[resolved], includes=tuple(includes))
+    return resolved
+
+
+def _requirement_closure(root: Path, files: dict[Path, _RequirementFile]) -> list[Path]:
+    closure: list[Path] = []
+    pending = [root]
+    seen: set[Path] = set()
+    while pending:
+        current = pending.pop()
+        if current in seen or current not in files:
+            continue
+        seen.add(current)
+        closure.append(current)
+        pending.extend(files[current].includes)
+    return closure
+
+
+def _combine_exposures(exposures: list[_IndexExposure]) -> _IndexExposure:
+    if all(exposure.mode is None for exposure in exposures):
+        return _IndexExposure(None)
+    candidates = _unique_indexes(
+        candidate for exposure in exposures for candidate in exposure.candidates
+    )
+    implicit = all(exposure.implicit or exposure.mode == "local" for exposure in exposures)
+    if not candidates:
+        return _IndexExposure("local")
+    if implicit and _only_default_index(candidates):
+        return _IndexExposure(None)
+    if len(candidates) == 1:
+        return _IndexExposure("exclusive", candidates)
+    return _IndexExposure("merged", candidates)
+
+
+def _unique_indexes(values: Iterable[str]) -> tuple[str, ...]:
+    unique: dict[str, str] = {}
+    for value in values:
+        unique.setdefault(_normalized_index(value), value)
+    return tuple(unique.values())
+
+
+def _only_default_index(candidates: tuple[str, ...]) -> bool:
+    return len(candidates) == 1 and _normalized_index(candidates[0]) == PYPI_SIMPLE_INDEX
 
 
 def _merge_pipfile_direct_sources(
@@ -572,20 +673,15 @@ def _mapping_path_reference(
     )
 
 
-def _record_editable_source(
-    sources: dict[str, _DeclaredSource],
-    value: str,
-    evidence: SourceEvidence,
-    base_dir: Path | None = None,
-) -> None:
-    name = _egg_name(value)
-    if not name:
-        return
+def _editable_reference(value: str, base_dir: Path | None) -> RequirementReference | None:
+    """An editable install: a VCS URL, a local directory, or PEP 508 ``name @ url``."""
     reference = parse_requirement_reference(value, base_dir=base_dir)
-    if reference is not None and canonicalize_name(reference.name) == canonicalize_name(name):
-        _record_reference(sources, reference, evidence)
-        return
-    _record_source(sources, name, value, evidence)
+    if reference is not None:
+        return reference
+    name = _egg_name(value)
+    if name:
+        return RequirementReference(name=name, source_kind=_source_kind_from_url(value), url=value)
+    return None
 
 
 def _record_reference(
@@ -642,24 +738,23 @@ def _record_registry_source(
 def _record_index_source(
     sources: dict[str, _DeclaredSource],
     name: str,
-    indexes: _RequirementIndexes,
+    exposure: _IndexExposure,
     evidence: SourceEvidence,
 ) -> None:
     key = canonicalize_name(name)
     existing = sources.get(key)
     if existing and existing.url:
         return
-    candidates = indexes.candidates
     registry = None
-    if indexes.mode == "exclusive":
-        registry = candidates[0]
+    if exposure.mode == "exclusive":
+        registry = exposure.candidates[0]
     sources[key] = _DeclaredSource(
         source_kind="registry",
         url=None,
         source_registry=registry,
         evidence=evidence,
-        registry_mode=indexes.mode,
-        candidate_registries=candidates,
+        registry_mode=exposure.mode,
+        candidate_registries=exposure.candidates,
     )
 
 
@@ -668,71 +763,6 @@ def _requirement_lines(path: Path) -> list[str] | None:
         return requirement_file_lines(path.read_text(encoding="utf-8", errors="ignore"))
     except OSError:
         return None
-
-
-def _requirement_option(line: str) -> tuple[str, str | None] | None:
-    """Return (canonical option, value) for a pip requirements-file option line.
-
-    Long options may be abbreviated to any unique prefix, as optparse allows, and
-    take their value after "=" or whitespace.
-    """
-    if not line.startswith("-"):
-        return None
-    if line.startswith("--"):
-        token = re.match(r"--[A-Za-z0-9-]*", line).group(0)
-        rest = line[len(token) :]
-        if token in _REQUIREMENT_LONG_OPTIONS:
-            option = token
-        else:
-            matches = [name for name in _REQUIREMENT_LONG_OPTIONS if name.startswith(token)]
-            if len(matches) != 1:
-                return (token, None)
-            option = matches[0]
-    else:
-        option = _REQUIREMENT_SHORT_OPTIONS.get(line[:2])
-        if option is None:
-            return (line[:2], None)
-        rest = line[2:]
-    if option not in _VALUE_OPTIONS:
-        return (option, None)
-    if rest.startswith("="):
-        rest = rest[1:]
-    value = rest.strip()
-    if option != "--editable":
-        parts = value.split()
-        if parts:
-            value = parts[0]
-        else:
-            value = ""
-    return (option, value or None)
-
-
-def _requirement_file_indexes(lines: list[str]) -> _RequirementIndexes:
-    index_url: str | None = None
-    extra: list[str] = []
-    find_links: list[str] = []
-    no_index = False
-    for line in lines:
-        option = _requirement_option(line)
-        if option is None:
-            continue
-        option_name, value = option
-        if value:
-            value = _without_credentials(value)
-        if option_name == "--index-url" and value:
-            index_url = value
-        elif option_name == "--extra-index-url" and value:
-            extra.append(value)
-        elif option_name == "--find-links" and value:
-            find_links.append(value)
-        elif option_name == "--no-index":
-            no_index = True
-    return _RequirementIndexes(
-        index_url=index_url,
-        extra_index_urls=tuple(extra),
-        find_links=tuple(find_links),
-        no_index=no_index,
-    )
 
 
 def _without_credentials(value: str) -> str:

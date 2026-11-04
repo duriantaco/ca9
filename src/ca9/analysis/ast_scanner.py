@@ -20,6 +20,7 @@ from ca9.analysis.import_names import (
 from ca9.readers.requirements import (
     looks_like_source_reference,
     parse_requirement_reference,
+    requirement_option,
 )
 
 # Primary import names for distributions whose module name differs from the
@@ -307,16 +308,11 @@ def _extract_req_name_from_line(line: str) -> str | None:
     if " #" in req:
         req = req.split(" #", 1)[0].strip()
 
-    if req.startswith(("-c ", "--constraint ")):
-        return None
-
-    if req.startswith(("-r ", "--requirement ")):
-        return None
-
-    if req.startswith("-e "):
-        editable = req[3:].strip()
-        if "#egg=" in editable:
-            return editable.split("#egg=", 1)[1].strip() or None
+    option = requirement_option(req)
+    if option is not None:
+        option_name, value = option
+        if option_name == "--editable" and value:
+            return _editable_requirement_name(value)
         return None
 
     req, _hashes = split_requirement_options(req)
@@ -333,6 +329,16 @@ def _extract_req_name_from_line(line: str) -> str | None:
     return _parse_requirement_name(req)
 
 
+def _editable_requirement_name(value: str) -> str | None:
+    """Name of an editable install: #egg=, PEP 508 name, or the VCS/path name."""
+    reference = parse_requirement_reference(value)
+    if reference is not None:
+        return reference.name
+    if "#egg=" in value:
+        return _parse_requirement_name(value.split("#egg=", 1)[1])
+    return None
+
+
 def _extract_req_exact_version_from_line(line: str) -> str | None:
     req = line.strip()
     if not req or req.startswith("#"):
@@ -341,7 +347,7 @@ def _extract_req_exact_version_from_line(line: str) -> str | None:
     if " #" in req:
         req = req.split(" #", 1)[0].strip()
 
-    if req.startswith(("-c ", "--constraint ", "-r ", "--requirement ", "-e ")):
+    if requirement_option(req) is not None:
         return None
 
     req, _hashes = split_requirement_options(req)
@@ -400,14 +406,12 @@ def _iter_requirement_inventory(
 
         include_target: Path | None = None
         constraint_target: Path | None = None
-        if line.startswith("-r "):
-            include_target = path.parent / line[3:].strip()
-        elif line.startswith("--requirement "):
-            include_target = path.parent / line[len("--requirement ") :].strip()
-        elif line.startswith("-c "):
-            constraint_target = path.parent / line[3:].strip()
-        elif line.startswith("--constraint "):
-            constraint_target = path.parent / line[len("--constraint ") :].strip()
+        option = requirement_option(line)
+        if option is not None and option[1]:
+            if option[0] == "--requirement":
+                include_target = path.parent / option[1]
+            elif option[0] == "--constraint":
+                constraint_target = path.parent / option[1]
 
         if include_target is not None:
             nested = _iter_requirement_inventory(include_target, seen, hashes)
@@ -454,17 +458,9 @@ def _iter_constraint_inventory(
         if not line or line.startswith("#"):
             continue
 
-        if line.startswith("-c "):
-            constraints.update(
-                _iter_constraint_inventory(path.parent / line[3:].strip(), seen, hashes)
-            )
-            continue
-        if line.startswith("--constraint "):
-            constraints.update(
-                _iter_constraint_inventory(
-                    path.parent / line[len("--constraint ") :].strip(), seen, hashes
-                )
-            )
+        option = requirement_option(line)
+        if option is not None and option[0] == "--constraint" and option[1]:
+            constraints.update(_iter_constraint_inventory(path.parent / option[1], seen, hashes))
             continue
 
         name = _extract_req_name_from_line(line)
@@ -833,14 +829,9 @@ def _iter_requirement_names(path: Path, seen: set[Path]) -> set[str]:
         if not line or line.startswith("#"):
             continue
 
-        include_target: Path | None = None
-        if line.startswith("-r "):
-            include_target = path.parent / line[3:].strip()
-        elif line.startswith("--requirement "):
-            include_target = path.parent / line[len("--requirement ") :].strip()
-
-        if include_target is not None:
-            names.update(_iter_requirement_names(include_target, seen))
+        option = requirement_option(line)
+        if option is not None and option[0] == "--requirement" and option[1]:
+            names.update(_iter_requirement_names(path.parent / option[1], seen))
             continue
 
         name = _extract_req_name_from_line(line)
