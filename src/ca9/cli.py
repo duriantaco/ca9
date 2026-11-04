@@ -1161,7 +1161,8 @@ def protect_cmd(
     "--scan-publisher-changes",
     is_flag=True,
     default=False,
-    help="Query public npm metadata for recent publisher changes after release dormancy.",
+    help="Query public npm metadata for publisher changes after release dormancy and "
+    "provenance regressions.",
 )
 @click.option(
     "--scan-artifacts",
