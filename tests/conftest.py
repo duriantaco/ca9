@@ -43,3 +43,14 @@ def trivy_path():
 @pytest.fixture
 def pip_audit_path():
     return FIXTURES_DIR / "pip_audit_sample.json"
+
+
+@pytest.fixture(autouse=True)
+def _no_registry_release_lookups(monkeypatch):
+    """Keep release-age registry lookups offline unless a test supplies its own fetch."""
+    from ca9 import release_age
+
+    def offline_fetch(url: str):
+        raise OSError(f"registry access is disabled in tests: {url}")
+
+    monkeypatch.setattr(release_age, "_default_fetch", offline_fetch)
