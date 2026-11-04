@@ -186,6 +186,8 @@ def test_new_major_without_provenance_after_attested_releases_regresses():
 
 
 def test_zero_major_lines_are_split_by_minor():
-    document = _document({"0.4.0": _plain(), "0.5.0": _attested(), "0.5.1": _attested(), "0.4.1": _plain()})
+    document = _document(
+        {"0.4.0": _plain(), "0.5.0": _attested(), "0.5.1": _attested(), "0.4.1": _plain()}
+    )
 
     assert npm_publisher.provenance_from_document(document, "pkg", "0.4.1")["status"] == "ok"
