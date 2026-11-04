@@ -21,6 +21,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ca9.artifacts.model import ArtifactSnapshot
+from ca9.artifacts.pypi import (
+    DEFAULT_MAX_PYPI_RESOLUTIONS,
+    MAX_PYPI_JSON_BYTES,
+    is_pypi_resolution_candidate,
+    parse_release_document,
+    release_json_url,
+    select_release_file,
+)
 from ca9.artifacts.unpack import AmbiguousArchiveError, UnpackConfig, unpack_artifact
 from ca9.core.models import (
     Artifact,
@@ -64,6 +72,15 @@ _WEAK_HASH_ALGORITHMS = frozenset({"md5", "sha1"})
 
 @dataclass(frozen=True)
 class ArtifactScanConfig:
+    """Where and how artifacts are fetched.
+
+    ``resolve_pypi_artifacts`` looks up pinned PyPI registry dependencies that have
+    no file record (requirements files) in the PyPI JSON API and inspects one file
+    each, at most ``max_pypi_resolutions``; names matching
+    ``internal_package_patterns`` are never looked up. An unhashed local file is
+    copied afresh on every run because a cached copy cannot be checked against it.
+    """
+
     cache_dir: Path = DEFAULT_ARTIFACT_CACHE_DIR
     allow_unhashed_downloads: bool = False
     max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES
@@ -80,6 +97,9 @@ class ArtifactScanConfig:
     private_indexes: tuple[str, ...] = ()
     # Test-only escape hatch that skips the built-in URL policy (url_validator still runs).
     allow_untrusted_urls: bool = False
+    resolve_pypi_artifacts: bool = False
+    max_pypi_resolutions: int = DEFAULT_MAX_PYPI_RESOLUTIONS
+    internal_package_patterns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -125,12 +145,39 @@ def collect_artifact_snapshots(
 ) -> ArtifactCollectionResult:
     active_config = config or ArtifactScanConfig()
     state = _CollectionState()
+    resolutions = 0
+    unresolved: dict[str, int] = {}
 
     for package in inventory.packages:
         for artifact in package.artifacts:
             if artifact.kind not in {"wheel", "sdist", "npm-tarball"}:
                 continue
             _collect_one(package, artifact, active_config, state)
+        if not active_config.resolve_pypi_artifacts:
+            continue
+        eligible, reason = is_pypi_resolution_candidate(
+            package, active_config.internal_package_patterns
+        )
+        if not eligible:
+            if reason in {
+                "version is not pinned",
+                "merged index setup; the serving index is not known",
+            }:
+                unresolved[reason] = unresolved.get(reason, 0) + 1
+            continue
+        if resolutions >= active_config.max_pypi_resolutions:
+            state.skipped_artifacts += 1
+            unresolved["resolution limit reached"] = (
+                unresolved.get("resolution limit reached", 0) + 1
+            )
+            continue
+        resolutions += 1
+        _collect_pypi_release(package, active_config, state)
+
+    for reason, count in sorted(unresolved.items()):
+        state.warnings.append(
+            f"{count} PyPI package(s) were not resolved for artifact scanning: {reason}"
+        )
 
     return ArtifactCollectionResult(
         snapshots=tuple(state.snapshots),
@@ -138,6 +185,81 @@ def collect_artifact_snapshots(
         warnings=tuple(state.warnings),
         scanned_artifacts=state.scanned_artifacts,
         skipped_artifacts=state.skipped_artifacts,
+    )
+
+
+def _collect_pypi_release(
+    package: Package,
+    config: ArtifactScanConfig,
+    state: _CollectionState,
+) -> None:
+    """Resolve a pinned PyPI dependency to one file and collect it.
+
+    Without a --hash pin nothing is requested unless unhashed downloads are allowed;
+    the file is then verified against the digest PyPI lists for it.
+    """
+    hashes = package.metadata.get("hashes")
+    if not hashes and not config.allow_unhashed_downloads:
+        state.skipped_artifacts += 1
+        state.warnings.append(
+            f"skipped {package.key}: requirement has no --hash pin; pass "
+            "--allow-unhashed-downloads to resolve and scan it from PyPI"
+        )
+        return
+    json_url = release_json_url(package.name, package.version or "")
+    try:
+        files = parse_release_document(
+            _fetch_registry_json(json_url, config), package.name, package.version or ""
+        )
+    except _UntrustedArtifactURL as exc:
+        state.skipped_artifacts += 1
+        state.warnings.append(f"skipped {package.key}: PyPI lookup blocked by policy ({exc})")
+        return
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        state.skipped_artifacts += 1
+        state.warnings.append(f"skipped {package.key}: PyPI release lookup failed ({exc})")
+        return
+    selection = select_release_file(package, files, json_url)
+    if selection.artifact is None:
+        state.skipped_artifacts += 1
+        state.warnings.append(f"skipped {package.key}: {selection.reason}")
+        return
+    _collect_one(package, selection.artifact, config, state)
+
+
+def _fetch_registry_json(url: str, config: ArtifactScanConfig) -> bytes:
+    """Fetch bounded registry metadata under the same URL policy as artifacts."""
+    policy = _URLPolicy.from_config(config)
+    rejection = policy.rejection(url)
+    if rejection is not None:
+        raise _UntrustedArtifactURL(rejection)
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "ca9-artifact-scanner"},
+    )
+    try:
+        with policy.opener().open(request, timeout=30) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_PYPI_JSON_BYTES:
+                raise ValueError(f"registry metadata exceeds {MAX_PYPI_JSON_BYTES} bytes")
+            raw = response.read(MAX_PYPI_JSON_BYTES + 1)
+    except _BlockedRedirect as exc:
+        raise _UntrustedArtifactURL(str(exc.reason)) from None
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"HTTP {exc.code} from {_display_url(url)}") from None
+    except urllib.error.URLError as exc:
+        raise ValueError(f"cannot reach {_display_url(url)}: {exc.reason}") from None
+    if len(raw) > MAX_PYPI_JSON_BYTES:
+        raise ValueError(f"registry metadata exceeds {MAX_PYPI_JSON_BYTES} bytes")
+    return raw
+
+
+def _is_declared_local_source(package: Package, artifact: Artifact) -> bool:
+    """A path dependency's own archive: the scanned file is the file that installs."""
+    return (
+        package.metadata.get("source_kind") == "path"
+        and artifact.kind in {"wheel", "sdist"}
+        and _local_artifact_path(artifact.url or "") is not None
     )
 
 
@@ -152,7 +274,11 @@ def _collect_one(
         state.warnings.append(f"skipped {package.key} {artifact.kind}: artifact has no URL")
         return
 
-    if not artifact.hash and not config.allow_unhashed_downloads:
+    if (
+        not artifact.hash
+        and not config.allow_unhashed_downloads
+        and not _is_declared_local_source(package, artifact)
+    ):
         state.skipped_artifacts += 1
         state.warnings.append(
             f"skipped {package.key} {artifact.kind}: artifact has no hash; "
@@ -300,7 +426,7 @@ def _fetch_to_cache(
     if artifact.hash and not _strongest_hash_candidates(artifact.hash):
         return _HashCheck(False, f"unsupported artifact hash format: {artifact.hash}")
 
-    if archive_path.is_file():
+    if archive_path.is_file() and (artifact.hash or validated_source is None):
         if archive_path.stat().st_size <= config.max_artifact_bytes:
             cached_check = _check_hash(archive_path, artifact.hash) if artifact.hash else None
             if cached_check is None or cached_check.ok:

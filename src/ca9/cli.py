@@ -1374,6 +1374,8 @@ def vet_cmd(
                 ),
                 trusted_indexes=(*trusted_indexes, *package_policy.registries.allow),
                 private_indexes=private_indexes,
+                resolve_pypi_artifacts=True,
+                internal_package_patterns=internal_package_patterns,
             ),
         )
         artifact_findings = [*artifact_result.findings]
