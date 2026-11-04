@@ -398,6 +398,7 @@ package-age or package-malware decisions:
 
 ```bash
 ca9 feed update
+ca9 feed update --require-attestation
 ca9 feed update --from ./ca9-feed.json
 ca9 feed status --policy ca9.toml
 ```
@@ -405,6 +406,10 @@ ca9 feed status --policy ca9.toml
 `ca9 feed update` without `--from` resolves `--from`, then `CA9_FEED_URL`, then
 the built-in default feed URL on the project's published `feed` branch. Use
 `--from` or `CA9_FEED_URL` to select a local or alternate hosted bundle.
+`--require-attestation` verifies the downloaded bundle with `gh attestation
+verify --repo duriantaco/ca9 --signer-workflow
+duriantaco/ca9/.github/workflows/feed.yml` and installs nothing unless that
+passes (a missing `gh` fails too). The GitHub Action runs it before `protect`.
 
 Feed sources must be `https://` URLs or local paths. Downloads are capped at
 256 MiB, snapshots dated more than a day in the future are rejected, and a
@@ -416,8 +421,18 @@ When the feed is missing, `vet`, `protect`, `scripts audit`, and `ca9 run` say
 so on every run instead of passing silently. When it has expired, ca9 still
 matches packages against the stale snapshot and warns how old it is. Set
 `[malware].fail_closed = true` to block instead. Only records with an OSV
-`MAL-` identifier or explicit malicious-package metadata count as malware;
-ordinary vulnerability advisories are never reported as malicious packages.
+`MAL-` identifier, explicit malicious-package metadata, or CWE-506 "Embedded
+Malicious Code" count as malware; ordinary vulnerability advisories are never
+reported as malicious packages. Records that only give bounded version ranges
+(such as `@solana/web3.js` 1.95.6 to 1.95.8) ship in the optional
+`*-malware-ranges` datasets and match only versions inside a range.
+
+Package-age release times come from the feed when it has them and otherwise
+from registry metadata (npm packument `time`, PyPI JSON upload times), cached
+under `~/.cache/ca9/release-times/`. `ca9 run` holds versions younger than 24
+hours by default and names an older version to use; a trusted policy turns
+that off with `package_age.enabled = false` or `package_age.minimum_hours = 0`.
+`vet` and `protect` check package age only when policy enables it.
 
 ### Audit install scripts for npm v12 allowlists
 
@@ -539,11 +554,12 @@ not a sandbox: install scripts still run as your user and can read files such
 as `~/.npmrc` or cloud credential files. The audit log is created with mode
 0600, redacts registry auth tokens and credential-bearing URLs, and a failed log
 write never blocks or masks the child's exit code. SIGINT/SIGTERM are forwarded
-to the child, and a child killed by signal N makes ca9 exit with 128+N. When package-age policy is
-enabled but a release time is missing from the local feed, pip preflight warns
-by default and blocks when `[mode].offline` is `block` or `strict`; npm unknown
-release times are deferred to the npm gateway so registry metadata can decide
-when the install actually resolves package versions.
+to the child, and a child killed by signal N makes ca9 exit with 128+N. Release
+times missing from the local feed are read from registry metadata. When
+package-age policy is enabled and neither knows a release time, pip preflight
+warns by default and blocks when `[mode].offline` is `block` or `strict`; npm
+unknown release times are deferred to the npm gateway. Under the built-in 24-hour
+default an unknown release time only warns.
 
 For npm and pip installs, `ca9 run` can also start child-process-scoped loopback
 gateways when a local feed is available. The npm gateway fetches upstream
@@ -871,7 +887,8 @@ ca9 feed status --policy ca9.toml      # verify freshness and offline policy
 ```
 
 Package feeds use schema `ca9.feed.v1` and include four datasets:
-`pypi-malware`, `npm-malware`, `pypi-releases`, and `npm-releases`. Feed status
+`pypi-malware`, `npm-malware`, `pypi-releases`, and `npm-releases`, plus the
+optional `pypi-malware-ranges` and `npm-malware-ranges`. Feed status
 verifies SHA-256 content hashes before using cached data. Missing or stale feeds
 warn or block according to `[mode].offline`; tampered feeds always block.
 
@@ -998,18 +1015,18 @@ without pulling in a large dependency tree.
   ca9 allows still run as your user and can read credential files on disk.
 - The default hosted feed is published, and local bundles or `CA9_FEED_URL` can
   override it. Feed availability still depends on GitHub hosting/network access.
-- The feed builder currently ships malware data and empty releases datasets. The
-  `covers_since` release-window mechanism is implemented, but complete recent
-  npm/PyPI release firehoses are still a data-ops task.
+- The feed builder ships malware data and empty releases datasets (kept so older
+  clients still load the bundle). Release age comes from registry metadata
+  instead, so it needs network access the first time each package is checked.
 - Feed integrity is hash-verified locally, and `ca9 feed update` refuses
   insecure URLs and rollbacks. Published `latest.json` bundles carry a GitHub
-  artifact attestation (`gh attestation verify latest.json --repo duriantaco/ca9`),
-  but `ca9 feed update` does not verify signatures itself yet.
+  artifact attestation that `ca9 feed update --require-attestation` checks with
+  `gh`; without the flag no signature is checked.
 - OSV malware records with explicit affected versions are emitted per version, and
   whole-package records (no versions, or a range from `introduced: "0"` with no
-  upper bound) are emitted name-only. Bounded ranges use the versions listed in
-  OpenSSF origin metadata; bounded ranges without listed versions are skipped and
-  counted in the build summary, and withdrawn records are skipped.
+  upper bound) are emitted name-only. Bounded ranges are kept verbatim in the
+  `*-malware-ranges` datasets (and also as versions when OpenSSF origin metadata
+  lists them); withdrawn records are skipped.
 - Artifact heuristics catch common Python and npm malware patterns, but they are
   static signatures, not sandboxed dynamic malware analysis. Maintainer hijack,
   typosquatting, provenance/Sigstore/SLSA, yanked metadata, and repository takeover
