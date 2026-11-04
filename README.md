@@ -446,9 +446,9 @@ ca9 feed status --policy ca9.toml
 the built-in default feed URL on the project's published `feed` branch. Use
 `--from` or `CA9_FEED_URL` to select a local or alternate hosted bundle.
 `--require-attestation` verifies the downloaded bundle with `gh attestation
-verify --repo duriantaco/ca9 --signer-workflow
-duriantaco/ca9/.github/workflows/feed.yml` and installs nothing unless that
-passes (a missing `gh` fails too). The GitHub Action runs it before `protect`.
+verify`, requiring a signature from `.github/workflows/feed.yml` running on
+`refs/heads/main` (exact certificate identity and source ref, GitHub-hosted
+runner), and installs nothing unless that passes (a missing `gh` fails too). The GitHub Action runs it before `protect`.
 
 Feed sources must be `https://` URLs or local paths. Downloads are capped at
 256 MiB, snapshots dated more than a day in the future are rejected, and a
@@ -467,10 +467,14 @@ reported as malicious packages. Records that only give bounded version ranges
 `*-malware-ranges` datasets and match only versions inside a range.
 
 Package-age release times come from the feed when it has them and otherwise
-from registry metadata (npm packument `time`, PyPI JSON upload times), cached
-under `~/.cache/ca9/release-times/`. `ca9 run` holds versions younger than 24
-hours by default and names an older version to use; a trusted policy turns
-that off with `package_age.enabled = false` or `package_age.minimum_hours = 0`.
+from registry metadata (npm packument `time`; for PyPI the newest upload among
+a release's non-yanked files, so a file added to an old release makes it new),
+cached under `~/.cache/ca9/release-times/`. `ca9 run` holds versions younger
+than 24 hours by default and names an older version to use; a trusted policy
+turns that off with `package_age.enabled = false` or
+`package_age.minimum_hours = 0`, while a discovered repository `ca9.toml` can
+only raise the hold. When a release time cannot be read (registry outage,
+unparseable time, npm packument over 64 MiB) the default hold only warns.
 `vet` and `protect` check package age only when policy enables it.
 
 ### Audit install scripts for npm v12 allowlists

@@ -167,9 +167,12 @@ default feed URL on the project's published `feed` branch. Use `--from` or
 `CA9_FEED_URL` to select a local or alternate hosted bundle.
 
 `--require-attestation` checks the downloaded bundle with
-`gh attestation verify <file> --repo duriantaco/ca9 --signer-workflow
-duriantaco/ca9/.github/workflows/feed.yml` before installing it. The exact bytes that
-were verified are the bytes installed. The update fails, and nothing is installed, when
+`gh attestation verify <file> --repo duriantaco/ca9 --cert-identity
+https://github.com/duriantaco/ca9/.github/workflows/feed.yml@refs/heads/main
+--source-ref refs/heads/main --deny-self-hosted-runners` before installing it. Only a
+bundle signed by `feed.yml` running from `main` on a GitHub-hosted runner passes; the
+same workflow dispatched from another branch does not. The exact bytes that were
+verified are the bytes installed. The update fails, and nothing is installed, when
 `gh` is missing, verification fails, or the source is a snapshot directory rather than
 a single bundle file. `gh` needs a GitHub token (`GH_TOKEN` in CI). Without the flag the
 update behaves as before.
@@ -204,12 +207,15 @@ minimum_hours = 48
 
 Release times come from the feed's releases dataset when it has them, and otherwise
 from registry metadata: the npm packument `time` map (from the registry npm uses, when
-policy trusts it, else `registry.npmjs.org`) or PyPI's JSON API (the earliest upload of
-the version's files). Publish times never change, so ca9 caches them under
-`~/.cache/ca9/release-times/` (bounded in size, written atomically, never through
-symlinks, and never caching a failed lookup). The hosted feed still ships empty
-releases datasets for older clients; an empty dataset without `covers_since` no longer
-settles anything by itself.
+policy trusts it, else `registry.npmjs.org`) or PyPI's JSON API. A PyPI release can gain
+files long after its first upload, so its time is the newest upload among its
+non-yanked files: a wheel added today to a 2020 release makes that release new again.
+ca9 caches release times under `~/.cache/ca9/release-times/` (bounded in size, written
+atomically, never through symlinks, and never caching a failed lookup). npm times never
+change and are reused; a cached PyPI time is re-checked after 10 minutes. The hosted
+feed still ships empty releases datasets for older clients; an empty dataset without
+`covers_since` no longer settles anything by itself. A minimum age that is missing,
+negative, or not a number makes the result unknown rather than "old enough".
 
 If a release time is younger than `minimum_hours`, ca9 blocks and names the newest
 stable version published before the window (not a prerelease, yanked, unpublished or
@@ -220,12 +226,22 @@ time, it is unknown; the default offline mode warns, and `[mode].offline = "bloc
 blocks. `ca9 vet --offline` only uses cached release times.
 
 `ca9 run` holds versions published less than 24 hours ago even without a
-`[package_age]` table, naming an older version to use instead. Unknown release times do
-not block under this default. Turn it off from a trusted policy (`--policy`,
-`CA9_POLICY`, or `~/.config/ca9/policy.toml`) with `package_age.enabled = false` or
-`package_age.minimum_hours = 0`; a repository `ca9.toml` that ca9 only discovers in the
-working directory cannot turn it off or lower it. `vet` and `protect` keep package age
+`[package_age]` table, naming an older version to use instead. Turn it off from a
+trusted policy (`--policy`, `CA9_POLICY`, or `~/.config/ca9/policy.toml`) with
+`package_age.enabled = false` or `package_age.minimum_hours = 0`; a trusted policy can
+also lower `minimum_hours` or add `exclusions`. A repository `ca9.toml` that ca9 only
+discovers in the working directory is merged against the 24-hour hold: it can raise
+`minimum_hours`, but `enabled = false`, a lower `minimum_hours`, and new `exclusions`
+are ignored with a warning naming the setting. `vet` and `protect` keep package age
 opt-in.
+
+Known limit of the default hold: when ca9 cannot read a version's release time, the
+24-hour default warns and lets the install continue; only an explicit
+`[package_age]` policy turns that into a block (with `[mode].offline = "block"`).
+This covers a registry or network outage, a version the registry does not list, a
+publish time that does not parse, an npm packument larger than 64 MiB (ca9 stops
+reading registry metadata at that size), and a private registry that needs
+credentials ca9 does not send.
 
 ## Malicious Advisory Query
 
