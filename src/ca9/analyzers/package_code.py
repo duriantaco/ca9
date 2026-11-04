@@ -187,6 +187,63 @@ _JS_EXECUTE_RE = re.compile(
     _JS_PROCESS_SINK + r"|\bchmod(?:Sync)?\b|\|\s*(?:ba)?sh\b|\bpowershell\b",
     re.I,
 )
+_JS_ASSIGN = r"\s*=(?![=>])"
+_JS_DOTTED_ASSIGN_RE = re.compile(
+    r"\.\s*(fetch|ethereum|solana|open|send|setRequestHeader|request|sendAsync|enable|"
+    r"signTransaction|signAllTransactions|signAndSendTransaction|signMessage|"
+    r"signTypedData(?:_v[34])?)" + _JS_ASSIGN
+)
+_JS_DEFINE_PROPERTY_RE = re.compile(
+    r"(?:Object|Reflect)\s*\.\s*(?:defineProperty|set)\s*\(\s*([^,()\n]{1,80}?)\s*,\s*"
+    r"(['\"`])([\w$]{1,40})\2"
+)
+_JS_COMPUTED_ASSIGN_RE = re.compile(
+    r"\[\s*((?:['\"`][^\[\]\n]{0,200}?)|(?:[\w$]+\s*\([^()\[\]\n]{0,40}\)))\s*\]" + _JS_ASSIGN
+)
+_JS_TARGET_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$.")
+_JS_ALIAS_RE = re.compile(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;,\n]{1,160})")
+_JS_IDENTIFIER_RE = re.compile(r"[A-Za-z_$][\w$]*")
+_JS_GLOBAL_NAMES = frozenset({"window", "globalThis", "self", "global", "top", "parent", "frames"})
+_JS_ALIAS_TOKENS = _JS_GLOBAL_NAMES | {"typeof", "undefined"}
+_MAX_JS_ALIASES = 20
+_JS_DECODER_CALL_RE = re.compile(r"[\w$]+\s*\([^()]*\)")
+_JS_BASE64_LITERAL_RE = re.compile(r"(['\"])([A-Za-z0-9+/]{4,88}={0,2})\1")
+_JS_ESCAPED_LITERAL_RE = re.compile(r"(['\"])((?:\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}){3,})\1")
+_HIJACK_SENSITIVE_NAMES = frozenset(
+    {"fetch", "XMLHttpRequest", "ethereum", "solana", "phantom", "web3"}
+)
+_HIJACK_OVERRIDE_NAMES = frozenset(
+    {
+        "fetch",
+        "ethereum",
+        "solana",
+        "open",
+        "send",
+        "setRequestHeader",
+        "request",
+        "sendAsync",
+        "enable",
+        "signTransaction",
+        "signAllTransactions",
+        "signAndSendTransaction",
+        "signMessage",
+        "signTypedData",
+        "signTypedData_v3",
+        "signTypedData_v4",
+    }
+)
+_HIJACK_TEXT_HINTS = ("fetch", "XMLHttpRequest", "ethereum", "solana")
+_CRYPTO_ADDRESS_RE = re.compile(
+    r"(?<![0-9A-Za-z_$])0x[0-9a-fA-F]{40}(?![0-9A-Za-z_$])|"
+    r"0x\[[^\]\n]{1,24}\]\{40\}|"
+    r"0x\\[dw]\{40\}|"
+    r"\[13\]\[a-km-zA-HJ-NP-Z1-9\]|"
+    r"bc1\[|"
+    r"\[1-9A-HJ-NP-Za-km-z\]\{3[2-9],\s*4[0-4]\}|"
+    r"['\"`](?:bc1[ac-hj-np-z02-9]{25,62}|[13][a-km-zA-HJ-NP-Z1-9]{25,34}|"
+    r"T[1-9A-HJ-NP-Za-km-z]{33})['\"`]"
+)
+_MAX_HIJACK_MATCHES = 5000
 _RUNTIME_INSTALL_RE = re.compile(
     r"bun\.sh/install|oven-sh/bun|deno\.land/(?:x/)?install|dl\.deno\.land|"
     r"(?:spawn|spawnSync|exec|execSync|execFile|execFileSync)\s*\(\s*['\"`]bun\b",
@@ -576,6 +633,18 @@ _NPM_CREDENTIAL_EXFIL_RULE = PackageCodeRule(
     description=(
         "dumping process.env or reading credential stores near outbound network or process "
         "execution is a common exfiltration pattern"
+    ),
+)
+_NPM_WALLET_HIJACK_RULE = PackageCodeRule(
+    id="npm-wallet-network-hijack",
+    title="npm package hijacks wallet providers or network APIs",
+    severity="high",
+    action="block",
+    confidence="medium",
+    description=(
+        "replacing browser wallet methods or the global fetch/XMLHttpRequest from obfuscated "
+        "code, or next to crypto-address patterns, is how wallet drainers swap payment "
+        "addresses"
     ),
 )
 _NPM_NATIVE_BINARY_RULE = PackageCodeRule(
@@ -1563,7 +1632,235 @@ def _analyze_npm_script(
         findings.append(
             _finding(snapshot, file, text, _NPM_CREDENTIAL_EXFIL_RULE, exfil_offset, extra)
         )
+    hijack = _wallet_network_hijack(text)
+    if hijack is not None:
+        offset, details = hijack
+        findings.append(
+            _finding(
+                snapshot,
+                file,
+                text,
+                _NPM_WALLET_HIJACK_RULE,
+                offset,
+                {**(extra or {}), **details},
+            )
+        )
     return findings
+
+
+def _wallet_network_hijack(text: str) -> tuple[int, dict[str, Any]] | None:
+    """Find a wallet-provider or global network override that looks like a drainer.
+
+    An override (assigning ethereum/solana request or sign methods, the global
+    fetch, XMLHttpRequest.prototype.open/send, or defineProperty on them) reports
+    only when its target name is obfuscated (concatenated, escaped, or decoded from
+    an encoded string table) or the file carries crypto-address literals or
+    address regexes. Polyfills that assign a plain fetch stay quiet.
+    """
+    hinted = any(hint in text for hint in _HIJACK_TEXT_HINTS)
+    computed = _JS_COMPUTED_ASSIGN_RE.search(text) is not None
+    if not hinted and not computed:
+        return None
+    encoded_names = _encoded_sensitive_names(text)
+    global_aliases: set[str] = set()
+    wallet_aliases: set[str] = set()
+    if hinted:
+        global_aliases, wallet_aliases = _js_aliases(text)
+    read_counts: dict[str, int] = {}
+    overrides: list[tuple[int, bool, str]] = []
+    if hinted:
+        for count, match in enumerate(_JS_DOTTED_ASSIGN_RE.finditer(text)):
+            if count >= _MAX_HIJACK_MATCHES:
+                break
+            kind = _dotted_override_kind(
+                _assignment_target(text, match.start()),
+                match.group(1),
+                global_aliases,
+                wallet_aliases,
+            )
+            if kind is not None:
+                overrides.append((match.start(), False, kind))
+    if hinted:
+        for count, match in enumerate(_JS_DEFINE_PROPERTY_RE.finditer(text)):
+            if count >= _MAX_HIJACK_MATCHES:
+                break
+            kind = _define_property_kind(match.group(1), match.group(3), global_aliases)
+            if kind is not None:
+                overrides.append((match.start(), False, kind))
+    if computed:
+        for count, match in enumerate(_JS_COMPUTED_ASSIGN_RE.finditer(text)):
+            if count >= _MAX_HIJACK_MATCHES:
+                break
+            override = _computed_override(
+                text,
+                _assignment_target(text, match.start()),
+                match.group(1),
+                encoded_names,
+                global_aliases,
+                wallet_aliases,
+                read_counts,
+            )
+            if override is not None:
+                overrides.append((match.start(), *override))
+    if not overrides:
+        return None
+    address = _CRYPTO_ADDRESS_RE.search(text)
+    for offset, obfuscated, kind in sorted(overrides):
+        if obfuscated or encoded_names or (address is not None and kind != "wallet_provider"):
+            details: dict[str, Any] = {
+                "override_kind": kind,
+                "obfuscated_name": obfuscated,
+                "crypto_address_pattern": address is not None,
+            }
+            if encoded_names:
+                details["encoded_names"] = sorted(encoded_names)
+            return offset, details
+    return None
+
+
+def _dotted_override_kind(
+    target: str,
+    prop: str,
+    global_aliases: set[str],
+    wallet_aliases: set[str],
+) -> str | None:
+    on_global = target in _JS_GLOBAL_NAMES or target in global_aliases
+    owner = target.rsplit(".", 1)[-1]
+    if prop == "fetch":
+        if on_global:
+            return "global_fetch"
+        return None
+    if prop in {"ethereum", "solana"}:
+        if on_global:
+            return "wallet_provider"
+        return None
+    if prop in {"open", "send", "setRequestHeader"} and target.endswith("XMLHttpRequest.prototype"):
+        return "xhr_prototype"
+    if prop in _HIJACK_OVERRIDE_NAMES and (
+        owner in {"ethereum", "solana"} or target in wallet_aliases
+    ):
+        return "wallet_method"
+    return None
+
+
+def _assignment_target(text: str, bracket: int, limit: int = 200) -> str:
+    """The dotted expression just before ``[``, read backwards in linear time."""
+    end = bracket
+    while end > 0 and text[end - 1] in " \t":
+        end -= 1
+    start = end
+    while start > 0 and end - start < limit and text[start - 1] in _JS_TARGET_CHARS:
+        start -= 1
+    return text[start:end]
+
+
+def _js_aliases(text: str) -> tuple[set[str], set[str]]:
+    """Local names bound to the global object or to an injected wallet provider."""
+    global_aliases: set[str] = set()
+    wallet_aliases: set[str] = set()
+    for count, match in enumerate(_JS_ALIAS_RE.finditer(text)):
+        if (
+            count >= _MAX_HIJACK_MATCHES
+            or len(global_aliases) + len(wallet_aliases) >= _MAX_JS_ALIASES
+        ):
+            break
+        name, value = match.group(1), match.group(2).strip()
+        tokens = _JS_IDENTIFIER_RE.findall(value)
+        if tokens and set(tokens) <= _JS_ALIAS_TOKENS and set(tokens) & _JS_GLOBAL_NAMES:
+            global_aliases.add(name)
+            continue
+        compact = re.sub(r"\s+|\?", "", value)
+        head, _dot, tail = compact.rpartition(".")
+        if tail in {"ethereum", "solana"} and (
+            not head
+            or head in _JS_GLOBAL_NAMES
+            or head in global_aliases
+            or head.endswith("phantom")
+        ):
+            wallet_aliases.add(name)
+    return global_aliases, wallet_aliases
+
+
+def _define_property_kind(target: str, prop: str, global_aliases: set[str]) -> str | None:
+    compact = re.sub(r"\s+", "", target)
+    if prop in {"ethereum", "solana"}:
+        return "wallet_provider_property"
+    if prop == "fetch" and (compact in _JS_GLOBAL_NAMES or compact in global_aliases):
+        return "global_fetch"
+    if prop in {"open", "send", "setRequestHeader"} and "XMLHttpRequest" in compact:
+        return "xhr_prototype"
+    if prop in _HIJACK_OVERRIDE_NAMES and ("ethereum" in compact or "solana" in compact):
+        return "wallet_method"
+    return None
+
+
+def _computed_override(
+    text: str,
+    target: str,
+    key: str,
+    encoded_names: set[str],
+    global_aliases: set[str],
+    wallet_aliases: set[str],
+    read_counts: dict[str, int],
+) -> tuple[bool, str] | None:
+    """Classify target[key] = ... assignments.
+
+    A key built from pieces or escapes is obfuscated. A decoder-call key counts when
+    the file decodes wallet or network API names and the original member is read
+    before it is replaced. A plainly written key counts only on the global object
+    or a wallet provider.
+    """
+    stripped = key.strip()
+    owner = target.rsplit(".", 1)[-1]
+    sensitive_owner = (
+        "XMLHttpRequest" in target or owner in {"ethereum", "solana"} or owner in wallet_aliases
+    )
+    if stripped[:1] in {"'", '"', "`"} or "+" in stripped:
+        folded, obfuscated = _fold_js_string(stripped)
+        if folded is None or folded not in _HIJACK_OVERRIDE_NAMES:
+            return None
+        if obfuscated:
+            return True, f"computed_{folded}"
+        on_global = target in _JS_GLOBAL_NAMES or target in global_aliases
+        if folded in {"fetch", "ethereum", "solana"} and on_global:
+            return False, f"computed_{folded}"
+        if sensitive_owner:
+            return False, f"computed_{folded}"
+        return None
+    if not _JS_DECODER_CALL_RE.fullmatch(stripped):
+        return None
+    if not (encoded_names & _HIJACK_SENSITIVE_NAMES or sensitive_owner):
+        return None
+    member = f"[{stripped}]"
+    if member not in read_counts:
+        read_counts[member] = text.count(member)
+    if read_counts[member] < 2:
+        return None
+    return True, "decoded_name"
+
+
+def _encoded_sensitive_names(text: str) -> set[str]:
+    """Wallet and network API names that appear only base64- or escape-encoded."""
+    names: set[str] = set()
+    for count, match in enumerate(_JS_BASE64_LITERAL_RE.finditer(text)):
+        if count >= _MAX_HIJACK_MATCHES:
+            break
+        literal = match.group(2)
+        if len(literal) % 4:
+            continue
+        try:
+            decoded = base64.b64decode(literal, validate=True).decode("ascii")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            continue
+        if decoded in _HIJACK_SENSITIVE_NAMES and decoded != literal:
+            names.add(decoded)
+    for count, match in enumerate(_JS_ESCAPED_LITERAL_RE.finditer(text)):
+        if count >= _MAX_HIJACK_MATCHES:
+            break
+        decoded = _decode_js_escapes(match.group(2))
+        if decoded in _HIJACK_SENSITIVE_NAMES:
+            names.add(decoded)
+    return names
 
 
 def _npm_credential_exfil_offset(text: str) -> int | None:
