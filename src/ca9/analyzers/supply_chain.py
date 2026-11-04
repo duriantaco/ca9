@@ -490,6 +490,8 @@ def _dependency_confusion_findings(
     source_kind = str(package.metadata.get("source_kind") or "")
     if not registries and source_kind in _NON_INDEX_SOURCE_KINDS:
         return []
+    if not registries and package.metadata.get("registry_mode") == "local":
+        return []
 
     source = _package_evidence(package, "package inventory")
     public = [registry for registry in registries if not _is_private_index(registry, policy)]
@@ -647,6 +649,16 @@ def _is_denied_index(registry: str, policy: SupplyChainPolicy) -> bool:
 
 def _is_private_index(registry: str, policy: SupplyChainPolicy) -> bool:
     return _registry_matches(registry, policy.private_indexes)
+
+
+def internal_pattern_for(name: str, patterns: tuple[str, ...]) -> str | None:
+    """The internal package pattern a name matches, ignoring case, '_' and '.'."""
+    return _matched_internal_pattern(name, patterns)
+
+
+def registry_matches(registry: str, candidates: tuple[str, ...]) -> bool:
+    """True when the registry is one of the candidates or beneath one of them."""
+    return _registry_matches(registry, candidates)
 
 
 def _matched_internal_pattern(name: str, patterns: tuple[str, ...]) -> str | None:

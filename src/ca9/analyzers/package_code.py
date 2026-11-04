@@ -201,6 +201,26 @@ _JS_COMPUTED_ASSIGN_RE = re.compile(
     r"\[\s*((?:['\"`][^\[\]\n]{0,200}?)|(?:[\w$]+\s*\([^()\[\]\n]{0,40}\)))\s*\]" + _JS_ASSIGN
 )
 _JS_TARGET_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$.")
+_JS_DEFINE_PROPERTY_VARIABLE_RE = re.compile(
+    r"(?:Object|Reflect)\s*\.\s*(?:defineProperty|set)\s*\(\s*([A-Za-z_$][\w$.]{0,80}?)\s*,\s*"
+    r"([A-Za-z_$][\w$]{0,40})\s*,"
+)
+_JS_BARE_FETCH_ASSIGN_RE = re.compile(r"(?<![\w$.])fetch\s*=(?![=>])")
+_JS_LOCAL_FETCH_BINDING_RE = re.compile(
+    r"(?:const|let|var|function|class)\s+fetch\b|import\s+fetch\b|"
+    r"import\s*\{[^}]{0,400}\bfetch\b[^}]{0,400}\}"
+)
+_JS_STRING_TABLE_RE = re.compile(
+    r"=\s*\[\s*((?:['\"][^'\"\\\n]{0,64}['\"]\s*,\s*){2,}"
+    r"['\"][^'\"\\\n]{0,64}['\"])\s*,?\s*\]"
+)
+_JS_IDENTIFIER_BEFORE_RE = re.compile(r"([A-Za-z_$][\w$]*)\s*$")
+_JS_TABLE_STRING_RE = re.compile(r"['\"]([^'\"\\\n]{0,64})['\"]")
+_JS_PROVIDER_ARGUMENT_RE = re.compile(r"(?:ethereum|solana)\s*[,)]")
+_JS_PROVIDER_CALLEE_RE = re.compile(
+    r"([A-Za-z_$][\w$]*)\s*\(\s*(?:(?:window|globalThis|self)\s*\.\s*)?"
+    r"(?:phantom\s*\.\s*)?$"
+)
 _JS_ALIAS_RE = re.compile(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;,\n]{1,160})")
 _JS_IDENTIFIER_RE = re.compile(r"[A-Za-z_$][\w$]*")
 _JS_GLOBAL_NAMES = frozenset({"window", "globalThis", "self", "global", "top", "parent", "frames"})
@@ -1662,12 +1682,20 @@ def _wallet_network_hijack(text: str) -> tuple[int, dict[str, Any]] | None:
     if not hinted and not computed:
         return None
     encoded_names = _encoded_sensitive_names(text)
+    table_names = _string_table_names(text)
+    decoded_names = encoded_names | table_names
     global_aliases: set[str] = set()
     wallet_aliases: set[str] = set()
     if hinted:
-        global_aliases, wallet_aliases = _js_aliases(text)
+        global_aliases, wallet_aliases = _js_aliases(text, decoded_names)
     read_counts: dict[str, int] = {}
     overrides: list[tuple[int, bool, str]] = []
+    if "fetch" in text and not _JS_LOCAL_FETCH_BINDING_RE.search(text):
+        for count, match in enumerate(_JS_BARE_FETCH_ASSIGN_RE.finditer(text)):
+            if count >= _MAX_HIJACK_MATCHES:
+                break
+            if _starts_statement(text, match.start()):
+                overrides.append((match.start(), False, "global_fetch"))
     if hinted:
         for count, match in enumerate(_JS_DOTTED_ASSIGN_RE.finditer(text)):
             if count >= _MAX_HIJACK_MATCHES:
@@ -1684,9 +1712,17 @@ def _wallet_network_hijack(text: str) -> tuple[int, dict[str, Any]] | None:
         for count, match in enumerate(_JS_DEFINE_PROPERTY_RE.finditer(text)):
             if count >= _MAX_HIJACK_MATCHES:
                 break
-            kind = _define_property_kind(match.group(1), match.group(3), global_aliases)
+            kind = _define_property_kind(
+                match.group(1), match.group(3), global_aliases, wallet_aliases
+            )
             if kind is not None:
                 overrides.append((match.start(), False, kind))
+        for count, match in enumerate(_JS_DEFINE_PROPERTY_VARIABLE_RE.finditer(text)):
+            if count >= _MAX_HIJACK_MATCHES:
+                break
+            target = re.sub(r"\s+", "", match.group(1))
+            if target in wallet_aliases or target.rsplit(".", 1)[-1] in {"ethereum", "solana"}:
+                overrides.append((match.start(), False, "wallet_method_dynamic"))
     if computed:
         for count, match in enumerate(_JS_COMPUTED_ASSIGN_RE.finditer(text)):
             if count >= _MAX_HIJACK_MATCHES:
@@ -1695,7 +1731,7 @@ def _wallet_network_hijack(text: str) -> tuple[int, dict[str, Any]] | None:
                 text,
                 _assignment_target(text, match.start()),
                 match.group(1),
-                encoded_names,
+                decoded_names,
                 global_aliases,
                 wallet_aliases,
                 read_counts,
@@ -1744,20 +1780,107 @@ def _dotted_override_kind(
 
 
 def _assignment_target(text: str, bracket: int, limit: int = 200) -> str:
-    """The dotted expression just before ``[``, read backwards in linear time."""
+    """The member expression just before ``[`` (dots and bracket chains), read backwards."""
     end = bracket
     while end > 0 and text[end - 1] in " \t":
         end -= 1
     start = end
-    while start > 0 and end - start < limit and text[start - 1] in _JS_TARGET_CHARS:
-        start -= 1
+    while start > 0 and end - start < limit:
+        char = text[start - 1]
+        if char in _JS_TARGET_CHARS:
+            start -= 1
+            continue
+        if char != "]":
+            break
+        depth = 0
+        index = start - 1
+        while index >= 0 and end - index < limit:
+            if text[index] == "]":
+                depth += 1
+            elif text[index] == "[":
+                depth -= 1
+                if depth == 0:
+                    break
+            index -= 1
+        if index < 0 or depth != 0:
+            break
+        start = index
     return text[start:end]
 
 
-def _js_aliases(text: str) -> tuple[set[str], set[str]]:
-    """Local names bound to the global object or to an injected wallet provider."""
+def _starts_statement(text: str, offset: int) -> bool:
+    """True when ``fetch = ...`` begins a statement rather than a parameter or pattern."""
+    index = offset - 1
+    newline = False
+    while index >= 0 and text[index] in " \t\r\n":
+        if text[index] == "\n":
+            newline = True
+        index -= 1
+    if index < 0:
+        return True
+    previous = text[index]
+    if previous in ";})":
+        return True
+    if previous == "{":
+        before = index - 1
+        while before >= 0 and text[before] in " \t\r\n":
+            before -= 1
+        return before >= 0 and text[before] in ")>"
+    return newline and previous not in ",({[:?=&|+-*/%!<>."
+
+
+def _string_table_names(text: str) -> set[str]:
+    """Wallet and network API names held in an obfuscator-style string table.
+
+    A table counts only when it is read through a computed index (``return
+    T[i]``, ``=> T[i]``, ``= T[i - 0x1a2]``), the shape of a string decoder.
+    """
+    names: set[str] = set()
+    if not any(f"'{name}'" in text or f'"{name}"' in text for name in _HIJACK_SENSITIVE_NAMES):
+        return names
+    for count, match in enumerate(_JS_STRING_TABLE_RE.finditer(text)):
+        if count >= _MAX_HIJACK_MATCHES:
+            break
+        strings = set(_JS_TABLE_STRING_RE.findall(match.group(1)))
+        sensitive = strings & _HIJACK_SENSITIVE_NAMES
+        if not sensitive:
+            continue
+        table = _JS_IDENTIFIER_BEFORE_RE.search(text, max(0, match.start() - 120), match.start())
+        if table is None:
+            continue
+        accessor = re.compile(
+            r"(?:return|=>|=)\s*" + re.escape(table.group(1)) + r"\s*\[\s*[A-Za-z_$(]"
+        )
+        if accessor.search(text, match.end()) or accessor.search(text, 0, match.start()):
+            names |= sensitive
+    return names
+
+
+def _js_aliases(text: str, decoded_names: set[str]) -> tuple[set[str], set[str]]:
+    """Local names bound to the global object or to an injected wallet provider.
+
+    Parameters of functions called with ``window.ethereum`` count as providers, and
+    so does ``global[decoder(i)]`` when the file decodes a wallet name.
+    """
     global_aliases: set[str] = set()
     wallet_aliases: set[str] = set()
+    for count, argument in enumerate(_JS_PROVIDER_ARGUMENT_RE.finditer(text)):
+        if count >= _MAX_HIJACK_MATCHES or len(wallet_aliases) >= _MAX_JS_ALIASES:
+            break
+        call = _JS_PROVIDER_CALLEE_RE.search(text, max(0, argument.start() - 120), argument.start())
+        if call is None:
+            continue
+        function = re.escape(call.group(1))
+        definition = re.search(
+            r"function\s+"
+            + function
+            + r"\s*\(\s*([A-Za-z_$][\w$]*)|"
+            + function
+            + r"\s*=\s*(?:async\s+)?(?:function\s*)?\(?\s*([A-Za-z_$][\w$]*)",
+            text,
+        )
+        if definition is not None:
+            wallet_aliases.add(definition.group(1) or definition.group(2))
     for count, match in enumerate(_JS_ALIAS_RE.finditer(text)):
         if (
             count >= _MAX_HIJACK_MATCHES
@@ -1770,6 +1893,14 @@ def _js_aliases(text: str) -> tuple[set[str], set[str]]:
             global_aliases.add(name)
             continue
         compact = re.sub(r"\s+|\?", "", value)
+        computed = re.fullmatch(r"([\w$]+)\[[\w$]+\([^()]*\)\]", compact)
+        if (
+            computed is not None
+            and (computed.group(1) in _JS_GLOBAL_NAMES or computed.group(1) in global_aliases)
+            and decoded_names & {"ethereum", "solana"}
+        ):
+            wallet_aliases.add(name)
+            continue
         head, _dot, tail = compact.rpartition(".")
         if tail in {"ethereum", "solana"} and (
             not head
@@ -1781,7 +1912,12 @@ def _js_aliases(text: str) -> tuple[set[str], set[str]]:
     return global_aliases, wallet_aliases
 
 
-def _define_property_kind(target: str, prop: str, global_aliases: set[str]) -> str | None:
+def _define_property_kind(
+    target: str,
+    prop: str,
+    global_aliases: set[str],
+    wallet_aliases: set[str],
+) -> str | None:
     compact = re.sub(r"\s+", "", target)
     if prop in {"ethereum", "solana"}:
         return "wallet_provider_property"
@@ -1789,7 +1925,9 @@ def _define_property_kind(target: str, prop: str, global_aliases: set[str]) -> s
         return "global_fetch"
     if prop in {"open", "send", "setRequestHeader"} and "XMLHttpRequest" in compact:
         return "xhr_prototype"
-    if prop in _HIJACK_OVERRIDE_NAMES and ("ethereum" in compact or "solana" in compact):
+    if prop in _HIJACK_OVERRIDE_NAMES and (
+        "ethereum" in compact or "solana" in compact or compact in wallet_aliases
+    ):
         return "wallet_method"
     return None
 
@@ -1813,7 +1951,10 @@ def _computed_override(
     stripped = key.strip()
     owner = target.rsplit(".", 1)[-1]
     sensitive_owner = (
-        "XMLHttpRequest" in target or owner in {"ethereum", "solana"} or owner in wallet_aliases
+        "XMLHttpRequest" in target
+        or owner in {"ethereum", "solana"}
+        or owner in wallet_aliases
+        or target in wallet_aliases
     )
     if stripped[:1] in {"'", '"', "`"} or "+" in stripped:
         folded, obfuscated = _fold_js_string(stripped)
@@ -1829,8 +1970,12 @@ def _computed_override(
         return None
     if not _JS_DECODER_CALL_RE.fullmatch(stripped):
         return None
-    if not (encoded_names & _HIJACK_SENSITIVE_NAMES or sensitive_owner):
+    if sensitive_owner:
+        return True, "decoded_name"
+    if not encoded_names & _HIJACK_SENSITIVE_NAMES:
         return None
+    if target in _JS_GLOBAL_NAMES or target in global_aliases:
+        return True, "decoded_name"
     member = f"[{stripped}]"
     if member not in read_counts:
         read_counts[member] = text.count(member)

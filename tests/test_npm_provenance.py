@@ -150,7 +150,7 @@ def test_oversized_packument_falls_back_to_abbreviated_version_order(monkeypatch
     assert result["evidence"]["ordering"] == "version"
 
 
-def test_backport_on_a_line_that_never_had_provenance_is_ok():
+def test_plain_release_on_an_old_line_after_attested_newer_lines_regresses_as_newer():
     document = _document(
         {
             "4.9.0": _plain(),
@@ -158,6 +158,18 @@ def test_backport_on_a_line_that_never_had_provenance_is_ok():
             "5.1.0": _attested(),
             "4.9.1": _plain(),
         }
+    )
+
+    result = npm_publisher.provenance_from_document(document, "pkg", "4.9.1")
+
+    assert result["status"] == "regressed"
+    assert result["evidence"]["line"] == "newer"
+    assert result["evidence"]["previous_with_provenance"] == ["5.1.0", "5.0.0"]
+
+
+def test_old_line_release_published_before_any_attested_release_is_ok():
+    document = _document(
+        {"4.9.0": _plain(), "4.9.1": _plain(), "5.0.0": _attested(), "5.1.0": _attested()}
     )
 
     assert npm_publisher.provenance_from_document(document, "pkg", "4.9.1")["status"] == "ok"
@@ -177,12 +189,16 @@ def test_backport_without_provenance_on_an_attested_line_regresses():
 
     assert result["status"] == "regressed"
     assert result["evidence"]["previous_with_provenance"] == ["4.9.0", "4.8.0"]
+    assert result["evidence"]["line"] == "same"
 
 
 def test_new_major_without_provenance_after_attested_releases_regresses():
     document = _document({"5.0.0": _attested(), "5.1.0": _attested(), "6.0.0": _plain()})
 
-    assert npm_publisher.provenance_from_document(document, "pkg", "6.0.0")["status"] == "regressed"
+    result = npm_publisher.provenance_from_document(document, "pkg", "6.0.0")
+
+    assert result["status"] == "regressed"
+    assert result["evidence"]["line"] == "older"
 
 
 def test_zero_major_lines_are_split_by_minor():
@@ -190,4 +206,7 @@ def test_zero_major_lines_are_split_by_minor():
         {"0.4.0": _plain(), "0.5.0": _attested(), "0.5.1": _attested(), "0.4.1": _plain()}
     )
 
-    assert npm_publisher.provenance_from_document(document, "pkg", "0.4.1")["status"] == "ok"
+    result = npm_publisher.provenance_from_document(document, "pkg", "0.4.1")
+
+    assert result["status"] == "regressed"
+    assert result["evidence"]["line"] == "newer"

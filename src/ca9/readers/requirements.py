@@ -42,6 +42,51 @@ _MARKER_SPLIT_RE = re.compile(r"\s+;|;\s")
 _NAME_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
 
 
+_REQUIREMENT_LONG_OPTIONS = (
+    "--index-url",
+    "--extra-index-url",
+    "--no-index",
+    "--find-links",
+    "--constraint",
+    "--requirement",
+    "--editable",
+    "--trusted-host",
+    "--pre",
+    "--prefer-binary",
+    "--require-hashes",
+    "--only-binary",
+    "--no-binary",
+    "--use-feature",
+    "--global-option",
+    "--config-settings",
+    "--hash",
+)
+_REQUIREMENT_SHORT_OPTIONS = {
+    "-i": "--index-url",
+    "-f": "--find-links",
+    "-c": "--constraint",
+    "-r": "--requirement",
+    "-e": "--editable",
+}
+_VALUE_OPTIONS = frozenset(
+    {
+        "--index-url",
+        "--extra-index-url",
+        "--find-links",
+        "--constraint",
+        "--requirement",
+        "--editable",
+        "--trusted-host",
+        "--only-binary",
+        "--no-binary",
+        "--use-feature",
+        "--global-option",
+        "--config-settings",
+        "--hash",
+    }
+)
+
+
 @dataclass(frozen=True)
 class RequirementReference:
     """A requirement that installs from a VCS, a URL, or a local path."""
@@ -62,6 +107,53 @@ class RequirementReference:
         if self.source_kind in {"git", "vcs"}:
             return not self.pinned_commit
         return True
+
+
+def requirement_option(line: str) -> tuple[str, str | None] | None:
+    """Return (canonical option, value) for a pip requirements-file option line.
+
+    Long options may be abbreviated to any unique prefix, as optparse allows, and
+    take their value after "=" or whitespace.
+    """
+    if not line.startswith("-"):
+        return None
+    if line.startswith("--"):
+        token = re.match(r"--[A-Za-z0-9-]*", line).group(0)
+        rest = line[len(token) :]
+        if token in _REQUIREMENT_LONG_OPTIONS:
+            option = token
+        else:
+            matches = [name for name in _REQUIREMENT_LONG_OPTIONS if name.startswith(token)]
+            if len(matches) != 1:
+                return (token, None)
+            option = matches[0]
+    else:
+        option = _REQUIREMENT_SHORT_OPTIONS.get(line[:2])
+        if option is None:
+            return (line[:2], None)
+        rest = line[2:]
+    if option not in _VALUE_OPTIONS:
+        return (option, None)
+    if rest.startswith("="):
+        rest = rest[1:]
+    value = rest.strip()
+    if option != "--editable":
+        parts = value.split()
+        if parts:
+            value = parts[0]
+        else:
+            value = ""
+    return (option, value or None)
+
+
+def is_local_location(value: str) -> bool:
+    """True for a local directory or file:// location; remote and unexpanded ${VAR} are not."""
+    raw = value.strip()
+    if not raw or "${" in raw:
+        return False
+    if raw.lower().startswith("file:"):
+        return True
+    return "://" not in raw
 
 
 def valid_hash_pins(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
