@@ -18,10 +18,18 @@ Signal types: dependency_confusion, untrusted_registry, git_dependency,
 direct_url_dependency, mutable_source, missing_integrity, malware,
 new_package_version, provenance_regression. Git and URL findings carry
 ``evidence.mutable`` plus ``pinned_commit``/``ref`` (git) or ``has_hash`` (URL).
+Provenance regressions carry ``evidence.line``: "same" (this release line had
+provenance), "older" (a new line after attested releases) or "newer" (an older
+line that never had it, after newer lines did; can be a hand-published backport).
+
+``feed_status(feed_dir=None)`` reports the malware feed state (ready, stale,
+missing, tampered); a stale feed is still matched but leaves the receipt
+incomplete.
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -32,6 +40,8 @@ from ca9.analyzers.supply_chain import (
     DEFAULT_TRUSTED_INDEXES,
     SupplyChainPolicy,
     analyze_supply_chain,
+    internal_pattern_for,
+    registry_matches,
 )
 from ca9.core.models import (
     Artifact,
@@ -255,6 +265,47 @@ def malware_matches(
     return _malware_dicts(matches, entries)
 
 
+def feed_status(*, feed_dir: str | Path | None = None) -> dict[str, Any]:
+    """State of the installed malware feed: ready, stale, missing, or tampered.
+
+    Returns ``state``, ``action`` (pass|warn|block), ``reason``, ``created_at`` and
+    ``expires_at`` (the effective expiry, ISO 8601). Never raises.
+    """
+    status_function = _optional_function("ca9.package_feed", "feed_status")
+    if status_function is None:
+        return _feed_status_dict("missing", "warn", "ca9.package_feed.feed_status is not available")
+    try:
+        status = status_function(cache_dir=_optional_path(feed_dir))
+    except Exception as exc:
+        return _feed_status_dict("missing", "warn", f"feed status check failed: {exc}")
+    state = str(getattr(status, "state", "missing"))
+    if state not in {"ready", "stale", "missing", "tampered"}:
+        state = "missing"
+    result = _feed_status_dict(
+        state, str(getattr(status, "action", "warn")), str(getattr(status, "reason", ""))
+    )
+    snapshot = getattr(status, "snapshot", None)
+    if snapshot is not None:
+        result["created_at"] = getattr(snapshot, "created_at", None)
+        result["expires_at"] = getattr(snapshot, "expires_at", None)
+        effective = getattr(snapshot, "effective_expires_at", None)
+        if callable(effective):
+            with contextlib.suppress(TypeError, ValueError, AttributeError):
+                result["expires_at"] = effective().isoformat()
+        result["snapshot_id"] = getattr(snapshot, "snapshot_id", None)
+    return result
+
+
+def _feed_status_dict(state: str, action: str, reason: str) -> dict[str, Any]:
+    return {
+        "state": state,
+        "action": action,
+        "reason": reason,
+        "created_at": None,
+        "expires_at": None,
+    }
+
+
 def check_provenance(
     ecosystem: str,
     name: str,
@@ -338,14 +389,26 @@ def _parse_entries(packages: object, receipt: _Receipt) -> list[_Entry]:
         return []
     entries: list[_Entry] = []
     try:
-        for raw in packages:
-            entry, reason = _entry(raw)
-            if entry is None:
-                receipt.skip(reason)
-            else:
-                entries.append(entry)
+        iterator = iter(packages)
     except Exception:
         receipt.skip("malformed_input")
+        return entries
+    while True:
+        try:
+            raw = next(iterator)
+        except StopIteration:
+            break
+        except Exception:
+            receipt.skip("malformed_input")
+            break
+        try:
+            entry, reason = _entry(raw)
+        except Exception:
+            entry, reason = None, "malformed_package"
+        if entry is None:
+            receipt.skip(reason)
+        else:
+            entries.append(entry)
     return entries
 
 
@@ -370,10 +433,10 @@ def _entry(raw: object) -> tuple[_Entry | None, str]:
     if not isinstance(line, int) or isinstance(line, bool):
         line = None
     mode = raw.get("registry_mode")
-    if mode is not None and mode not in _REGISTRY_MODES:
+    if mode is not None and (not isinstance(mode, str) or mode not in _REGISTRY_MODES):
         return None, "malformed_package"
     source_kind = raw.get("source_kind") or "registry"
-    if source_kind not in _SOURCE_KINDS:
+    if not isinstance(source_kind, str) or source_kind not in _SOURCE_KINDS:
         return None, "malformed_package"
     extra_registries: tuple[str, ...] = ()
     if raw.get("registries") is not None:
@@ -522,6 +585,8 @@ def _malware_findings(
     except Exception:
         receipt.skip("malware_feed_unavailable", len(entries))
         return []
+    if feed_status(feed_dir=options.feed_dir)["state"] == "stale":
+        receipt.skip("malware_feed_stale", len(entries))
     return _malware_dicts(matches, entries)
 
 
@@ -556,6 +621,9 @@ def _release_age_findings(
     unpinned = [entry for entry in eligible if not entry.version]
     receipt.skip("release_age_no_version", len(unpinned))
     eligible = [entry for entry in eligible if entry.version]
+    private = [entry for entry in eligible if _private_name(entry, options)]
+    receipt.skip("release_age_private_registry", len(private))
+    eligible = [entry for entry in eligible if not _private_name(entry, options)]
     if not eligible:
         return []
     if not options.network:
@@ -654,7 +722,10 @@ def _provenance_findings(
     ]
     public: list[_Entry] = []
     for entry in npm_entries:
-        if entry.registry and entry.registry.rstrip("/").lower() != REGISTRY_ORIGIN:
+        private_registry = bool(
+            entry.registry and entry.registry.rstrip("/").lower() != REGISTRY_ORIGIN
+        )
+        if private_registry or _private_name(entry, options):
             receipt.skip("provenance_private_registry")
         elif not entry.version:
             receipt.skip("provenance_no_version")
@@ -711,6 +782,18 @@ def _provenance_findings(
             }
         )
     return findings
+
+
+def _private_name(entry: _Entry, options: _Options) -> bool:
+    """Names that must not be sent to a public registry: internal or privately hosted."""
+    if internal_pattern_for(entry.name, options.internal_packages) is not None:
+        return True
+    mode = entry.raw.get("registry_mode")
+    return bool(
+        entry.registry
+        and mode != "merged"
+        and registry_matches(entry.registry, options.private_registries)
+    )
 
 
 def _finding_dict(finding: Finding, entry: _Entry) -> dict[str, Any] | None:

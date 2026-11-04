@@ -308,3 +308,107 @@ def test_provenance_regression_is_a_blocking_npm_finding(monkeypatch):
     assert len(fetched) == 1
     assert result["receipt"]["lookups"] == 1
     assert _skips(result)["provenance_private_registry"] == 1
+
+
+def test_bad_entries_are_skipped_one_by_one():
+    corp = _pkg("corp-auth", "1.0")
+    result = api.evaluate_packages(
+        [
+            {"ecosystem": "npm", "name": "a", "version": "1.0.0", "registry_mode": ["merged"]},
+            {"ecosystem": "npm", "name": "b", "version": "1.0.0", "source_kind": {"git": 1}},
+            corp,
+            {"ecosystem": "pypi", "name": "c", "version": "1.0", "registries": [["x"]]},
+            _pkg("corp-billing", "2.0"),
+        ],
+        options={"internal_packages": ["corp-*"]},
+    )
+
+    assert result["receipt"]["checked"] == 2
+    assert _skips(result)["malformed_package"] == 3
+    names = {f["name"] for f in result["findings"] if f["signal_type"] == "dependency_confusion"}
+    assert names == {"corp-auth", "corp-billing"}
+
+
+def test_an_iterator_that_fails_keeps_what_it_yielded():
+    def packages():
+        yield _pkg("corp-auth", "1.0")
+        raise RuntimeError("inventory reader crashed")
+
+    result = api.evaluate_packages(packages(), options={"internal_packages": ["corp-*"]})
+
+    assert result["receipt"]["checked"] == 1
+    assert _skips(result)["malformed_input"] == 1
+    assert result["findings"][0]["signal_type"] == "dependency_confusion"
+
+
+def test_internal_and_privately_hosted_names_are_not_sent_to_public_registries(monkeypatch):
+    calls = _release_age_module(monkeypatch, {})
+    fetched = []
+    monkeypatch.setattr(
+        npm_publisher, "_fetch_json", lambda url, *, max_bytes: fetched.append(url) or {}
+    )
+    packages = [
+        _pkg("ACME_Ledger", "1.0"),
+        _pkg("billing", "1.0", registry=PRIVATE, registry_mode="exclusive"),
+        _pkg("requests", "2.32.3", registry=PRIVATE, registry_mode="merged"),
+        {"ecosystem": "npm", "name": "@acme/ui", "version": "1.0.0", "integrity": "sha512-x"},
+    ]
+
+    result = api.evaluate_packages(
+        packages,
+        options={
+            "internal_packages": ["acme-*", "@acme/*"],
+            "private_registries": [PRIVATE],
+            "min_release_age_hours": 24,
+            "check_provenance": True,
+            "network": True,
+        },
+    )
+
+    assert [call[1] for call in calls] == ["requests"]
+    assert fetched == []
+    assert _skips(result)["release_age_private_registry"] == 3
+    assert _skips(result)["provenance_private_registry"] == 1
+
+
+class _Snapshot:
+    created_at = "2026-10-01T00:00:00Z"
+    expires_at = "2026-10-02T00:00:00Z"
+    snapshot_id = "snap-1"
+
+    def effective_expires_at(self):
+        from datetime import datetime
+
+        return datetime.fromisoformat("2026-10-02T00:00:00+00:00")
+
+
+class _StaleStatus:
+    state = "stale"
+    action = "warn"
+    reason = "feed snapshot expired at 2026-10-02T00:00:00Z"
+    snapshot = _Snapshot()
+
+
+def test_stale_feed_matches_but_does_not_report_complete(monkeypatch):
+    import ca9.package_feed as package_feed
+
+    monkeypatch.setattr(
+        package_feed, "find_malware_matches", lambda p, *, cache_dir=None: [], raising=False
+    )
+    monkeypatch.setattr(package_feed, "feed_status", lambda **kwargs: _StaleStatus())
+
+    result = api.evaluate_packages([_pkg("requests", "2.32.3")])
+
+    assert _skips(result) == {"malware_feed_stale": 1}
+    assert result["receipt"]["complete"] is False
+    status = api.feed_status()
+    assert status["state"] == "stale"
+    assert status["expires_at"] == "2026-10-02T00:00:00+00:00"
+    assert status["created_at"] == "2026-10-01T00:00:00Z"
+
+
+def test_feed_status_reports_a_missing_feed(tmp_path):
+    status = api.feed_status(feed_dir=tmp_path / "nofeed")
+
+    assert status["state"] == "missing"
+    assert set(status) >= {"state", "action", "reason", "created_at", "expires_at"}
