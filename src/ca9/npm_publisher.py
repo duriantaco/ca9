@@ -475,11 +475,27 @@ def provenance_from_document(
             return _provenance_result("unknown", reason="version has no valid publish time")
         ordered = _earlier_by_publish_time(times, versions, version, published_at)
         ordering = "publish_time"
-    same_line = [item for item in ordered if _release_line(item) == _release_line(version)]
-    if same_line:
-        ordered = same_line
+    line = _release_line(version)
+    same_line = [item for item in ordered if _release_line(item) == line]
+    newer_line: list[str] = []
+    if ordering == "publish_time" and line is not None:
+        newer_line = [item for item in ordered if _is_newer_line(item, line)]
     window = ordered[:PROVENANCE_HISTORY_WINDOW]
+    if same_line:
+        window = same_line[:PROVENANCE_HISTORY_WINDOW]
     with_provenance = [item for item in window if _has_provenance(versions[item])]
+    relation = "same"
+    if with_provenance and not same_line:
+        relation = "older"
+        if _is_newer_line(with_provenance[0], line):
+            relation = "newer"
+    if not with_provenance and same_line and newer_line:
+        newer_window = newer_line[:PROVENANCE_HISTORY_WINDOW]
+        newer_with = [item for item in newer_window if _has_provenance(versions[item])]
+        if newer_with:
+            window = newer_window
+            with_provenance = newer_with
+            relation = "newer"
     current = _provenance_state(metadata)
     evidence = {
         "registry_url": f"{REGISTRY_ORIGIN}/{quote(name.lower(), safe='')}",
@@ -493,16 +509,27 @@ def provenance_from_document(
         evidence["published_at"] = published_at.isoformat()
     if current["provenance"] or current["trusted_publisher"]:
         return _provenance_result("ok", evidence=evidence)
-    if with_provenance:
-        return _provenance_result(
-            "regressed",
-            evidence=evidence,
-            reason=(
-                f"{name}@{version} was published without provenance or a trusted publisher, "
-                f"but {', '.join(with_provenance)} had it"
-            ),
+    if not with_provenance:
+        return _provenance_result("ok", evidence=evidence)
+    evidence["line"] = relation
+    reason = (
+        f"{name}@{version} was published without provenance or a trusted publisher, "
+        f"but {', '.join(with_provenance)} had it"
+    )
+    if relation == "newer":
+        reason = (
+            f"{name}@{version} was published without provenance on a release line that never "
+            f"had it, after newer releases {', '.join(with_provenance)} were published with "
+            "provenance; a hand-published backport looks the same as a stolen publish token"
         )
-    return _provenance_result("ok", evidence=evidence)
+    return _provenance_result("regressed", evidence=evidence, reason=reason)
+
+
+def _is_newer_line(version: str, line: tuple[int, ...] | None) -> bool:
+    other = _release_line(version)
+    if other is None or line is None:
+        return False
+    return other > line
 
 
 def _earlier_by_publish_time(
