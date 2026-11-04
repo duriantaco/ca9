@@ -240,7 +240,8 @@ ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
 ```
 
 `vet` uses an installed `ca9.feed.v1` feed for local malware and package-age decisions
-when policy enables those checks. `--malware-query` is an additional OSV query path, not
+when policy enables those checks; release times the feed lacks come from registry
+metadata, or only from the local release-time cache with `--offline`. `--malware-query` is an additional OSV query path, not
 the feed path. See [Supply-Chain Vetting](supply-chain.md) for details on current
 findings and limits.
 
@@ -288,6 +289,7 @@ Options:
 |---|---|
 | `--from PATH_OR_URL` | Feed bundle `https://` URL, JSON file, or directory containing `snapshot.json`. Optional for `update`. |
 | `--allow-downgrade` | Install a snapshot older than the one already installed (otherwise refused as a possible rollback). |
+| `--require-attestation` | Verify the downloaded bundle with `gh attestation verify --repo duriantaco/ca9 --signer-workflow duriantaco/ca9/.github/workflows/feed.yml` before installing it. Fails, installing nothing, when `gh` is missing, verification fails, or the source is a snapshot directory. |
 | `--policy PATH` | ca9 package policy TOML for `status` offline/stale behavior. |
 | `-f, --format table\|json` | Output format. Defaults to `table`. |
 
@@ -296,7 +298,9 @@ built-in default feed URL on the project's published `feed` branch. Use `--from`
 `CA9_FEED_URL` to select a local or alternate hosted bundle.
 
 Feed bundles use schema `ca9.feed.v1` with `npm-malware`, `pypi-malware`,
-`npm-releases`, and `pypi-releases`. ca9 stores snapshots under `~/.cache/ca9/feed/` and
+`npm-releases`, and `pypi-releases`, plus the optional `npm-malware-ranges` and
+`pypi-malware-ranges` datasets (bounded OSV malware ranges, matched with npm semver or
+PEP 440 ordering; older clients ignore them). ca9 stores snapshots under `~/.cache/ca9/feed/` and
 verifies per-dataset SHA-256 hashes before use. `http://` sources are refused, downloads
 are capped at 256 MiB, snapshots dated more than a day in the future are rejected, and a
 snapshot is treated as stale no later than 30 days after it was built. A missing or stale
@@ -307,6 +311,7 @@ Examples:
 
 ```bash
 ca9 feed update
+ca9 feed update --require-attestation
 ca9 feed update --from ./ca9-feed.json
 ca9 feed status --policy ca9.toml -f json
 ```
@@ -339,7 +344,9 @@ Options:
 
 `run` checks registry policy, local feed malware, package-age policy, install scripts with
 secret-bearing environment variables, and unsupported sources before executing the child
-command. When a feed is available, npm and PyPI loopback gateways can hide denied
+command. Unless a trusted policy sets `package_age.enabled = false` or
+`package_age.minimum_hours = 0`, `run` holds versions published less than 24 hours ago
+(release times from registry metadata) and names an older version to use instead. When a feed is available, npm and PyPI loopback gateways can hide denied
 versions or links from the package manager and record those gateway decisions in the
 runtime audit log.
 

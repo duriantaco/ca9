@@ -40,11 +40,16 @@ jobs:
           fail-on-findings: "true"
 ```
 
-`protect` is local and read-only. It validates enforceable npm/pip install
-workflows, reports unsupported managers, checks feed and exception hygiene, and
-combines package-policy and local Actions findings. Omit `policy` to use normal
-policy discovery. Set `scan-workflows: "false"` to restrict the report to
-dependency posture.
+`protect` validates enforceable npm/pip install workflows, reports unsupported
+managers, checks feed and exception hygiene, and combines package-policy and
+local Actions findings. Omit `policy` to use normal policy discovery. Set
+`scan-workflows: "false"` to restrict the report to dependency posture.
+
+Before `protect`, the action installs the hosted malware feed with
+`ca9 feed update --require-attestation`, using the job's `github.token` for
+`gh attestation verify`. The step fails when the bundle's attestation from the
+ca9 feed workflow cannot be verified. Set `update-feed: "false"` to skip it and
+manage the feed yourself.
 
 ## Direct OSV scan with SARIF upload
 

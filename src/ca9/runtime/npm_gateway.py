@@ -24,6 +24,7 @@ from ca9.package_feed import (
     release_window_covers,
 )
 from ca9.package_policy import PackagePolicy, action_for_mode, find_policy_exception
+from ca9.release_age import cached_publish_time, remember_npm_packument
 
 DEFAULT_NPM_REGISTRY = "https://registry.npmjs.org"
 GATEWAY_SCHEMA = "ca9.npm.gateway.v1"
@@ -89,6 +90,7 @@ class NpmGatewayState:
     applied_exceptions: list[dict[str, Any]] | None = None
     evaluation_failures: list[NpmGatewayEvaluationFailure] | None = None
     packument_times: dict[str, dict[str, Any]] | None = None
+    release_age_defaulted: bool = False
 
     def __post_init__(self) -> None:
         self.removed_versions = []
@@ -105,12 +107,14 @@ class NpmMetadataGateway:
         policy: PackagePolicy,
         feed_cache_dir: Path | None = None,
         now: datetime | None = None,
+        release_age_defaulted: bool = False,
     ) -> None:
         self.state = NpmGatewayState(
             upstream_registry=upstream_registry.rstrip("/"),
             policy=policy,
             feed_cache_dir=feed_cache_dir,
             now=now,
+            release_age_defaulted=release_age_defaulted,
         )
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -517,8 +521,24 @@ def _tarball_decision(
         return None
     metadata_time = None
     if _needs_registry_release_time(package_name, version, state, snapshot):
-        metadata_time = _packument_time(package_name, state)
+        cached = cached_publish_time(
+            "npm",
+            package_name,
+            version,
+            registry=state.upstream_registry,
+            cache_dir=_release_cache_root(state),
+        )
+        if cached:
+            metadata_time = {version: cached}
+        else:
+            metadata_time = _packument_time(package_name, state)
     return _denied_version(package_name, version, state.policy, snapshot, state, metadata_time)
+
+
+def _release_cache_root(state: NpmGatewayState) -> Path | None:
+    if state.feed_cache_dir is None:
+        return None
+    return Path(state.feed_cache_dir).parent
 
 
 def _needs_registry_release_time(
@@ -559,6 +579,12 @@ def _packument_time(package_name: str, state: NpmGatewayState) -> dict[str, Any]
     if not isinstance(metadata_time, dict):
         return None
     cache[key] = metadata_time
+    remember_npm_packument(
+        package_name,
+        metadata,
+        registry=state.upstream_registry,
+        cache_dir=_release_cache_root(state),
+    )
     return metadata_time
 
 
@@ -676,6 +702,8 @@ def _denied_version(
             if release_window_covers(
                 snapshot, "npm", now=now, minimum_hours=policy.package_age.minimum_hours
             ):
+                return None
+            if state.release_age_defaulted:
                 return None
             if action_for_mode("block", policy.mode.offline) == "block":
                 return _apply_gateway_exception(

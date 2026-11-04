@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
@@ -28,10 +29,12 @@ from ca9.package_feed import (
 )
 from ca9.package_policy import (
     PackagePolicy,
+    _load_policy_root,
     action_for_mode,
     find_policy_exception,
 )
 from ca9.readers.package_lock import read_package_lock
+from ca9.release_age import DEFAULT_NPM_REGISTRY, check_release_age
 
 RUN_SCHEMA = "ca9.run.v1"
 LEDGER_SCHEMA = "ca9.run.ledger.v1"
@@ -307,6 +310,8 @@ _NPM_SEMVER_RE = re.compile(
     r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$",
 )
 MALWARE_FEED_UNAVAILABLE_POLICY_ID = "ca9.malware_feed_unavailable"
+RUNTIME_RELEASE_AGE_HOURS = 24
+RELEASE_LOOKUP_WORKERS = 8
 NPM_REGISTRY_ENV_NAMES = ("NPM_CONFIG_REGISTRY", "npm_config_registry")
 NPM_GATEWAY_UPSTREAM_ENV_NAMES = ("CA9_NPM_UPSTREAM_REGISTRY",)
 NPM_CONFIG_FILE_ENV_NAMES = (
@@ -338,6 +343,7 @@ class PackageRequest:
     exact_version: str | None = None
     source_path: str | None = None
     hashes: tuple[str, ...] = ()
+    from_lockfile: bool = False
 
     @property
     def key(self) -> str:
@@ -550,6 +556,49 @@ def parse_install_command(
     raise RuntimePreflightError(UNSUPPORTED_COMMAND_FAMILY_MESSAGE)
 
 
+def runtime_release_age_policy(policy: PackagePolicy) -> tuple[PackagePolicy, bool]:
+    """Apply the ``ca9 run`` release-age cooldown to ``policy``.
+
+    ``ca9 run`` holds versions published less than ``RUNTIME_RELEASE_AGE_HOURS``
+    ago unless a trusted policy (user policy, ``CA9_POLICY`` or ``--policy``)
+    sets ``package_age.enabled = false`` or ``package_age.minimum_hours = 0``. A
+    tighten-only repository ``ca9.toml`` cannot switch the default off or lower
+    it. Returns the effective policy and whether the age check comes from this
+    default rather than from policy; defaulted checks never block a version just
+    because its release time is unknown.
+    """
+    age = policy.package_age
+    trusted = _trusted_package_age_settings(policy)
+    if age.enabled:
+        if age.minimum_hours <= 0:
+            return replace(policy, package_age=replace(age, enabled=False)), False
+        if "minimum_hours" not in trusted and age.minimum_hours < RUNTIME_RELEASE_AGE_HOURS:
+            return (
+                replace(policy, package_age=replace(age, minimum_hours=RUNTIME_RELEASE_AGE_HOURS)),
+                False,
+            )
+        return policy, False
+    if trusted.get("enabled") is False or trusted.get("minimum_hours") == 0:
+        return policy, False
+    defaulted = replace(age, enabled=True, minimum_hours=RUNTIME_RELEASE_AGE_HOURS)
+    return replace(policy, package_age=defaulted), True
+
+
+def _trusted_package_age_settings(policy: PackagePolicy) -> dict[str, Any]:
+    settings: dict[str, Any] = {}
+    for source in policy.sources:
+        if source in policy.tighten_only_sources:
+            continue
+        try:
+            root = _load_policy_root(Path(source))
+        except ValueError:
+            continue
+        table = root.get("package_age")
+        if isinstance(table, dict):
+            settings.update(table)
+    return settings
+
+
 def evaluate_runtime_preflight(
     command: tuple[str, ...] | list[str],
     policy: PackagePolicy,
@@ -558,7 +607,16 @@ def evaluate_runtime_preflight(
     feed_cache_dir: Path | None = None,
     now: datetime | None = None,
     cwd: Path | None = None,
+    release_age_defaulted: bool = False,
+    release_fetch: Any = None,
 ) -> RuntimePreflight:
+    """Evaluate a package-manager command against ``policy`` before it runs.
+
+    ``release_age_defaulted`` marks the package-age check as the ``ca9 run``
+    default (see ``runtime_release_age_policy``): an unknown release time then
+    becomes a warning instead of a decision. ``release_fetch`` replaces the
+    registry client used for release times, mainly for tests.
+    """
     active_env = env if env is not None else dict(os.environ)
     try:
         parsed = parse_install_command(command, cwd=cwd)
@@ -582,13 +640,31 @@ def evaluate_runtime_preflight(
 
     parsed = _with_env_registry_sources(parsed, active_env)
     decisions: list[RuntimeDecision] = []
+    age_warnings: list[str] = []
     feed = _load_feed_status_if_needed(parsed, policy, feed_cache_dir=feed_cache_dir, now=now)
     decisions.extend(_registry_source_decisions(parsed, policy))
     decisions.extend(_gateway_requirement_source_decisions(parsed, policy, feed))
-    decisions.extend(_feed_availability_decisions(feed, policy))
+    decisions.extend(
+        _feed_availability_decisions(feed, policy, release_age_defaulted=release_age_defaulted)
+    )
+    snapshot = None
     if feed and feed.snapshot:
+        snapshot = feed.snapshot
         decisions.extend(_malware_decisions(parsed, policy, feed.snapshot, feed_cache_dir))
-        decisions.extend(_package_age_decisions(parsed, policy, feed.snapshot, now=now))
+    if feed is None or feed.state != "tampered":
+        decisions.extend(
+            _package_age_decisions(
+                parsed,
+                policy,
+                snapshot,
+                now=now,
+                defaulted=release_age_defaulted,
+                cache_root=_release_cache_root(feed_cache_dir),
+                fetch=release_fetch,
+                env=active_env,
+                warnings=age_warnings,
+            )
+        )
     decisions = _apply_runtime_policy_exceptions(decisions, parsed, policy, now=now)
 
     secrets = detect_secret_env(active_env)
@@ -603,7 +679,7 @@ def evaluate_runtime_preflight(
         secret_names=secrets,
         stripped_secret_names=stripped,
         feed=feed,
-        warnings=_feed_warnings(feed, policy),
+        warnings=(*_feed_warnings(feed, policy), *age_warnings),
         stripped_env_names=_ci_file_command_env_names(parsed, policy, active_env),
     )
 
@@ -1805,6 +1881,7 @@ def _npm_lock_requests(cwd: Path) -> tuple[list[PackageRequest], list[RegistrySo
             raw_spec=f"{package.name}@{package.version}",
             version_spec=package.version,
             exact_version=package.version,
+            from_lockfile=True,
         )
         if request.key not in expected_keys:
             continue
@@ -2344,6 +2421,8 @@ def _load_feed_status_if_needed(
 def _feed_availability_decisions(
     status: FeedStatus | None,
     policy: PackagePolicy,
+    *,
+    release_age_defaulted: bool = False,
 ) -> list[RuntimeDecision]:
     if status is None:
         return []
@@ -2357,7 +2436,11 @@ def _feed_availability_decisions(
             )
         ]
     decisions: list[RuntimeDecision] = []
-    if policy.package_age.enabled and status.state in {"missing", "stale"}:
+    if (
+        policy.package_age.enabled
+        and not release_age_defaulted
+        and status.state in {"missing", "stale"}
+    ):
         decisions.append(
             RuntimeDecision(
                 action=status.action,
@@ -2529,70 +2612,173 @@ def _malware_decisions(
 def _package_age_decisions(
     command: RuntimeCommand,
     policy: PackagePolicy,
-    snapshot: FeedSnapshot,
+    snapshot: FeedSnapshot | None,
     *,
     now: datetime | None,
+    defaulted: bool = False,
+    cache_root: Path | None = None,
+    fetch: Any = None,
+    env: dict[str, str] | None = None,
+    warnings: list[str] | None = None,
 ) -> list[RuntimeDecision]:
+    """Package-age decisions for exact requests, in request order.
+
+    Release times come from the feed, then registry metadata. npm lockfile
+    entries the feed cannot date are left to the npm gateway, which reads the
+    same release-time cache, so ``npm ci`` does not fetch every packument twice.
+    """
     if not policy.package_age.enabled:
         return []
     active_now = now or datetime.now(timezone.utc)
+    minimum_hours = policy.package_age.minimum_hours
+    notes: list[str] = []
+    if warnings is not None:
+        notes = warnings
+    planned: list[tuple[PackageRequest, str | None]] = []
     decisions: list[RuntimeDecision] = []
     for request in command.package_requests:
         if _is_age_excluded(request, policy.package_age.exclusions):
             continue
         if request.exact_version is None:
-            if request.ecosystem == "npm":
+            if request.ecosystem == "npm" or defaulted:
                 continue
-            decisions.append(_unknown_release_time_decision(request, policy, snapshot))
+            planned.append((request, "unknown"))
             continue
-        released_at = lookup_release_time(
+        released_at = None
+        if snapshot is not None:
+            released_at = lookup_release_time(
+                request.ecosystem,
+                request.name,
+                request.exact_version,
+                snapshot=snapshot,
+            )
+        if released_at:
+            planned.append((request, released_at))
+            continue
+        if snapshot is not None and release_window_covers(
+            snapshot,
+            request.ecosystem,
+            now=active_now,
+            minimum_hours=minimum_hours,
+        ):
+            continue
+        if request.ecosystem == "npm" and request.from_lockfile:
+            continue
+        planned.append((request, None))
+
+    registry = _release_registry(command, policy, env or {})
+
+    def lookup(request: PackageRequest) -> dict[str, Any]:
+        return check_release_age(
             request.ecosystem,
             request.name,
-            request.exact_version,
-            snapshot=snapshot,
+            str(request.exact_version),
+            min_hours=minimum_hours,
+            cache_dir=cache_root,
+            fetch=fetch,
+            registry=registry,
+            now=active_now,
         )
-        if not released_at:
-            if request.ecosystem == "npm":
-                continue
-            if release_window_covers(
-                snapshot,
-                request.ecosystem,
-                now=active_now,
-                minimum_hours=policy.package_age.minimum_hours,
-            ):
-                continue
+
+    to_lookup = [request for request, released_at in planned if released_at is None]
+    lookups: dict[str, dict[str, Any]] = {}
+    if to_lookup:
+        with ThreadPoolExecutor(max_workers=min(RELEASE_LOOKUP_WORKERS, len(to_lookup))) as pool:
+            for request, result in zip(to_lookup, pool.map(lookup, to_lookup), strict=True):
+                lookups[request.key] = result
+
+    for request, released_at in planned:
+        if released_at == "unknown":
             decisions.append(_unknown_release_time_decision(request, policy, snapshot))
             continue
+        suggested_version = None
+        release_source = "feed"
+        if released_at is None:
+            result = lookups[request.key]
+            if result["status"] == "old_enough":
+                continue
+            if result["status"] == "too_new" and result.get("published_at"):
+                released_at = str(result["published_at"])
+                suggested_version = result.get("suggested_version")
+                release_source = str(result.get("source") or "registry")
+            elif request.ecosystem == "npm":
+                continue
+            elif defaulted:
+                notes.append(
+                    f"release time for {request.name}=={request.exact_version} is unknown; "
+                    f"the default {minimum_hours}h release-age hold was not applied"
+                )
+                continue
+            else:
+                decisions.append(_unknown_release_time_decision(request, policy, snapshot))
+                continue
         released = _parse_feed_time(released_at)
         age_hours = (active_now - released).total_seconds() / 3600
-        if age_hours >= policy.package_age.minimum_hours:
+        if age_hours >= minimum_hours:
             continue
         action = action_for_mode("block", policy.mode.default)
+        reason = (
+            f"package version age is {age_hours:.1f}h, below policy minimum of {minimum_hours}h"
+        )
+        evidence: dict[str, Any] = {
+            "released_at": released_at,
+            "age_hours": round(age_hours, 2),
+            "minimum_hours": minimum_hours,
+            "feed_snapshot": _snapshot_id(snapshot),
+            "release_source": release_source,
+        }
+        if defaulted:
+            evidence["default_policy"] = True
+        if suggested_version:
+            evidence["suggested_version"] = suggested_version
+            reason = f"{reason}; use {suggested_version}, which is older than the window"
         decisions.append(
             RuntimeDecision(
                 action=action,
                 policy_id="ca9.package_age",
-                reason=(
-                    f"package version age is {age_hours:.1f}h, below policy minimum "
-                    f"of {policy.package_age.minimum_hours}h"
-                ),
+                reason=reason,
                 package=request.name,
                 version=request.exact_version,
-                evidence={
-                    "released_at": released_at,
-                    "age_hours": round(age_hours, 2),
-                    "minimum_hours": policy.package_age.minimum_hours,
-                    "feed_snapshot": snapshot.snapshot_id,
-                },
+                evidence=evidence,
             )
         )
     return decisions
 
 
+def _snapshot_id(snapshot: FeedSnapshot | None) -> str | None:
+    if snapshot is None:
+        return None
+    return snapshot.snapshot_id
+
+
+def _release_cache_root(feed_cache_dir: Path | None) -> Path | None:
+    if feed_cache_dir is None:
+        return None
+    return Path(feed_cache_dir).parent
+
+
+def _release_registry(
+    command: RuntimeCommand,
+    policy: PackagePolicy,
+    env: dict[str, str],
+) -> str | None:
+    """Registry to read npm publish times from: the trusted one npm will use."""
+    if command.family != "npm":
+        return None
+    candidate = env.get("CA9_NPM_UPSTREAM_REGISTRY") or primary_registry_url(command)
+    if not candidate:
+        return DEFAULT_NPM_REGISTRY
+    if not candidate.startswith("https://") or not _registry_allowed(
+        candidate, policy.registries.allow
+    ):
+        return DEFAULT_NPM_REGISTRY
+    return candidate
+
+
 def _unknown_release_time_decision(
     request: PackageRequest,
     policy: PackagePolicy,
-    snapshot: FeedSnapshot,
+    snapshot: FeedSnapshot | None,
 ) -> RuntimeDecision:
     action = action_for_mode("block", policy.mode.offline)
     target = f"{request.name}@{request.exact_version}" if request.exact_version else request.name
@@ -2600,13 +2786,13 @@ def _unknown_release_time_decision(
         action=action,
         policy_id="ca9.package_age_unknown",
         reason=(
-            f"release time for {target} is not available in the local feed; "
-            "ca9 cannot verify the minimum package age"
+            f"release time for {target} is not available in the local feed or registry "
+            "metadata; ca9 cannot verify the minimum package age"
         ),
         package=request.name,
         version=request.exact_version,
         evidence={
-            "feed_snapshot": snapshot.snapshot_id,
+            "feed_snapshot": _snapshot_id(snapshot),
             "minimum_hours": policy.package_age.minimum_hours,
             "offline_mode": policy.mode.offline,
         },

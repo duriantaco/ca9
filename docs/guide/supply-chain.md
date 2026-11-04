@@ -157,6 +157,7 @@ package-age decisions:
 
 ```bash
 ca9 feed update
+ca9 feed update --require-attestation
 ca9 feed update --from ./ca9-feed.json
 ca9 feed status
 ```
@@ -165,10 +166,33 @@ ca9 feed status
 default feed URL on the project's published `feed` branch. Use `--from` or
 `CA9_FEED_URL` to select a local or alternate hosted bundle.
 
-Feed bundles use schema `ca9.feed.v1` and contain `npm-malware`, `pypi-malware`,
-`npm-releases`, and `pypi-releases`. Feed snapshots are stored under
+`--require-attestation` checks the downloaded bundle with
+`gh attestation verify <file> --repo duriantaco/ca9 --signer-workflow
+duriantaco/ca9/.github/workflows/feed.yml` before installing it. The exact bytes that
+were verified are the bytes installed. The update fails, and nothing is installed, when
+`gh` is missing, verification fails, or the source is a snapshot directory rather than
+a single bundle file. `gh` needs a GitHub token (`GH_TOKEN` in CI). Without the flag the
+update behaves as before.
+
+Feed bundles use schema `ca9.feed.v1` and always contain `npm-malware`, `pypi-malware`,
+`npm-releases`, and `pypi-releases`. Newer bundles add the optional
+`npm-malware-ranges` and `pypi-malware-ranges` datasets. Feed snapshots are stored under
 `~/.cache/ca9/feed/` and verified with SHA-256 content hashes before use. Tampered feeds
 always block.
+
+Malware entries come from OSV records with a `MAL-` id or alias, explicit
+malicious-package metadata, or CWE-506 "Embedded Malicious Code" (GitHub advisories such
+as `GHSA-33qr-m49q-rxfx` for `xrpl`). Withdrawn records are skipped. A record that lists
+versions becomes one entry per version, and a record that covers the whole package
+(no versions, or a range from `introduced: "0"` with no upper bound) matches every
+version. A record that only gives bounded ranges (for example `@solana/web3.js`
+`introduced: 1.95.6`, `fixed: 1.95.8`) is kept with its OSV events unchanged in the
+`*-malware-ranges` dataset. ca9 matches those ranges with npm semver ordering
+(prereleases sort before their release, build metadata is ignored, a leading `v` is
+accepted) or PEP 440 ordering for PyPI. A version outside every range never matches,
+and a range is never widened into a whole-package entry. Clients older than this
+change ignore the range datasets and keep working; run `ca9 feed update` after
+upgrading so the installed snapshot includes them.
 
 Enable package-age policy in `ca9.toml`:
 
@@ -178,10 +202,30 @@ enabled = true
 minimum_hours = 48
 ```
 
-If a release timestamp is present and younger than `minimum_hours`, ca9 blocks. If a
-release dataset declares `covers_since`, a missing version can pass when it is provably
-older than the configured minimum. Otherwise the release time is unknown; the default
-offline mode warns, and `[mode].offline = "block"` blocks.
+Release times come from the feed's releases dataset when it has them, and otherwise
+from registry metadata: the npm packument `time` map (from the registry npm uses, when
+policy trusts it, else `registry.npmjs.org`) or PyPI's JSON API (the earliest upload of
+the version's files). Publish times never change, so ca9 caches them under
+`~/.cache/ca9/release-times/` (bounded in size, written atomically, never through
+symlinks, and never caching a failed lookup). The hosted feed still ships empty
+releases datasets for older clients; an empty dataset without `covers_since` no longer
+settles anything by itself.
+
+If a release time is younger than `minimum_hours`, ca9 blocks and names the newest
+stable version published before the window (not a prerelease, yanked, unpublished or
+deprecated version; versions below the requested one are preferred). If a release
+dataset declares `covers_since`, a missing version can pass when it is provably older
+than the configured minimum. If neither the feed nor the registry knows the release
+time, it is unknown; the default offline mode warns, and `[mode].offline = "block"`
+blocks. `ca9 vet --offline` only uses cached release times.
+
+`ca9 run` holds versions published less than 24 hours ago even without a
+`[package_age]` table, naming an older version to use instead. Unknown release times do
+not block under this default. Turn it off from a trusted policy (`--policy`,
+`CA9_POLICY`, or `~/.config/ca9/policy.toml`) with `package_age.enabled = false` or
+`package_age.minimum_hours = 0`; a repository `ca9.toml` that ca9 only discovers in the
+working directory cannot turn it off or lower it. `vet` and `protect` keep package age
+opt-in.
 
 ## Malicious Advisory Query
 
@@ -382,10 +426,7 @@ Still planned:
 - typosquatting and namespace confusion
 - lockfile poisoning diffs
 - hosted complete recent-release datasets for package-age feeds
-- PyPI yanked/project metadata
 - maintainer or repository hijack signals
 - provenance/Sigstore/SLSA checks
-- signed feed snapshots
-- range-aware feed matching for bounded OSV malware advisories
 - yarn, pnpm, uv, poetry, pipx, npx, requirements-file, direct URL, local path, and
   alternate pip-source runtime mediation

@@ -434,3 +434,98 @@ def test_feed_update_rejects_plain_http_url(tmp_path):
 
     assert update.exit_code == 1
     assert "insecure http://" in update.output
+
+
+SOLANA_RECORD = {
+    "id": "MAL-2024-11183",
+    "aliases": ["GHSA-2mhj-xmf4-pr8m"],
+    "summary": "Malicious code in @solana/web3.js (npm)",
+    "affected": [
+        {
+            "package": {"ecosystem": "npm", "name": "@solana/web3.js"},
+            "ranges": [
+                {"type": "SEMVER", "events": [{"introduced": "1.95.6"}, {"fixed": "1.95.8"}]}
+            ],
+        }
+    ],
+}
+XRPL_RECORD = {
+    "id": "GHSA-33qr-m49q-rxfx",
+    "aliases": ["CVE-2025-32965"],
+    "summary": "Compromised xrpl.js versions 4.2.1, 4.2.2, 4.2.3, 4.2.4, and 2.14.2",
+    "database_specific": {"cwe_ids": ["CWE-506"], "severity": "CRITICAL"},
+    "affected": [
+        {
+            "package": {"ecosystem": "npm", "name": "xrpl"},
+            "ranges": [{"type": "SEMVER", "events": [{"introduced": "4.2.1"}, {"fixed": "4.2.5"}]}],
+        },
+        {
+            "package": {"ecosystem": "npm", "name": "xrpl"},
+            "ranges": [
+                {"type": "SEMVER", "events": [{"introduced": "2.14.2"}, {"fixed": "2.14.3"}]}
+            ],
+            "versions": ["2.14.2"],
+        },
+    ],
+}
+
+
+def test_cwe_506_advisories_are_malicious_but_other_cwes_are_not():
+    assert is_malicious(XRPL_RECORD)
+    assert is_malicious(
+        {
+            "id": "GHSA-aff-level",
+            "affected": [{"database_specific": {"cwes": [{"cweId": "CWE-506"}]}}],
+        }
+    )
+    assert not is_malicious(
+        {"id": "GHSA-plain", "database_specific": {"cwe_ids": ["CWE-79", "CWE-5060"]}}
+    )
+
+
+def test_range_only_records_are_kept_as_ranges_never_as_whole_package():
+    stats: dict[str, dict[str, int]] = {}
+    bundle = build_bundle_from_records({"npm": [SOLANA_RECORD, XRPL_RECORD]}, stats=stats)
+
+    exact = bundle["datasets"]["npm-malware"]["packages"]
+    ranges = bundle["datasets"]["npm-malware-ranges"]["packages"]
+    assert [(entry["name"], entry.get("version")) for entry in exact] == [("xrpl", "2.14.2")]
+    assert sorted(
+        (entry["name"], entry["ranges"][0]["events"][0]["introduced"]) for entry in ranges
+    ) == [
+        ("@solana/web3.js", "1.95.6"),
+        ("xrpl", "2.14.2"),
+        ("xrpl", "4.2.1"),
+    ]
+    assert all("version" not in entry for entry in ranges)
+    assert ranges[0]["ranges"] == SOLANA_RECORD["affected"][0]["ranges"]
+    assert stats["npm-malware"]["cwe506_records"] == 1
+    assert stats["npm-malware-ranges"]["ranged"] == 3
+
+
+def test_withdrawn_cwe_506_and_git_only_ranges_stay_out_of_every_dataset():
+    withdrawn = {**XRPL_RECORD, "id": "GHSA-withdrawn", "withdrawn": "2025-05-01T00:00:00Z"}
+    git_only = _openssf_record(
+        "MAL-2026-20",
+        "git-only",
+        ranges=[{"type": "GIT", "repo": "https://x", "events": [{"introduced": "abc"}]}],
+    )
+    stats: dict[str, dict[str, int]] = {}
+    bundle = build_bundle_from_records({"npm": [withdrawn, git_only]}, stats=stats)
+
+    assert bundle["datasets"]["npm-malware"]["packages"] == []
+    assert bundle["datasets"]["npm-malware-ranges"]["packages"] == []
+    assert stats["npm-malware"]["withdrawn_skipped"] == 1
+    assert stats["npm-malware-ranges"]["range_unusable"] == 1
+
+
+def test_range_counts_are_reported_but_not_held_to_the_malware_floor():
+    from scripts.build_feed import build_manifest, count_guard_errors
+
+    bundle = build_bundle_from_records({"npm": [SOLANA_RECORD], "PyPI": PYPI_RECORDS})
+    manifest = build_manifest(bundle)
+
+    assert manifest["malware_range_counts"] == {"npm-malware-ranges": 1, "pypi-malware-ranges": 0}
+    assert "npm-malware-ranges" not in manifest["malware_counts"]
+    assert count_guard_errors(manifest["malware_range_counts"], previous={}) == []
+    assert count_guard_errors({"npm-malware-ranges": 10}, previous={"npm-malware-ranges": 100})

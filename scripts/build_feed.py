@@ -2,13 +2,17 @@
 
 The malicious-package records (OSV ``MAL-`` IDs) originate from the OpenSSF
 ``malicious-packages`` project (Apache-2.0), surfaced through the OSV.dev
-per-ecosystem export. This script downloads those exports, keeps only the
-malicious records, and maps them into ca9's feed dataset shape.
+per-ecosystem export. GitHub advisories (``GHSA-``) tagged CWE-506 "Embedded
+Malicious Code" are malicious too. This script downloads those exports, keeps
+only the malicious records, and maps them into ca9's feed dataset shape.
 
-v1 ships malware only; the ``*-releases`` datasets are emitted empty (package-age
-is opt-in and off by default, so this does not change default behaviour). A later
-revision can fill a recent-window releases dataset — see
-``docs/proposals/default-feed.md``.
+Exact versions and whole-package records go to ``<ecosystem>-malware``. Records
+that only give bounded version ranges go, with their OSV events kept verbatim,
+to the optional ``<ecosystem>-malware-ranges`` datasets; clients that predate
+them ignore unknown datasets, and a range is never widened to a whole-package
+entry. The ``*-releases`` datasets are still emitted empty so older clients keep
+loading the bundle; release age now comes from registry metadata (see
+``ca9.release_age``).
 
 Usage:
     python scripts/build_feed.py -o feed_build/latest.json
@@ -39,14 +43,18 @@ OSV_EXPORT_URL = "https://osv-vulnerabilities.storage.googleapis.com/{ecosystem}
 # Range types whose events describe package versions (GIT ranges describe commits).
 VERSION_RANGE_TYPES = {"SEMVER", "ECOSYSTEM"}
 UPPER_BOUND_EVENTS = ("fixed", "last_affected", "limit")
+RANGE_EVENT_KEYS = ("introduced", "fixed", "last_affected", "limit")
+MALICIOUS_CWE = "CWE-506"
 # Per-ecosystem build statistics reported in the build summary and manifest.
 STAT_KEYS = (
     "malicious_records",
+    "cwe506_records",
     "withdrawn_skipped",
     "whole_package",
     "versioned",
     "bounded_skipped",
 )
+RANGE_STAT_KEYS = ("ranged", "range_unusable")
 
 
 def fetch_osv_export(osv_ecosystem: str, *, source_url: str | None = None) -> list[dict[str, Any]]:
@@ -69,7 +77,37 @@ def records_from_zip(raw: bytes) -> list[dict[str, Any]]:
 
 
 def is_malicious(record: dict[str, Any]) -> bool:
-    """OSV records flagged as malicious carry a ``MAL-`` id (or alias/marker)."""
+    """OSV records flagged as malicious: a ``MAL-`` id, alias, marker, or CWE-506."""
+    return _is_mal_record(record) or has_malicious_cwe(record)
+
+
+def has_malicious_cwe(record: dict[str, Any]) -> bool:
+    """True when the record, or one of its affected entries, carries CWE-506."""
+    sources = [record.get("database_specific")]
+    sources.extend(
+        affected.get("database_specific")
+        for affected in record.get("affected") or []
+        if isinstance(affected, dict)
+    )
+    return any(_cwe_ids(source) & {MALICIOUS_CWE} for source in sources)
+
+
+def _cwe_ids(database_specific: Any) -> set[str]:
+    if not isinstance(database_specific, dict):
+        return set()
+    found: set[str] = set()
+    cwe_ids = database_specific.get("cwe_ids")
+    if isinstance(cwe_ids, list):
+        found.update(str(item).strip().upper() for item in cwe_ids if isinstance(item, str))
+    cwes = database_specific.get("cwes")
+    if isinstance(cwes, list):
+        for item in cwes:
+            if isinstance(item, dict) and isinstance(item.get("cweId"), str):
+                found.add(item["cweId"].strip().upper())
+    return found
+
+
+def _is_mal_record(record: dict[str, Any]) -> bool:
     if str(record.get("id", "")).startswith("MAL-"):
         return True
     if any(str(alias).startswith("MAL-") for alias in record.get("aliases") or []):
@@ -90,9 +128,10 @@ def malware_entries(
     version; records that flag the whole package (no versions or ranges, or a
     range that starts at ``introduced: "0"`` with no upper bound) become a single
     name-only entry, which ca9 matches against any version. Bounded ranges use the
-    explicit versions OpenSSF lists in ``malicious-packages-origins`` and are
-    skipped (and counted in ``stats``) when no such versions exist. Withdrawn
-    records are skipped.
+    explicit versions OpenSSF lists in ``malicious-packages-origins``; when no such
+    versions exist they are counted as ``bounded_skipped`` here and kept only in
+    the ranges dataset (see ``malware_range_entries``). Withdrawn records are
+    skipped.
     """
     counts = stats if stats is not None else {}
     for key in STAT_KEYS:
@@ -106,6 +145,8 @@ def malware_entries(
             counts["withdrawn_skipped"] += 1
             continue
         counts["malicious_records"] += 1
+        if not _is_mal_record(record):
+            counts["cwe506_records"] += 1
         record_id = str(record.get("id") or "")
         summary = _summary(record)
         affected_entries = [item for item in record.get("affected") or [] if isinstance(item, dict)]
@@ -146,6 +187,83 @@ def malware_entries(
                 entries.append(entry)
     entries.sort(key=lambda item: (item["name"], item.get("version", ""), item["id"]))
     return entries
+
+
+def malware_range_entries(
+    records: Iterable[dict[str, Any]],
+    ca9_ecosystem: str,
+    *,
+    stats: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Map bounded malicious ranges to ``<ecosystem>-malware-ranges`` entries.
+
+    Every malicious, non-withdrawn affected entry with a bounded ``SEMVER`` or
+    ``ECOSYSTEM`` range is kept, events verbatim, even when explicit versions
+    were also listed: OSV enumerates versions from what the registry still
+    serves, so unpublished malicious versions are often only described by the
+    range. Whole-package records already live in ``<ecosystem>-malware`` and are
+    not repeated here. Entries carry no ``version`` key, and clients match them
+    only when a version falls inside a range.
+    """
+    counts: dict[str, int] = {}
+    if stats is not None:
+        counts = stats
+    for key in RANGE_STAT_KEYS:
+        counts.setdefault(key, 0)
+    seen: set[tuple[str, str, str]] = set()
+    entries: list[dict[str, Any]] = []
+    for record in records:
+        if not is_malicious(record) or record.get("withdrawn"):
+            continue
+        record_id = str(record.get("id") or "")
+        summary = _summary(record)
+        for affected in record.get("affected") or []:
+            if not isinstance(affected, dict):
+                continue
+            package = affected.get("package") or {}
+            name = package.get("name")
+            raw_ranges = [item for item in affected.get("ranges") or [] if isinstance(item, dict)]
+            if not name or not raw_ranges:
+                continue
+            if any(_is_whole_package_range(item) for item in raw_ranges):
+                continue
+            ranges = [kept for kept in map(_verbatim_version_range, raw_ranges) if kept]
+            if not ranges:
+                if not affected.get("versions"):
+                    counts["range_unusable"] += 1
+                continue
+            normalized = normalize_name(ca9_ecosystem, str(name))
+            key = (normalized, record_id, json.dumps(ranges, sort_keys=True))
+            if key in seen:
+                continue
+            seen.add(key)
+            entry: dict[str, Any] = {"name": normalized, "id": record_id, "ranges": ranges}
+            if summary:
+                entry["summary"] = summary
+            entries.append(entry)
+            counts["ranged"] += 1
+    entries.sort(key=lambda item: (item["name"], item["id"], json.dumps(item["ranges"])))
+    return entries
+
+
+def _verbatim_version_range(osv_range: dict[str, Any]) -> dict[str, Any] | None:
+    """A ``SEMVER``/``ECOSYSTEM`` range with its version events copied unchanged."""
+    if osv_range.get("type") not in VERSION_RANGE_TYPES:
+        return None
+    events = []
+    for event in osv_range.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        kept = {
+            key: str(event[key])
+            for key in RANGE_EVENT_KEYS
+            if key in event and isinstance(event[key], (str, int, float))
+        }
+        if kept:
+            events.append(kept)
+    if not any("introduced" in event for event in events):
+        return None
+    return {"type": osv_range["type"], "events": events}
 
 
 def _is_whole_package_range(osv_range: dict[str, Any]) -> bool:
@@ -219,6 +337,13 @@ def build_datasets(
         datasets[dataset_name] = {
             "packages": malware_entries(records, ca9_ecosystem, stats=dataset_stats)
         }
+        ranges_name = f"{ca9_ecosystem}-malware-ranges"
+        ranges_stats = None
+        if stats is not None:
+            ranges_stats = stats.setdefault(ranges_name, {})
+        datasets[ranges_name] = {
+            "packages": malware_range_entries(records, ca9_ecosystem, stats=ranges_stats)
+        }
     for ca9_ecosystem in OSV_ECOSYSTEMS.values():
         datasets[f"{ca9_ecosystem}-releases"] = build_releases_dataset(
             releases.get(ca9_ecosystem, {}), covers_since
@@ -279,10 +404,19 @@ def _iso(moment: datetime) -> str:
 
 def malware_counts(bundle: dict[str, Any]) -> dict[str, int]:
     """Return per-ecosystem malware entry counts for a bundle."""
+    return _dataset_counts(bundle, "-malware")
+
+
+def malware_range_counts(bundle: dict[str, Any]) -> dict[str, int]:
+    """Return per-ecosystem malware range entry counts for a bundle."""
+    return _dataset_counts(bundle, "-malware-ranges")
+
+
+def _dataset_counts(bundle: dict[str, Any], suffix: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for name, dataset in bundle.get("datasets", {}).items():
         packages = dataset.get("packages") if isinstance(dataset, dict) else None
-        if name.endswith("-malware") and isinstance(packages, list):
+        if name.endswith(suffix) and isinstance(packages, list):
             counts[name] = len(packages)
     return counts
 
@@ -308,6 +442,7 @@ def build_manifest(
         "built_at": _iso(now or datetime.now(timezone.utc)),
         "expires_at": bundle.get("expires_at"),
         "malware_counts": malware_counts(bundle),
+        "malware_range_counts": malware_range_counts(bundle),
         "sources": dict(source_urls or {}),
     }
     if stats is not None:
@@ -319,7 +454,10 @@ def format_build_stats(stats: dict[str, dict[str, int]]) -> list[str]:
     """One summary line per dataset, so skipped records are visible in build logs."""
     lines: list[str] = []
     for name, values in sorted(stats.items()):
-        details = "  ".join(f"{key}={values.get(key, 0)}" for key in STAT_KEYS)
+        keys = STAT_KEYS
+        if name.endswith("-malware-ranges"):
+            keys = RANGE_STAT_KEYS
+        details = "  ".join(f"{key}={values.get(key, 0)}" for key in keys)
         lines.append(f"{name}: {details}")
     return lines
 
@@ -389,19 +527,31 @@ def main(argv: list[str] | None = None) -> int:
     bundle["build_info"] = manifest
     counts = manifest["malware_counts"]
 
+    range_counts = manifest["malware_range_counts"]
     previous = None
+    previous_ranges = None
     if args.compare_manifest and args.compare_manifest.is_file():
         try:
-            loaded = json.loads(args.compare_manifest.read_text()).get("malware_counts")
-            previous = loaded if isinstance(loaded, dict) else None
+            loaded_manifest = json.loads(args.compare_manifest.read_text())
         except (OSError, json.JSONDecodeError):
-            previous = None
+            loaded_manifest = {}
+        if isinstance(loaded_manifest, dict):
+            loaded = loaded_manifest.get("malware_counts")
+            if isinstance(loaded, dict):
+                previous = loaded
+            loaded_ranges = loaded_manifest.get("malware_range_counts")
+            if isinstance(loaded_ranges, dict):
+                previous_ranges = loaded_ranges
 
-    print("feed built: " + "  ".join(f"{name}={count}" for name, count in sorted(counts.items())))
+    print(
+        "feed built: "
+        + "  ".join(f"{name}={count}" for name, count in sorted({**counts, **range_counts}.items()))
+    )
     for line in format_build_stats(stats):
         print(f"feed stats: {line}")
 
     errors = count_guard_errors(counts, minimum=args.min_malware, previous=previous)
+    errors.extend(count_guard_errors(range_counts, previous=previous_ranges))
     if errors:
         for error in errors:
             print(f"feed guard failed: {error}", file=sys.stderr)

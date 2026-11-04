@@ -6,8 +6,10 @@ name: Publish package feed
 #
 # The build job runs third-party code (pip, the feed builder) with a read-only
 # token. Only the publish job can write, and it runs no project code. Each
-# published bundle carries a GitHub artifact attestation that can be checked
-# with: gh attestation verify latest.json --repo duriantaco/ca9
+# published bundle carries a GitHub artifact attestation signed by this
+# workflow. `ca9 feed update --require-attestation` checks it with:
+#   gh attestation verify latest.json --repo duriantaco/ca9 \
+#     --signer-workflow duriantaco/ca9/.github/workflows/feed.yml
 
 on:
   schedule:
