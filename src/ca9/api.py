@@ -888,3 +888,77 @@ def _optional_string(value: object) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def agent_config(repo_root: str | Path) -> dict[str, Any]:
+    """Committed agent/editor execution hooks, MCP server configs and API base-URL overrides.
+
+    Reads ``.claude/settings(.local).json``, ``.gemini/settings.json``,
+    ``.cursor/{hooks,mcp}.json``, ``.codex/{hooks.json,config.toml}``,
+    ``.vscode/{tasks,mcp,settings}.json``, ``*.code-workspace``, ``.mcp.json``,
+    ``.kiro/settings/mcp.json`` (and Roo / Amazon Q / Windsurf ``mcp.json``) at any
+    depth, skipping ``node_modules``, ``.git`` and virtualenvs. JSON with comments and
+    trailing commas parses; an unparseable hook file still reports the command strings
+    found in its text. Never raises.
+
+    Returns ``{"findings": [finding dict], "inventory": {...}}``. ``signal_type`` is one
+    of agent_hook_command (HIGH; CRITICAL when the command downloads remote code,
+    decodes and runs a payload, or runs a script disguised as a font/image),
+    editor_folder_open_task (same severities), mcp_server_unpinned (MEDIUM),
+    mcp_server_hidden_path (HIGH), mcp_server_impersonation (MEDIUM),
+    agent_base_url_override (HIGH). ``name`` is the hook event, task label, server
+    name or variable; ``ecosystem``/``version`` are set for MCP findings. Hook
+    evidence carries the exact ``command`` plus ``display_command``, ``executable``,
+    ``script``, ``fetches_remote``, ``decodes_and_executes``, ``disguised_script`` and
+    ``hidden_by_padding``. No command is trusted by name.
+
+    ``inventory``: ``schema`` "ca9.agent_hooks.v1", ``hooks`` [{file, kind, event,
+    command, line}] (kind: claude_hook, claude_setting, gemini_hook, gemini_setting,
+    cursor_hook, codex_hook, vscode_task; optional matcher, label, via,
+    handler_type), ``mcp_servers`` [{file, name, command, ecosystem, package,
+    version, pinned, line}] (optional argv, transport, fetches, launcher, url), plus
+    optional ``env_overrides``, ``files``, ``errors``, ``status``
+    ("complete"|"partial") and ``truncated``.
+    """
+    from ca9.agent_config import scan_repository
+
+    try:
+        return scan_repository(repo_root)
+    except Exception as exc:
+        return {
+            "findings": [],
+            "inventory": {
+                "schema": "ca9.agent_hooks.v1",
+                "hooks": [],
+                "mcp_servers": [],
+                "env_overrides": [],
+                "files": [],
+                "errors": [{"file": ".", "reason": f"agent config scan failed: {exc}"}],
+                "status": "partial",
+                "truncated": False,
+            },
+        }
+
+
+def parse_mcp_server(
+    command: object, args: object = None, *, version: object = None
+) -> dict[str, Any] | None:
+    """Package behind an MCP server launch, and whether it is pinned.
+
+    Understands npx / npm exec / pnpm dlx / yarn dlx / bunx / bun x / uvx / uv tool
+    run / pipx run / python -m / node and other interpreters / deno / docker and
+    podman run, through ``cmd /c``, ``sh -c`` and ``env`` wrappers. Returns
+    ``ecosystem`` (npm|pypi|docker|url|local), ``package``, ``version`` (or None),
+    ``pinned`` (exact version, full git commit, or image digest) and
+    ``pinned_command``: the same argv with ``version`` inserted when the caller
+    passes an exact ``version=`` (an image digest ``sha256:...`` for docker), else
+    None. Optional keys: ``launcher``, ``fetches`` (False for local files and
+    ``python -m``, which run what is already installed), ``spec``, ``source``
+    (registry|git|url|local|installed|image). None for unusable input; never raises.
+    """
+    from ca9.agent_config import parse_launch
+
+    try:
+        return parse_launch(command, args, version=version)
+    except Exception:
+        return None
