@@ -128,9 +128,7 @@ def _review(pairs, **options):
 
 
 def _one(ecosystem, name, old, new, **options):
-    report = _review(
-        [{"ecosystem": ecosystem, "name": name, "old": old, "new": new}], **options
-    )
+    report = _review([{"ecosystem": ecosystem, "name": name, "old": old, "new": new}], **options)
     return report["results"][0], report["receipt"]
 
 
