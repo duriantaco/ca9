@@ -888,3 +888,50 @@ def _optional_string(value: object) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def review_upgrades(
+    pairs: Iterable[Mapping[str, Any]],
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Diff the old and new published artifacts of each dependency upgrade.
+
+    ``pairs``: ``[{"ecosystem": "npm"|"pypi", "name", "old", "new", "registry"?}]``.
+    Both releases are fetched from a trusted registry (digest-verified, size-capped),
+    unpacked safely and compared with deterministic static rules; package code is
+    never installed, imported or executed. Only behaviours the new release adds are
+    reported; ones present in both versions are counted in ``unchanged_risky``.
+
+    Returns ``{"results": [...], "receipt": {...}}``. Each result has ``ecosystem``,
+    ``name``, ``old``, ``new``, ``status`` (reviewed|skipped), ``reason`` (when
+    skipped), ``block`` and ``warn`` (lists of deltas). A delta is ``{"kind", "path",
+    "line", "snippet", "detail"}``. Block kinds: new_pth_code, new_sitecustomize,
+    new_install_hook, new_decode_exec, new_git_or_url_dependency,
+    ships_agent_or_editor_hook. Warn kinds: new_import_time_network,
+    new_import_time_exec, obfuscation_growth, new_native_binary, publisher_change.
+    Optional result keys: ``detail``, ``info`` (informational deltas),
+    ``unchanged_risky``, ``unchanged_risky_by_kind``, ``artifacts``, ``limitations``.
+
+    Options: ``network`` (default true), ``max_pairs`` (50), ``max_artifact_mb`` (50),
+    ``cache_dir`` (keeps verified downloads; a temporary directory otherwise),
+    ``trusted_registries``, ``private_registries``, ``internal_packages`` (never looked
+    up on a public registry). Never raises: bad input is skipped with a reason and
+    counted in the receipt, whose ``complete`` is false when anything was not reviewed.
+    """
+    from ca9.review.upgrades import review_upgrades as _review_upgrade_pairs
+
+    try:
+        return _review_upgrade_pairs(pairs, options)
+    except Exception as exc:
+        return {
+            "results": [],
+            "receipt": {
+                "schema": "ca9.upgrade_review.v1",
+                "pairs": 0,
+                "reviewed": 0,
+                "skipped": [{"reason": "review_error", "count": 1}],
+                "complete": False,
+                "error": f"{type(exc).__name__}: {exc}"[:300],
+            },
+        }

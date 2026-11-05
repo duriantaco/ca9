@@ -124,6 +124,10 @@ class _UntrustedArtifactURL(ValueError):
     """The artifact location is outside the fetch policy, so nothing was requested."""
 
 
+class RegistryDocumentNotFound(ValueError):
+    """The registry answered 404 or 410: the release or project is not published there."""
+
+
 class _BlockedRedirect(urllib.error.URLError):
     pass
 
@@ -227,7 +231,11 @@ def _collect_pypi_release(
     _collect_one(package, selection.artifact, config, state)
 
 
-def _fetch_registry_json(url: str, config: ArtifactScanConfig) -> bytes:
+def _fetch_registry_json(
+    url: str,
+    config: ArtifactScanConfig,
+    accept: str = "application/json",
+) -> bytes:
     """Fetch bounded registry metadata under the same URL policy as artifacts."""
     policy = _URLPolicy.from_config(config)
     rejection = policy.rejection(url)
@@ -235,7 +243,7 @@ def _fetch_registry_json(url: str, config: ArtifactScanConfig) -> bytes:
         raise _UntrustedArtifactURL(rejection)
     request = urllib.request.Request(
         url,
-        headers={"Accept": "application/json", "User-Agent": "ca9-artifact-scanner"},
+        headers={"Accept": accept, "User-Agent": "ca9-artifact-scanner"},
     )
     try:
         with policy.opener().open(request, timeout=30) as response:
@@ -246,6 +254,8 @@ def _fetch_registry_json(url: str, config: ArtifactScanConfig) -> bytes:
     except _BlockedRedirect as exc:
         raise _UntrustedArtifactURL(str(exc.reason)) from None
     except urllib.error.HTTPError as exc:
+        if exc.code in (404, 410):
+            raise RegistryDocumentNotFound(f"HTTP {exc.code} from {_display_url(url)}") from None
         raise ValueError(f"HTTP {exc.code} from {_display_url(url)}") from None
     except urllib.error.URLError as exc:
         raise ValueError(f"cannot reach {_display_url(url)}: {exc.reason}") from None
