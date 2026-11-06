@@ -888,3 +888,54 @@ def _optional_string(value: object) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+_CI_INVENTORY_SCHEMA = "ca9.ci_inventory.v1"
+
+
+def ci_inventory(repo_root: str | PurePath, *, max_jobs: int = 500) -> dict[str, Any]:
+    """What each CI job can install, run, reach and publish (``ca9.ci_inventory.v1``).
+
+    Covers GitHub Actions workflows (with local composite actions and local
+    reusable workflows) and ``.gitlab-ci.yml`` with local includes. Records names
+    only: secret names, never values; download hosts, never URLs or credentials.
+    ``status`` is complete, partial (some files unreadable, listed in ``skipped``)
+    or yaml_unavailable (PyYAML missing). ``truncated`` is true when ``max_jobs``
+    or a per-list cap cut the output. Never raises.
+    """
+    try:
+        from ca9.ci.inventory import build_inventory
+
+        inventory, _ = build_inventory(repo_root, max_jobs=max_jobs)
+    except Exception as exc:
+        return {
+            "schema": _CI_INVENTORY_SCHEMA,
+            "status": "partial",
+            "truncated": False,
+            "workflows": [],
+            "skipped": [{"file": ".", "reason": f"error:{type(exc).__name__}"}],
+        }
+    return inventory
+
+
+def audit_workflows(repo_root: str | PurePath) -> dict[str, Any]:
+    """Publish-job rules: ``{"findings": [finding dict], "receipt": {...}}``.
+
+    Signal types: unpinned_tool_in_credentialed_job, unverified_download_into_publish,
+    oidc_publish_without_environment, publish_on_dispatch_or_any_branch. Findings use
+    the package finding shape with ``ecosystem`` github-actions|gitlab-ci, ``name``
+    the job id (or workflow file) and ``version`` None. Never raises.
+    """
+    try:
+        from ca9.ci.audit import audit_repository
+
+        return audit_repository(repo_root)
+    except Exception as exc:
+        return {
+            "findings": [],
+            "receipt": {
+                "status": "partial",
+                "complete": False,
+                "skipped": [{"file": ".", "reason": f"error:{type(exc).__name__}"}],
+            },
+        }
