@@ -467,3 +467,119 @@ jobs:
         (C, "publish.yml", "publish"),
         (D, "publish.yml", ".github/workflows/publish.yml"),
     }
+
+
+R = "credentials_to_remote_reusable_workflow"
+
+
+def _quoted(condition: str) -> str:
+    return "'" + condition.replace("'", "''") + "'"
+
+
+@pytest.mark.parametrize(
+    ("condition", "fires"),
+    [
+        ("${{ !(github.ref == 'refs/heads/main') }}", True),
+        ("github.ref != 'refs/heads/main'", True),
+        ("!(github.ref != 'refs/heads/main')", False),
+        ("github.ref_name == 'main'", True),
+        ("startsWith(github.ref, 'refs/heads/') && github.ref_name == 'main'", False),
+        ("github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'", False),
+        ("${{ github.ref == 'refs/heads/main' }} && true", True),
+        ('github.ref == "refs/heads/main"', True),
+    ],
+)
+def test_only_conditions_that_prove_the_release_branch_silence_dispatch(tmp_path, condition, fires):
+    workflow = _publish_job(job_extra=f"    if: {_quoted(condition)}\n")
+
+    findings = _by_signal(_repo(tmp_path, {"release.yml": workflow}), D)
+
+    assert len(findings) == int(fires)
+
+
+@pytest.mark.parametrize(
+    ("on", "condition", "fires"),
+    [
+        ("on: repository_dispatch", None, True),
+        ("on: pull_request_target", None, True),
+        ("on: pull_request_target", "github.ref == 'refs/heads/main'", True),
+        ("on: issue_comment", None, True),
+        (
+            "on:\n  push:\n    branches: [main]\n  pull_request_target:",
+            "github.event_name != 'pull_request_target'",
+            False,
+        ),
+    ],
+)
+def test_publish_jobs_started_by_outside_events_report(tmp_path, on, condition, fires):
+    extra = ""
+    if condition:
+        extra = f"    if: {_quoted(condition)}\n"
+    workflow = _publish_job(on=on, job_extra=extra)
+
+    findings = _by_signal(_repo(tmp_path, {"release.yml": workflow}), D)
+
+    assert [item["severity"] for item in findings] == ["HIGH"] * int(fires)
+
+
+def _remote_caller(ref: str, extra: str) -> str:
+    return f"""
+on:
+  push:
+    branches: [main]
+jobs:
+  release:
+{extra}    uses: org/shared/.github/workflows/release.yml@{ref}
+"""
+
+
+@pytest.mark.parametrize(
+    ("ref", "extra", "handed"),
+    [
+        ("main", "    secrets: inherit\n", ["all secrets (secrets: inherit)"]),
+        (SHA, "    secrets: inherit\n", ["all secrets (secrets: inherit)"]),
+        ("v1", "    permissions:\n      id-token: write\n", ["id-token: write"]),
+        ("v1", "    secrets:\n      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}\n", ["NPM_TOKEN"]),
+    ],
+)
+def test_credentials_handed_to_a_remote_reusable_workflow_are_an_explicit_unknown(
+    tmp_path, ref, extra, handed
+):
+    repo = _repo(tmp_path, {"release.yml": _remote_caller(ref, extra)})
+
+    result = api.audit_workflows(repo)
+    job = api.ci_inventory(repo)["workflows"][0]["jobs"][0]
+    findings = [item for item in result["findings"] if item["signal_type"] == R]
+
+    assert [(item["action"], item["evidence"]["credentials"]) for item in findings] == [
+        ("investigate", handed)
+    ]
+    assert findings[0]["evidence"]["pinned"] is (ref == SHA)
+    assert job["remote_reusable"] is True
+    assert result["receipt"]["complete"] is False
+    assert result["receipt"]["incomplete_reasons"] == ["remote_reusable_workflow"]
+
+
+def test_remote_call_without_credentials_is_still_unknown_but_local_calls_are_not(tmp_path):
+    remote = _repo(tmp_path / "remote", {"lint.yml": _remote_caller("v1", "")})
+    local = _repo(
+        tmp_path / "local",
+        {
+            "ci.yml": "on: push\njobs:\n  call:\n    uses: ./.github/workflows/lint.yml\n",
+            "lint.yml": "on: workflow_call\njobs:\n  lint:\n    runs-on: ubuntu-latest\n"
+            "    steps:\n      - run: echo lint\n",
+        },
+    )
+
+    remote_result = api.audit_workflows(remote)
+    local_result = api.audit_workflows(local)
+    local_jobs = [job for wf in api.ci_inventory(local)["workflows"] for job in wf["jobs"]]
+
+    assert remote_result["findings"] == []
+    assert remote_result["receipt"]["complete"] is False
+    assert (
+        remote_result["receipt"]["unknowns"][0]["uses"]
+        == "org/shared/.github/workflows/release.yml@v1"
+    )
+    assert local_result["receipt"]["complete"] is True
+    assert {job["remote_reusable"] for job in local_jobs} == {False}

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ca9.ci import jobs as jobtools
+from ca9.ci.conditions import NOTHING, condition_facts
 from ca9.ci.model import ActionRef, Job, Origin, Publish, Tool, Workflow
 from ca9.ci.shell import ScriptFacts, ShellContext, scan_script
 from ca9.ci.yamlload import (
@@ -389,7 +390,7 @@ class _JobBuilder:
         self.facts = ScriptFacts()
         self.contexts: dict[tuple[int, ...], str] = {}
         self.base_env = {**_literal_env(workflow_env), **_literal_env(node.get("env"))}
-        self.step_guards: dict[tuple[int, ...], bool] = {}
+        self.step_facts: dict[tuple[int, ...], frozenset[tuple[str, ...]]] = {}
 
     def context(self, step_env: dict[str, str], inputs: dict[str, str]) -> ShellContext:
         return ShellContext(
@@ -463,7 +464,7 @@ class _JobBuilder:
                     for script, script_line in _matrix_scripts(self.node):
                         self.scan(script, script_line, context, order, origin_file, line)
             if not base:
-                self.step_guards[order] = jobtools.ref_guarded(step.get("if"))
+                self.step_facts[order] = condition_facts(step.get("if"))
 
     def scan(
         self,
@@ -740,6 +741,7 @@ def _job(
         else:
             name, _, ref = target.partition("@")
             owner = name.split("/", 1)[0].lower()
+            job.remote_reusable = True
             job.actions.append(
                 ActionRef(
                     name,
@@ -753,12 +755,10 @@ def _job(
     builder = _JobBuilder(repo_root, job, node, document, workflow_env, project)
     builder.steps(node.get("steps"), (), visits)
     jobtools.finalize(job, builder.facts, builder.contexts)
-    step_publishes = [
-        publish for publish in job.publishes if publish.via not in {"credential", "manual_oidc"}
-    ]
-    job.ref_guarded = jobtools.ref_guarded(node.get("if")) or (
-        bool(step_publishes)
-        and len(step_publishes) == len(job.publishes)
-        and all(builder.step_guards.get(publish.order[:1], False) for publish in step_publishes)
-    )
+    job_facts = condition_facts(node.get("if"))
+    for publish in job.publishes:
+        facts = job_facts
+        if publish.via not in {"credential", "manual_oidc"}:
+            facts = job_facts | builder.step_facts.get(publish.order[:1], NOTHING)
+        job.publish_guards.append(facts)
     return job
