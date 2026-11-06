@@ -3,8 +3,9 @@
 Accepts what VS Code, Cursor and Gemini accept (``//`` and ``/* */`` comments,
 trailing commas, a byte-order mark, raw control characters inside strings) so a
 file an editor would load is never skipped. Iterative, so deep nesting cannot
-exhaust the Python stack. Duplicate keys merge objects and lists and otherwise
-keep the last value, which is what ``JSON.parse`` keeps.
+exhaust the Python stack. A duplicate key keeps only its last value, as
+``JSON.parse`` does, and is recorded in ``Document.duplicates`` so callers can
+report the ambiguity.
 """
 
 from __future__ import annotations
@@ -51,10 +52,18 @@ class LineList(list):
         self.offsets: list[int] = []
 
 
+class Duplicate:
+    def __init__(self, path: str, first: int, last: int) -> None:
+        self.path = path
+        self.first = first
+        self.last = last
+
+
 class Document:
-    def __init__(self, text: str, value: Any) -> None:
+    def __init__(self, text: str, value: Any, duplicates: list[Duplicate]) -> None:
         self.text = text
         self.value = value
+        self.duplicates = duplicates
         self._newlines = [match.start() for match in re.finditer("\n", text)]
 
     def line(self, offset: int | None) -> int:
@@ -70,7 +79,8 @@ class Document:
 
 
 def parse(text: str) -> Document:
-    return Document(text, _parse_value(text))
+    duplicates: list[Duplicate] = []
+    return Document(text, _parse_value(text, duplicates), duplicates)
 
 
 def _tokens(text: str):
@@ -97,42 +107,41 @@ def _scalar(kind: str, raw: str, offset: int) -> Any:
     return _LITERALS[raw]
 
 
-def _merge(old: Any, new: Any) -> Any:
-    if isinstance(old, LineDict) and isinstance(new, LineDict):
-        for key, value in new.items():
-            if key in old:
-                old[key] = _merge(old[key], value)
-            else:
-                old[key] = value
-            old.offsets[key] = new.offsets[key]
-        return old
-    if isinstance(old, LineList) and isinstance(new, LineList):
-        old.extend(new)
-        old.offsets.extend(new.offsets)
-        return old
-    return new
+def _join(path: str, key: Any) -> str:
+    if isinstance(key, int):
+        return f"{path}[{key}]"
+    if path:
+        return f"{path}.{key}"
+    return str(key)
 
 
-def _attach(stack: list[list[Any]], value: Any, offset: int) -> bool:
+def _child_path(stack: list[list[Any]]) -> str:
+    if not stack:
+        return ""
+    frame = stack[-1]
+    if isinstance(frame[0], LineDict):
+        return _join(frame[4], frame[2])
+    return _join(frame[4], len(frame[0]))
+
+
+def _attach(stack: list[list[Any]], value: Any, offset: int, duplicates: list[Duplicate]) -> None:
     frame = stack[-1]
     container = frame[0]
     if isinstance(container, LineDict):
         key = frame[2]
         if key in container:
-            container[key] = _merge(container[key], value)
-        else:
-            container[key] = value
+            duplicates.append(Duplicate(_join(frame[4], key), container.offsets[key], offset))
+        container[key] = value
         container.offsets[key] = offset
         frame[1] = "comma"
         frame[2] = None
-        return False
+        return
     container.append(value)
     container.offsets.append(offset)
     frame[1] = "comma"
-    return False
 
 
-def _parse_value(text: str) -> Any:
+def _parse_value(text: str, duplicates: list[Duplicate]) -> Any:
     stack: list[list[Any]] = []
     root: Any = None
     have_root = False
@@ -159,7 +168,7 @@ def _parse_value(text: str) -> Any:
                     raise JsoncError("missing value", offset)
                 stack.pop()
                 if stack:
-                    _attach(stack, container, frame[3])
+                    _attach(stack, container, frame[3], duplicates)
                 else:
                     root, have_root = container, True
                 continue
@@ -181,13 +190,13 @@ def _parse_value(text: str) -> Any:
             container = LineList()
             if raw == "{":
                 container = LineDict()
-            stack.append([container, "first", None, offset])
+            stack.append([container, "first", None, offset, _child_path(stack)])
             continue
         if kind == "punct":
             raise JsoncError(f"unexpected {raw}", offset)
         value = _scalar(kind, raw, offset)
         if stack:
-            _attach(stack, value, offset)
+            _attach(stack, value, offset, duplicates)
         else:
             root, have_root = value, True
     if stack or not have_root:

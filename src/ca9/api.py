@@ -984,9 +984,18 @@ def hardening_settings(repo_root: str | Path) -> dict[str, Any]:
     [{file, uses, ref, pinned, line}] and ``truncated``. ``sources``: setting key to
     the file it came from. Optional: ``cooldown_minutes`` (each cooldown in minutes;
     None when unset or an absolute date), ``exclusions`` (manager -> packages that skip
-    the cooldown), ``dependabot`` [{ecosystem, directory, default_days}], ``managers``
-    (from package.json ``packageManager``), ``renovate_presets``, ``errors``, ``status``.
-    Never raises.
+    the cooldown), ``dependabot`` [{ecosystem, directory, directories, default_days}],
+    ``managers`` (package.json ``packageManager``, ``devEngines`` or ``engines``),
+    ``renovate_presets``, ``renovate_rules`` [{match, all, minimum_release_age}] for
+    packageRules that set an age, ``ignored`` [{setting, file, reason}] for settings the
+    declared tool version does not read (pnpm 11 ignores pnpm keys in .npmrc and the
+    removed onlyBuiltDependencies / neverBuiltDependencies), ``scripts`` keys
+    ``pnpm_never_built_dependencies`` and ``workflow_overrides`` [{file, line, setting,
+    value}] (workflow or composite-action lines that turn install scripts back on, such as
+    ``npm_config_ignore_scripts: false`` or ``YARN_ENABLE_SCRIPTS=true``), ``errors``,
+    ``status``. Actions are read with the YAML parser when available (flow style and
+    anchors included) and local composite actions referenced by ``uses: ./...`` are
+    followed. Never raises.
     """
     from ca9.hardening import SCHEMA, settings
 
@@ -1012,13 +1021,17 @@ def hardening_regressions(base: object, head: object) -> list[dict[str, Any]]:
     ``base``, ``head`` and, for per-package items, ``package`` (and ``line`` for
     actions). Kinds: cooldown_removed, cooldown_lowered (compared in minutes across
     units; a removal that falls back to an equal or longer default such as pnpm 11's
-    1440 minutes or Dependabot's 3 days is not reported), cooldown_exclusion_added,
-    ignore_scripts_disabled, allow_builds_added (pnpm allowBuilds /
-    onlyBuiltDependencies / dangerouslyAllowAllBuilds, Bun trustedDependencies),
-    allow_scripts_added (npm allowScripts), strict_dep_builds_disabled,
-    action_unpinned (an action pinned to a SHA in base used at a tag or branch in
-    head). Exceptions are the caller's to apply. Never raises: an internal error
-    returns one ``check_failed`` item so a gate does not read it as "no regressions".
+    1440 minutes or Dependabot's 3 days is not reported; Renovate packageRules and
+    Dependabot entries are matched by the packages and directories they cover),
+    cooldown_exclusion_added, ignore_scripts_disabled (including new workflow
+    overrides), allow_builds_added (pnpm allowBuilds / onlyBuiltDependencies /
+    dangerouslyAllowAllBuilds, entries removed from neverBuiltDependencies, Bun
+    trustedDependencies), allow_scripts_added (npm allowScripts),
+    strict_dep_builds_disabled, action_unpinned (an action pinned to a SHA in base, owner
+    and repo compared case-insensitively, used at a tag or branch in head), and
+    check_failed (with ``side``) for a side that is missing, not a snapshot, or was only
+    partly read; a missing or unreadable side returns only check_failed items, never an
+    empty list. Exceptions are the caller's to apply. Never raises.
     """
     from ca9.hardening import regressions
 

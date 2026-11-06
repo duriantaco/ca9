@@ -22,6 +22,7 @@ MAX_FILE_BYTES = 32 * 1024 * 1024
 TAIL_BYTES = 1024 * 1024
 MAX_WALK_ENTRIES = 200_000
 MAX_ITEMS = 500
+MAX_DUPLICATES = 50
 
 _SKIP_DIRS = frozenset(
     {
@@ -137,6 +138,7 @@ class FileResult:
     servers: list[Server] = field(default_factory=list)
     env_overrides: list[EnvOverride] = field(default_factory=list)
     errors: list[dict[str, str]] = field(default_factory=list)
+    duplicates: list[dict[str, Any]] = field(default_factory=list)
 
 
 def role_for(path: str | Path) -> str | None:
@@ -203,6 +205,15 @@ def analyze_text(rel_path: str, text: str, *, truncated: bool = False) -> FileRe
         result.errors.append({"file": rel_path, "reason": f"could not parse: {exc}"})
         _salvage(rel_path, role, text, result)
         return result
+    for duplicate in document.duplicates[:MAX_DUPLICATES]:
+        result.duplicates.append(
+            {
+                "file": rel_path,
+                "key": duplicate.path,
+                "line": document.line(duplicate.last),
+                "first_line": document.line(duplicate.first),
+            }
+        )
     value = document.value
     if not isinstance(value, jsonc.LineDict):
         return result
@@ -245,6 +256,8 @@ def scan_repository(repo_root: str | Path) -> dict[str, Any]:
         "errors": [],
         "status": "complete",
         "truncated": False,
+        "duplicate_keys": False,
+        "duplicates": [],
     }
     findings: list[dict[str, Any]] = []
     try:
@@ -777,7 +790,27 @@ def _findings_for(result: FileResult) -> list[dict[str, Any]]:
         findings.extend(_server_findings(server))
     for override in result.env_overrides:
         findings.append(_override_finding(override))
+    for duplicate in result.duplicates:
+        findings.append(_duplicate_finding(duplicate))
     return findings
+
+
+def _duplicate_finding(duplicate: dict[str, Any]) -> dict[str, Any]:
+    key = duplicate["key"]
+    return _finding(
+        "agent_config_ambiguous",
+        "MEDIUM",
+        "investigate",
+        key,
+        f"{duplicate['file']} defines {key} more than once",
+        f"{key} appears at lines {duplicate['first_line']} and {duplicate['line']}. Agents and "
+        f"editors keep the last value, so a reviewer reading the first one sees a different "
+        f"command than the one that runs. Only the last value was checked.",
+        "Remove the duplicate key so the file has one unambiguous value.",
+        {"key": key, "first_line": duplicate["first_line"], "last_line": duplicate["line"]},
+        duplicate["file"],
+        duplicate["line"],
+    )
 
 
 def _finding(
@@ -1033,6 +1066,19 @@ def _override_finding(override: EnvOverride) -> dict[str, Any]:
 
 
 def _add_inventory(inventory: dict[str, Any], result: FileResult) -> None:
+    ambiguous = bool(result.duplicates)
+    if ambiguous:
+        inventory["duplicate_keys"] = True
+        inventory["duplicates"].extend(result.duplicates)
+    first_hook = len(inventory["hooks"])
+    first_server = len(inventory["mcp_servers"])
+    _add_entries(inventory, result)
+    if ambiguous:
+        for entry in inventory["hooks"][first_hook:] + inventory["mcp_servers"][first_server:]:
+            entry["duplicate_keys"] = True
+
+
+def _add_entries(inventory: dict[str, Any], result: FileResult) -> None:
     for hook in result.hooks:
         if len(inventory["hooks"]) >= MAX_ITEMS:
             inventory["truncated"] = True
