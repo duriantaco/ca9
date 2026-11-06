@@ -1,0 +1,10 @@
+{
+  "name": "@nx/nx-source",
+  "packageManager": "pnpm@10.11.1",
+  "scripts": {
+    "nx-release": "nx nx-release @nx/nx-source --parallel 8"
+  },
+  "devDependencies": {
+    "ts-node": "10.9.1"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "subql-mono",
+  "packageManager": "yarn@4.10.3",
+  "scripts": {},
+  "devDependencies": {
+    "ts-node": "^10.9.2"
+  }
+}
