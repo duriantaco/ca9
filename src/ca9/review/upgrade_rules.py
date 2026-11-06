@@ -133,6 +133,14 @@ _JS_EXEC_MODULES = frozenset({"child_process", "vm"})
 _JS_NETWORK_MODULES = frozenset({"http", "https", "net", "tls", "dgram", "dns", "http2"})
 _JS_BINDING_RE = re.compile(r"\bprocess\s*\.\s*(?:binding|_linkedBinding|dlopen)\s*\(")
 _OBFUSCATED_IDENT_RE = re.compile(r"\b_0x[0-9a-f]{4,6}\b")
+_JS_DECODE_HINT = re.compile(
+    r"Buffer\.from\s*\([^;]{0,200}?['\"](?:base64|hex)['\"]|\batob\s*\(|"
+    r"String\.fromCharCode\s*\("
+)
+_JS_DECODED_SINK_RE = re.compile(
+    r"(?<![\w$])(?P<sink>require|import|eval|Function|execSync|exec|spawnSync|spawn|execFile)"
+    r"\s*\(\s*(?P<decoder>[A-Za-z_$][\w$]*)\s*\(\s*['\"`]"
+)
 _HEX_ESCAPE_RE = re.compile(r"\\x[0-9a-fA-F]{2}")
 _BLOB_RE = re.compile(r"[A-Za-z0-9+/=_-]{10000,}")
 _PY_EXEC_NAMES = frozenset({"exec", "eval", "execfile"})
@@ -1450,6 +1458,8 @@ def _file_code_behaviours(side: _Side, path: str) -> list[Behaviour]:
     behaviours: list[Behaviour] = []
     if lowered.endswith(_JS_SUFFIXES + (".py",)):
         behaviours.extend(_obfuscation_behaviours(side, path))
+    if lowered.endswith(_JS_SUFFIXES):
+        behaviours.extend(_decoded_sink_behaviours(side, path))
     if side.ecosystem != "pypi" or not lowered.endswith(".py"):
         return behaviours
     text = side.text(path)
@@ -1484,6 +1494,73 @@ def _file_code_behaviours(side: _Side, path: str) -> list[Behaviour]:
             )
         )
     return behaviours
+
+
+def _decoded_sink_behaviours(side: _Side, path: str) -> list[Behaviour]:
+    """A module load, eval or process call fed by a local decoder of a string literal.
+
+    ``require(_d('...'))`` where ``_d`` is defined in the same file and decodes base64,
+    hex or character codes hides which module or command runs; benign code names its
+    modules and commands directly.
+    """
+    text = side.text(path)
+    if text is None or not _JS_DECODE_HINT.search(text):
+        return []
+    for match in _JS_DECODED_SINK_RE.finditer(text):
+        name = match.group("decoder")
+        if not _is_local_decoder(text, name):
+            continue
+        line, snippet = pc._line_snippet(text, match.start())
+        return [
+            Behaviour(
+                "new_decode_exec",
+                ("decoded-sink", path),
+                path,
+                line,
+                snippet,
+                f"{match.group('sink')} receives a value decoded by local function {name}",
+                "block",
+            )
+        ]
+    return []
+
+
+def _is_local_decoder(text: str, name: str) -> bool:
+    escaped = re.escape(name)
+    definition = re.compile(
+        rf"function\s+{escaped}\s*(?=\()|(?<![\w$.]){escaped}\s*=\s*(?=function\b|\(|[\w$]+\s*=>)"
+    )
+    for found in definition.finditer(text):
+        if _JS_DECODE_HINT.search(_function_body(text, found.end())):
+            return True
+    return False
+
+
+def _function_body(text: str, start: int, limit: int = 2000) -> str:
+    """The braced body (or arrow expression) that follows a definition, bounded."""
+    window = text[start : start + limit]
+    brace = window.find("{")
+    arrow = window.find("=>")
+    if arrow >= 0 and (brace < 0 or arrow < brace):
+        rest = window[arrow + 2 :].lstrip()
+        if not rest.startswith("{"):
+            end = re.search(r"[;\n]", rest)
+            if end is None:
+                return rest
+            return rest[: end.start()]
+        brace = window.find("{", arrow)
+    if brace < 0:
+        return ""
+    depth = 0
+    for index in range(brace, len(window)):
+        char = window[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return window[brace : index + 1]
+    return window[brace:]
 
 
 def _obfuscation_behaviours(side: _Side, path: str) -> list[Behaviour]:

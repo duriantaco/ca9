@@ -545,8 +545,31 @@ def test_new_npm_package_install_hook_warns_but_obfuscated_dropper_blocks(regist
         manifest={"scripts": {"postinstall": "node setup.js"}},
     )
 
+    registry.npm(
+        "plain-helper",
+        "4.2.1",
+        {
+            "index.js": "module.exports = 1;\n",
+            "setup.js": (
+                "function _d(s) {\n"
+                "  const b = Buffer.from(s.split('').reverse().join(''), 'base64').toString();\n"
+                "  return b.split('').map((c) => String.fromCharCode(c.charCodeAt(0) ^ 7)).join('');\n"
+                "}\n"
+                "const cp = require(_d('==Abh5mbktmZ'));\n"
+                "cp.exec('true');\n"
+            ),
+            "lib/load.js": (
+                "function plugin(name) { return './plugins/' + name; }\n"
+                "const icon = Buffer.from('aGk=', 'base64');\n"
+                "module.exports = require(plugin('core'));\n"
+            ),
+        },
+        manifest={"scripts": {"postinstall": "node setup.js"}},
+    )
+
     benign = _new("npm", "fastbuild", "1.0.0")
     dropper = _new("npm", "plain-crypto", "4.2.1")
+    helper = _new("npm", "plain-helper", "4.2.1")
 
     assert benign["basis"] == "new_package" and benign["old"] is None
     assert benign["block"] == []
@@ -554,6 +577,8 @@ def test_new_npm_package_install_hook_warns_but_obfuscated_dropper_blocks(regist
     assert dropper["basis"] == "new_package"
     assert _kinds(dropper, "block") == ["new_decode_exec"]
     assert "new_install_hook" in _kinds(dropper, "warn")
+    assert _kinds(helper, "block") == ["new_decode_exec"]
+    assert [delta["path"] for delta in helper["block"]] == ["setup.js"]
 
 
 def test_new_pypi_package_blocks_only_high_signal_startup_code(registry):
