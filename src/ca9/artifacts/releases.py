@@ -1,0 +1,469 @@
+"""Registry metadata for one published release: which file to fetch and who published it.
+
+Upgrade review compares two releases of a package, so both sides must be the
+same kind of file. npm has one tarball per version. PyPI releases list several
+files; the comparable pair is a pure-Python wheel when both releases have one,
+else wheels for the same platform (what most installs use), else the sdists.
+Every document is fetched through the artifact URL policy and size caps.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import quote, urljoin, urlsplit
+
+from packaging.utils import (
+    InvalidSdistFilename,
+    InvalidWheelFilename,
+    canonicalize_name,
+    parse_sdist_filename,
+    parse_wheel_filename,
+)
+from packaging.version import InvalidVersion, Version
+
+from ca9.artifacts import fetch
+from ca9.artifacts.pypi import parse_release_document, release_json_url
+
+NPM_PUBLIC_REGISTRY = "https://registry.npmjs.org"
+NPM_REGISTRY_ALIASES = frozenset({"https://registry.npmjs.org", "https://registry.yarnpkg.com"})
+PYPI_PUBLIC_INDEXES = frozenset(
+    {"https://pypi.org", "https://pypi.org/simple", "https://pypi.python.org/simple"}
+)
+PYPI_SIMPLE_JSON = "application/vnd.pypi.simple.v1+json"
+_SRI = re.compile(r"(sha256|sha384|sha512)-([A-Za-z0-9+/]+={0,2})\Z")
+_SHA1_HEX = re.compile(r"[0-9a-f]{40}\Z")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+_NPM_NAME = re.compile(r"(?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*\Z")
+_PLATFORM_RANK = (
+    ("manylinux", "x86_64"),
+    ("linux", "x86_64"),
+    ("musllinux", "x86_64"),
+    ("macosx", "arm64"),
+    ("macosx", "x86_64"),
+    ("macosx", "universal2"),
+    ("win", "amd64"),
+    ("manylinux", "aarch64"),
+)
+
+
+class ReleaseUnavailable(ValueError):
+    """The registry does not publish this release (removed, never published, or 404)."""
+
+
+class ReleaseMetadataError(ValueError):
+    """Registry metadata exists but cannot be used for a verified fetch."""
+
+
+@dataclass(frozen=True)
+class ReleaseFile:
+    kind: str
+    filename: str
+    url: str
+    hash: str
+    size: int | None = None
+    basis: str = ""
+    publisher: dict[str, Any] = field(default_factory=dict)
+
+    def describe(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"kind": self.kind, "filename": self.filename}
+        if self.size is not None:
+            result["size"] = self.size
+        algorithm = self.hash.split(":", 1)[0].split("-", 1)[0]
+        result["hash_algorithm"] = algorithm
+        return result
+
+
+def npm_registry_base(registry: str | None) -> str:
+    if not registry:
+        return NPM_PUBLIC_REGISTRY
+    base = registry.strip().rstrip("/")
+    if base.lower() in NPM_REGISTRY_ALIASES:
+        return NPM_PUBLIC_REGISTRY
+    return base
+
+
+def is_public_registry(ecosystem: str, registry: str | None) -> bool:
+    if not registry:
+        return True
+    base = registry.strip().rstrip("/").lower()
+    if ecosystem == "npm":
+        return base in NPM_REGISTRY_ALIASES
+    return base in PYPI_PUBLIC_INDEXES
+
+
+def npm_release(
+    name: str,
+    version: str,
+    registry: str | None,
+    config: fetch.ArtifactScanConfig,
+) -> ReleaseFile:
+    """Tarball, digest and publisher of one npm version, from the version document."""
+    if not _NPM_NAME.fullmatch(name.lower()):
+        raise ReleaseMetadataError("invalid npm package name")
+    base = npm_registry_base(registry)
+    url = f"{base}/{quote(name, safe='@')}/{quote(version, safe='')}"
+    document = _registry_document(url, config)
+    if str(document.get("name", "")).lower() != name.lower():
+        raise ReleaseMetadataError("registry document names a different package")
+    if document.get("version") != version:
+        raise ReleaseMetadataError("registry document names a different version")
+    dist = document.get("dist")
+    if not isinstance(dist, dict):
+        raise ReleaseMetadataError("registry document has no dist record")
+    tarball = dist.get("tarball")
+    if not isinstance(tarball, str) or urlsplit(tarball).scheme.lower() != "https":
+        raise ReleaseMetadataError("registry document has no HTTPS tarball URL")
+    digest = _npm_digest(dist)
+    if digest is None:
+        raise ReleaseMetadataError("registry document has no usable tarball digest")
+    filename = tarball.rsplit("/", 1)[-1] or f"{name}-{version}.tgz"
+    return ReleaseFile(
+        kind="npm-tarball",
+        filename=filename,
+        url=tarball,
+        hash=digest,
+        size=None,
+        basis="npm tarball",
+        publisher=_npm_publisher(document, dist),
+    )
+
+
+def pypi_release_entries(
+    name: str,
+    version: str,
+    registry: str | None,
+    config: fetch.ArtifactScanConfig,
+) -> list[dict[str, Any]]:
+    """File entries for one PyPI release: the JSON API on pypi.org, PEP 691 elsewhere."""
+    if is_public_registry("pypi", registry):
+        url = release_json_url(name, version)
+        raw = _registry_bytes(url, config)
+        try:
+            files = parse_release_document(raw, name, version)
+        except ValueError as exc:
+            raise ReleaseMetadataError(str(exc)) from None
+        entries = [entry for entry in (_pypi_entry(item) for item in files) if entry is not None]
+    else:
+        base = (registry or "").strip().rstrip("/") + "/"
+        url = urljoin(base, f"{quote(str(canonicalize_name(name)), safe='')}/")
+        raw = _registry_bytes(url, config, PYPI_SIMPLE_JSON)
+        entries = _simple_entries(raw, name, version, url)
+    if not entries:
+        raise ReleaseUnavailable("the registry lists no files for this release")
+    return entries
+
+
+def select_pypi_pair(
+    old_entries: list[dict[str, Any]],
+    new_entries: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any], str] | None:
+    """The same kind of file on both sides: pure wheel, same-platform wheel, else sdist."""
+    old_pure = _pure_wheels(old_entries)
+    new_pure = _pure_wheels(new_entries)
+    if old_pure and new_pure:
+        return old_pure[0], new_pure[0], "pure-python wheel"
+    platform_pair = _platform_pair(old_entries, new_entries)
+    if platform_pair is not None:
+        return platform_pair
+    old_sdist = sorted(
+        (entry for entry in old_entries if entry["kind"] == "sdist"),
+        key=lambda entry: entry["filename"],
+    )
+    new_sdist = sorted(
+        (entry for entry in new_entries if entry["kind"] == "sdist"),
+        key=lambda entry: entry["filename"],
+    )
+    if old_sdist and new_sdist:
+        return old_sdist[0], new_sdist[0], "sdist"
+    return None
+
+
+def release_file(entry: dict[str, Any], basis: str) -> ReleaseFile:
+    return ReleaseFile(
+        kind=entry["kind"],
+        filename=entry["filename"],
+        url=entry["url"],
+        hash=f"sha256:{entry['sha256']}",
+        size=entry.get("size"),
+        basis=basis,
+        publisher=dict(entry.get("publisher") or {}),
+    )
+
+
+def pypi_provenance_publisher(
+    name: str,
+    version: str,
+    filename: str,
+    config: fetch.ArtifactScanConfig,
+) -> dict[str, Any] | None:
+    """The trusted publisher recorded in PyPI's PEP 740 provenance, or None when absent."""
+    url = (
+        f"https://pypi.org/integrity/{quote(str(canonicalize_name(name)), safe='')}/"
+        f"{quote(version, safe='')}/{quote(filename, safe='')}/provenance"
+    )
+    try:
+        document = _registry_document(url, config)
+    except ReleaseUnavailable:
+        return None
+    bundles = document.get("attestation_bundles")
+    if not isinstance(bundles, list):
+        return None
+    for bundle in bundles:
+        if not isinstance(bundle, dict):
+            continue
+        publisher = bundle.get("publisher")
+        if isinstance(publisher, dict):
+            return {
+                key: str(publisher[key])
+                for key in ("kind", "repository", "workflow", "environment")
+                if isinstance(publisher.get(key), str) and publisher.get(key)
+            }
+    return None
+
+
+def _registry_bytes(
+    url: str,
+    config: fetch.ArtifactScanConfig,
+    accept: str = "application/json",
+) -> bytes:
+    try:
+        if accept == "application/json":
+            return fetch._fetch_registry_json(url, config)
+        return fetch._fetch_registry_json(url, config, accept)
+    except fetch.RegistryDocumentNotFound as exc:
+        raise ReleaseUnavailable(str(exc)) from None
+
+
+def _registry_document(url: str, config: fetch.ArtifactScanConfig) -> dict[str, Any]:
+    raw = _registry_bytes(url, config)
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ReleaseMetadataError("registry metadata is not valid JSON") from None
+    if not isinstance(document, dict):
+        raise ReleaseMetadataError("registry metadata is not an object")
+    return document
+
+
+def _npm_digest(dist: dict[str, Any]) -> str | None:
+    integrity = dist.get("integrity")
+    if isinstance(integrity, str):
+        strongest: tuple[int, str] | None = None
+        for token in integrity.split():
+            match = _SRI.fullmatch(token)
+            if match is None:
+                continue
+            algorithm, encoded = match.groups()
+            try:
+                digest = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                continue
+            bits = int(algorithm[3:])
+            if len(digest) == bits // 8 and (strongest is None or bits > strongest[0]):
+                strongest = (bits, token)
+        if strongest is not None:
+            return strongest[1]
+    shasum = dist.get("shasum")
+    if isinstance(shasum, str) and _SHA1_HEX.fullmatch(shasum.lower()):
+        return f"sha1:{shasum.lower()}"
+    return None
+
+
+def _npm_publisher(document: dict[str, Any], dist: dict[str, Any]) -> dict[str, Any]:
+    user = document.get("_npmUser")
+    publisher: dict[str, Any] = {"source": "npm _npmUser"}
+    if isinstance(user, dict):
+        if isinstance(user.get("name"), str):
+            publisher["name"] = user["name"]
+        if isinstance(user.get("email"), str):
+            publisher["email"] = user["email"]
+        trusted = user.get("trustedPublisher")
+        if isinstance(trusted, dict) and trusted.get("id"):
+            publisher["trusted_publisher"] = str(trusted["id"])
+    maintainers = document.get("maintainers")
+    names = []
+    if isinstance(maintainers, list):
+        for item in maintainers:
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                names.append(item["name"])
+    publisher["maintainers"] = sorted(set(names))
+    attestations = dist.get("attestations")
+    publisher["provenance"] = isinstance(attestations, dict) and bool(
+        attestations.get("url") or attestations.get("provenance")
+    )
+    return publisher
+
+
+def _pypi_entry(item: dict[str, Any]) -> dict[str, Any] | None:
+    filename = item.get("filename")
+    url = item.get("url")
+    digests = item.get("digests")
+    if not isinstance(filename, str) or not isinstance(url, str) or not isinstance(digests, dict):
+        return None
+    packagetype = item.get("packagetype")
+    kind = None
+    if packagetype == "bdist_wheel" and filename.endswith(".whl"):
+        kind = "wheel"
+    elif packagetype == "sdist" and filename.endswith((".tar.gz", ".zip")):
+        kind = "sdist"
+    return _entry(filename, url, digests.get("sha256"), item.get("size"), kind)
+
+
+def _simple_entries(raw: bytes, name: str, version: str, base_url: str) -> list[dict[str, Any]]:
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ReleaseMetadataError("simple index response is not PEP 691 JSON") from None
+    if not isinstance(document, dict) or not isinstance(document.get("files"), list):
+        raise ReleaseMetadataError("simple index response has no file list")
+    listed = document.get("name")
+    if isinstance(listed, str) and canonicalize_name(listed) != canonicalize_name(name):
+        raise ReleaseMetadataError("simple index response names a different project")
+    entries = []
+    for item in document["files"]:
+        if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
+            continue
+        filename = item["filename"]
+        kind, file_version = _filename_release(filename, name)
+        if kind is None or file_version is None or not _same_version(file_version, version):
+            continue
+        hashes = item.get("hashes")
+        sha256 = None
+        if isinstance(hashes, dict):
+            sha256 = hashes.get("sha256")
+        url = urljoin(base_url, str(item.get("url") or ""))
+        entry = _entry(filename, url, sha256, item.get("size"), kind)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def _entry(
+    filename: str, url: str, sha256: object, size: object, kind: str | None
+) -> dict[str, Any] | None:
+    if kind is None or not isinstance(sha256, str) or not _SHA256_HEX.fullmatch(sha256.lower()):
+        return None
+    if urlsplit(url).scheme.lower() != "https":
+        return None
+    tags: frozenset = frozenset()
+    if kind == "wheel":
+        try:
+            tags = parse_wheel_filename(filename)[3]
+        except InvalidWheelFilename:
+            return None
+    if not isinstance(size, int) or isinstance(size, bool):
+        size = None
+    return {
+        "filename": filename,
+        "url": url,
+        "kind": kind,
+        "sha256": sha256.lower(),
+        "size": size,
+        "tags": tags,
+    }
+
+
+def _filename_release(filename: str, name: str) -> tuple[str | None, str | None]:
+    try:
+        if filename.endswith(".whl"):
+            wheel_name, wheel_version, _build, _tags = parse_wheel_filename(filename)
+            if wheel_name == canonicalize_name(name):
+                return "wheel", str(wheel_version)
+            return None, None
+        sdist_name, sdist_version = parse_sdist_filename(filename)
+        if sdist_name == canonicalize_name(name):
+            return "sdist", str(sdist_version)
+    except (InvalidWheelFilename, InvalidSdistFilename, InvalidVersion):
+        return None, None
+    return None, None
+
+
+def _same_version(listed: str, requested: str) -> bool:
+    if listed == requested:
+        return True
+    try:
+        return Version(listed) == Version(requested)
+    except InvalidVersion:
+        return False
+
+
+def _pure_wheels(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pure = [
+        entry
+        for entry in entries
+        if entry["kind"] == "wheel"
+        and any(
+            tag.abi == "none" and tag.platform == "any" and tag.interpreter.startswith("py3")
+            for tag in entry["tags"]
+        )
+    ]
+    return sorted(pure, key=lambda entry: entry["filename"])
+
+
+def _platform_family(platform: str) -> tuple[str, str] | None:
+    for family, arch in _PLATFORM_RANK:
+        if platform.startswith(family) and platform.endswith(arch):
+            if family == "manylinux" or (family == "linux" and platform == "linux_x86_64"):
+                return ("manylinux", arch)
+            return (family, arch)
+    return None
+
+
+def _wheel_keys(entry: dict[str, Any]) -> set[tuple[int, str, str]]:
+    keys = set()
+    for tag in entry["tags"]:
+        family = _platform_family(tag.platform)
+        if family is None:
+            continue
+        rank = _PLATFORM_RANK.index(family)
+        keys.add((rank, tag.interpreter, tag.abi))
+    return keys
+
+
+def _platform_pair(
+    old_entries: list[dict[str, Any]],
+    new_entries: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any], str] | None:
+    old_wheels = [entry for entry in old_entries if entry["kind"] == "wheel"]
+    new_wheels = [entry for entry in new_entries if entry["kind"] == "wheel"]
+    if not old_wheels or not new_wheels:
+        return None
+    exact = []
+    family_only = []
+    for new in new_wheels:
+        new_keys = _wheel_keys(new)
+        for old in old_wheels:
+            old_keys = _wheel_keys(old)
+            for key in new_keys & old_keys:
+                exact.append(
+                    (key[0], _interpreter_order(key[1], key[2]), new["filename"], old, new)
+                )
+            new_ranks = {key[0] for key in new_keys}
+            for rank in new_ranks & {key[0] for key in old_keys}:
+                family_only.append((rank, 0, new["filename"] + old["filename"], old, new))
+    for candidates, basis in ((exact, "same-platform wheel"), (family_only, "platform wheel")):
+        if candidates:
+            best = min(candidates, key=lambda item: (item[0], item[1], item[2]))
+            return best[3], best[4], basis
+    return None
+
+
+def _interpreter_order(interpreter: str, abi: str) -> tuple[int, int]:
+    """Prefer the running CPython's tag, then abi3, then the newest non-free-threaded tag."""
+    current = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    if interpreter == current and not abi.endswith("t"):
+        return (0, 0)
+    if abi == "abi3":
+        return (1, 0)
+    digits = re.sub(r"\D", "", interpreter)
+    if not digits:
+        return (3, 0)
+    if abi.endswith("t"):
+        return (3, -int(digits[:4]))
+    return (2, -int(digits[:4]))
