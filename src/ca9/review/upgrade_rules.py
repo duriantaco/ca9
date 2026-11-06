@@ -15,6 +15,7 @@ import json
 import posixpath
 import re
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
@@ -200,13 +201,22 @@ class _Entry:
     file: ArtifactFile
 
 
+class AnalysisTimeout(Exception):
+    """The review deadline passed while an artifact was being analysed."""
+
+
 class _Cache:
     """Parse results shared by both sides; identical files are analysed once."""
 
-    def __init__(self) -> None:
+    def __init__(self, deadline: float | None = None) -> None:
         self.trees: dict[str, ast.Module | None] = {}
         self.calls: dict[tuple[str, bool], list[_PyCall] | None] = {}
         self.encoded: dict[str, list[int]] = {}
+        self.deadline = deadline
+
+    def check(self) -> None:
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise AnalysisTimeout("review deadline reached during analysis")
 
 
 class _Side:
@@ -250,6 +260,7 @@ class _Side:
 
     def digest(self, path: str) -> str:
         if path not in self._hashes:
+            self.cache.check()
             digest = hashlib.sha256()
             try:
                 with self.entries[path].file.path.open("rb") as stream:
@@ -322,11 +333,57 @@ def diff_artifacts(
     old: ArtifactSnapshot,
     new: ArtifactSnapshot,
     ecosystem: str,
+    *,
+    deadline: float | None = None,
 ) -> DiffResult:
     """Behaviours of ``new`` whose identity is absent from ``old``."""
-    cache = _Cache()
+    cache = _Cache(deadline)
     before = _Side(old, ecosystem, cache)
     after = _Side(new, ecosystem, cache)
+    old_behaviours, new_behaviours, result = _collect(before, after, before.top_modules())
+    _assemble(old_behaviours, new_behaviours, result)
+    return result
+
+
+def diff_new_package(
+    new: ArtifactSnapshot,
+    ecosystem: str,
+    *,
+    deadline: float | None = None,
+) -> DiffResult:
+    """Review a newly added package on its own, against an empty baseline.
+
+    Blocks only on signals that are rare in legitimate new packages: startup .pth code
+    (tiered as for upgrades, the package's own modules counting as shipped), top-level
+    sitecustomize/usercustomize, decode-and-exec, agent/editor hook files and git/URL
+    dependencies. Install hooks, nested startup modules, import-time network or exec
+    and obfuscation are warnings; native binaries are informational.
+    """
+    cache = _Cache(deadline)
+    before = _Side(replace(new, files=()), ecosystem, cache)
+    after = _Side(new, ecosystem, cache)
+    _old, new_behaviours, result = _collect(before, after, after.top_modules())
+    _assemble([], [_new_package_level(item) for item in new_behaviours], result)
+    return result
+
+
+def _new_package_level(item: Behaviour) -> Behaviour:
+    level = item.level
+    install_hook = item.kind == "new_install_hook" and level == "block"
+    nested_startup = item.kind == "new_sitecustomize" and len(item.identity) == 2
+    if install_hook or nested_startup:
+        level = "warn"
+    elif item.kind == "new_native_binary":
+        level = "info"
+    elif item.kind == "new_dependency":
+        level = "drop"
+    return replace(item, level=level)
+
+
+def _collect(
+    before: _Side, after: _Side, baseline_modules: set[str]
+) -> tuple[list[Behaviour], list[Behaviour], DiffResult]:
+    ecosystem = after.ecosystem
     changed = _changed_paths(before, after)
     result = DiffResult()
     old_behaviours: list[Behaviour] = []
@@ -337,7 +394,7 @@ def diff_artifacts(
     ]
     if ecosystem == "pypi":
         old_behaviours.extend(_pth_behaviours(before, None))
-        new_behaviours.extend(_pth_behaviours(after, before.top_modules()))
+        new_behaviours.extend(_pth_behaviours(after, baseline_modules))
         collectors.extend(
             [
                 _startup_module_behaviours,
@@ -349,13 +406,13 @@ def diff_artifacts(
     else:
         collectors.extend([_npm_manifest_behaviours, _npm_import_time_behaviours])
     for collect in collectors:
+        after.cache.check()
         old_behaviours.extend(collect(before, result))
         new_behaviours.extend(collect(after, result))
     old_changed, new_changed = _changed_file_behaviours(before, after, changed, result)
     old_behaviours.extend(old_changed)
     new_behaviours.extend(new_changed)
-    _assemble(old_behaviours, new_behaviours, result)
-    return result
+    return old_behaviours, new_behaviours, result
 
 
 def _assemble(
@@ -375,6 +432,8 @@ def _assemble(
         if key in old_ids:
             if item.level in {"block", "warn"}:
                 result.unchanged_risky[item.kind] += 1
+            continue
+        if item.level == "drop":
             continue
         target = {"block": result.block, "warn": result.warn}.get(item.level, result.info)
         counts[(item.level, item.kind)] += 1
@@ -1100,6 +1159,7 @@ def _python_import_time_behaviours(side: _Side, result: DiffResult) -> list[Beha
     queue = list(roots)
     behaviours: list[Behaviour] = []
     while queue and len(seen) < MAX_IMPORT_MODULES:
+        side.cache.check()
         module = queue.pop(0)
         if module in seen or module not in modules:
             continue
@@ -1291,6 +1351,7 @@ def _npm_import_time_behaviours(side: _Side, result: DiffResult) -> list[Behavio
     seen: set[str] = set()
     behaviours: list[Behaviour] = []
     while queue and len(seen) < MAX_JS_REACHABLE:
+        side.cache.check()
         path = queue.pop(0)
         if path in seen or path not in side.entries:
             continue
@@ -1376,6 +1437,7 @@ def _changed_file_behaviours(
                 continue
             if side is after and after.digest(path) in old_digests:
                 continue
+            side.cache.check()
             target.extend(_file_code_behaviours(side, path))
     if before.ecosystem == "npm":
         old_list.extend(_npm_observations(before, changed, result))
@@ -1471,6 +1533,7 @@ def _npm_observations(side: _Side, changed: set[str], result: DiffResult) -> lis
         if PurePosixPath(path).name == "package.json" or path in changed:
             keep.append(file)
     reduced = replace(snapshot, files=tuple(keep))
+    side.cache.check()
     try:
         profile = inspect_snapshot(reduced)
     except (RecursionError, ValueError) as exc:

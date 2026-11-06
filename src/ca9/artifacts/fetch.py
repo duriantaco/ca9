@@ -12,11 +12,12 @@ import socket
 import stat
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,6 +47,8 @@ DEFAULT_ARTIFACT_CACHE_DIR = Path(
 DEFAULT_MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
 DEFAULT_MAX_EXTRACTED_BYTES = 250 * 1024 * 1024
 DEFAULT_MAX_EXTRACTED_FILES = 5000
+DEFAULT_REQUEST_TIMEOUT = 30.0
+_READ_CHUNK = 64 * 1024
 # Public registries whose artifact hosts are fetched without further configuration.
 DEFAULT_ARTIFACT_INDEXES = (
     "https://registry.npmjs.org",
@@ -100,6 +103,8 @@ class ArtifactScanConfig:
     resolve_pypi_artifacts: bool = False
     max_pypi_resolutions: int = DEFAULT_MAX_PYPI_RESOLUTIONS
     internal_package_patterns: tuple[str, ...] = ()
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT
+    deadline: float | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +131,10 @@ class _UntrustedArtifactURL(ValueError):
 
 class RegistryDocumentNotFound(ValueError):
     """The registry answered 404 or 410: the release or project is not published there."""
+
+
+class TransferTimeout(ValueError):
+    """A registry or artifact transfer exceeded its per-request timeout or overall deadline."""
 
 
 class _BlockedRedirect(urllib.error.URLError):
@@ -246,11 +255,18 @@ def _fetch_registry_json(
         headers={"Accept": accept, "User-Agent": "ca9-artifact-scanner"},
     )
     try:
-        with policy.opener().open(request, timeout=30) as response:
+        with policy.opener().open(request, timeout=policy.timeout(url)) as response:
             content_length = response.headers.get("Content-Length")
             if content_length and int(content_length) > MAX_PYPI_JSON_BYTES:
                 raise ValueError(f"registry metadata exceeds {MAX_PYPI_JSON_BYTES} bytes")
-            raw = response.read(MAX_PYPI_JSON_BYTES + 1)
+            parts = []
+            total = 0
+            for chunk in _read_chunks(response, policy, url):
+                parts.append(chunk)
+                total += len(chunk)
+                if total > MAX_PYPI_JSON_BYTES:
+                    break
+            raw = b"".join(parts)
     except _BlockedRedirect as exc:
         raise _UntrustedArtifactURL(str(exc.reason)) from None
     except urllib.error.HTTPError as exc:
@@ -258,7 +274,11 @@ def _fetch_registry_json(
             raise RegistryDocumentNotFound(f"HTTP {exc.code} from {_display_url(url)}") from None
         raise ValueError(f"HTTP {exc.code} from {_display_url(url)}") from None
     except urllib.error.URLError as exc:
+        if _is_timeout(exc):
+            raise TransferTimeout(f"timed out reaching {_display_url(url)}") from None
         raise ValueError(f"cannot reach {_display_url(url)}: {exc.reason}") from None
+    except TimeoutError:
+        raise TransferTimeout(f"timed out reading {_display_url(url)}") from None
     if len(raw) > MAX_PYPI_JSON_BYTES:
         raise ValueError(f"registry metadata exceeds {MAX_PYPI_JSON_BYTES} bytes")
     return raw
@@ -543,6 +563,8 @@ class _URLPolicy:
     private_hosts: frozenset[tuple[str, int]] = frozenset()
     validator: Callable[[str], bool] | None = None
     unrestricted: bool = False
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT
+    deadline: float | None = None
 
     @classmethod
     def from_config(cls, config: ArtifactScanConfig) -> _URLPolicy:
@@ -553,7 +575,23 @@ class _URLPolicy:
             private_hosts=_index_hosts(config.private_indexes),
             validator=config.url_validator,
             unrestricted=config.allow_untrusted_urls,
+            request_timeout=config.request_timeout,
+            deadline=config.deadline,
         )
+
+    def timeout(self, url: str) -> float:
+        """Socket timeout for connect and each read: the per-request cap or the time left."""
+        budget = self.request_timeout
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TransferTimeout(f"timed out before requesting {_display_url(url)}")
+            budget = min(budget, remaining)
+        return max(budget, 0.001)
+
+    def check_deadline(self, url: str) -> None:
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise TransferTimeout(f"timed out reading {_display_url(url)}: deadline reached")
 
     def __call__(self, url: str) -> bool:
         return self.rejection(url) is None
@@ -706,7 +744,7 @@ def _download_artifact(
         raise _UntrustedArtifactURL(rejection)
     request = urllib.request.Request(url, headers={"User-Agent": "ca9-artifact-scanner"})
     try:
-        with policy.opener().open(request, timeout=30) as response:
+        with policy.opener().open(request, timeout=policy.timeout(url)) as response:
             content_length = response.headers.get("Content-Length")
             if content_length and int(content_length) > max_bytes:
                 raise ValueError(
@@ -714,10 +752,7 @@ def _download_artifact(
                 )
             total = 0
             with archive_path.open("wb") as out:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
+                for chunk in _read_chunks(response, policy, url):
                     total += len(chunk)
                     if total > max_bytes:
                         raise ValueError(f"artifact is too large: exceeds {max_bytes} bytes")
@@ -730,7 +765,33 @@ def _download_artifact(
         raise
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         archive_path.unlink(missing_ok=True)
+        if _is_timeout(exc):
+            raise TransferTimeout(f"timed out downloading {_display_url(url)}") from None
         raise ValueError(f"cannot download artifact {url}: {exc}") from exc
+
+
+def _read_chunks(
+    response: http.client.HTTPResponse, policy: _URLPolicy, url: str
+) -> Iterator[bytes]:
+    """Yield response bytes one socket read at a time, stopping at the deadline.
+
+    ``read1`` returns after a single read, so a server that trickles bytes cannot
+    hold the transfer open past the deadline; each read is bounded by the socket
+    timeout set when the request was opened.
+    """
+    reader = getattr(response, "read1", None) or response.read
+    while True:
+        policy.check_deadline(url)
+        chunk = reader(_READ_CHUNK)
+        if not chunk:
+            return
+        yield chunk
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    return isinstance(getattr(exc, "reason", None), TimeoutError)
 
 
 def _verify_hash(path: Path, expected: str) -> tuple[bool, str]:

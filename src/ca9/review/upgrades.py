@@ -13,6 +13,7 @@ import http.client
 import re
 import shutil
 import tempfile
+import time
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -33,11 +34,21 @@ from ca9.artifacts.releases import (
     select_pypi_pair,
 )
 from ca9.core.models import Artifact, Inventory, Package
-from ca9.review.upgrade_rules import BLOCK_KINDS, WARN_KINDS, diff_artifacts
+from ca9.review.upgrade_rules import (
+    BLOCK_KINDS,
+    WARN_KINDS,
+    AnalysisTimeout,
+    diff_artifacts,
+    diff_new_package,
+)
 
 SCHEMA = "ca9.upgrade_review.v1"
 DEFAULT_MAX_PAIRS = 50
 DEFAULT_MAX_ARTIFACT_MB = 50
+DEFAULT_MAX_SECONDS = 120
+DEFAULT_REQUEST_TIMEOUT = 20
+NEW_PACKAGE_WARN_KINDS = (*WARN_KINDS, "new_install_hook", "new_sitecustomize")
+SDIST_LIMITATION = "sdist not compared: a payload present only in the sdist would not be seen"
 MAX_EXTRACTED_FILES = 20000
 REGISTRY_METADATA_PATH = "(registry metadata)"
 _ECOSYSTEMS = {"npm": "npm", "pypi": "pypi"}
@@ -94,6 +105,8 @@ class _Options:
     network: bool = True
     max_pairs: int = DEFAULT_MAX_PAIRS
     max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_MB * 1024 * 1024
+    max_seconds: float = DEFAULT_MAX_SECONDS
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT
     cache_dir: Path | None = None
     trusted_registries: tuple[str, ...] = ()
     private_registries: tuple[str, ...] = ()
@@ -104,7 +117,7 @@ class _Options:
 class _Pair:
     ecosystem: str
     name: str
-    old: str
+    old: str | None
     new: str
     registry: str | None
 
@@ -119,6 +132,7 @@ class _Skip(Exception):
 def review_upgrades(pairs: object, options: object = None) -> dict[str, Any]:
     receipt = _Receipt()
     active = _parse_options(options, receipt)
+    deadline = time.monotonic() + active.max_seconds
     results: list[dict[str, Any]] = []
     memo: dict[_Pair, dict[str, Any]] = {}
     work_root = active.cache_dir
@@ -129,7 +143,9 @@ def review_upgrades(pairs: object, options: object = None) -> dict[str, Any]:
     try:
         for index, raw in enumerate(_iterate(pairs, receipt)):
             receipt.pairs += 1
-            result = _review_one(index, raw, active, work_root, temporary is not None, memo)
+            result = _review_one(
+                index, raw, active, work_root, temporary is not None, memo, deadline
+            )
             if result["status"] == "skipped":
                 receipt.skipped[result["reason"]] += 1
             else:
@@ -174,6 +190,7 @@ def _review_one(
     work_root: Path,
     cleanup: bool,
     memo: dict[_Pair, dict[str, Any]],
+    deadline: float,
 ) -> dict[str, Any]:
     echo = _echo(raw)
     try:
@@ -188,8 +205,19 @@ def _review_one(
             return cached
         _check_policy(pair, options)
         if not options.network:
-            raise _Skip("network_disabled", "both artifacts must be fetched from the registry")
-        result = _review_pair(pair, options, work_root, cleanup)
+            raise _Skip("network_disabled", "artifacts must be fetched from the registry")
+        if time.monotonic() >= deadline:
+            raise _Skip("timeout", f"the {options.max_seconds:g}s review deadline was reached")
+        result = _review_pair(pair, options, work_root, cleanup, deadline)
+    except (fetch.TransferTimeout, AnalysisTimeout) as exc:
+        return {
+            **echo,
+            "status": "skipped",
+            "reason": "timeout",
+            "detail": str(exc)[:300],
+            "block": [],
+            "warn": [],
+        }
     except _Skip as skip:
         skipped = {**echo, "status": "skipped", "reason": skip.reason, "block": [], "warn": []}
         if skip.detail:
@@ -210,6 +238,8 @@ def _review_one(
 
 def _echo(raw: object) -> dict[str, Any]:
     values: dict[str, Any] = {"ecosystem": None, "name": None, "old": None, "new": None}
+    if isinstance(raw, Mapping) and "old" in raw and raw.get("old") is None:
+        values["basis"] = "new_package"
     if isinstance(raw, Mapping):
         for key in values:
             value = raw.get(key)
@@ -227,8 +257,11 @@ def _parse_pair(raw: object) -> _Pair:
     ecosystem = raw.get("ecosystem")
     if not isinstance(ecosystem, str) or ecosystem.strip().lower() not in _ECOSYSTEMS:
         raise _Skip("unsupported_ecosystem", "only npm and pypi upgrades are reviewed")
-    values = {}
-    for key in ("name", "old", "new"):
+    values: dict[str, str | None] = {"old": None}
+    keys = ("name", "old", "new")
+    if "old" in raw and raw.get("old") is None:
+        keys = ("name", "new")
+    for key in keys:
         value = raw.get(key)
         if not isinstance(value, str) or not value.strip() or len(value) > 214:
             raise _Skip("invalid_pair", f"{key} must be a non-empty string")
@@ -241,17 +274,14 @@ def _parse_pair(raw: object) -> _Pair:
     if isinstance(registry, str):
         registry = registry.strip()
     normalized = _ECOSYSTEMS[ecosystem.strip().lower()]
-    if not _NAMES[normalized].fullmatch(values["name"]):
+    name = values["name"] or ""
+    new = values["new"] or ""
+    old = values["old"]
+    if not _NAMES[normalized].fullmatch(name):
         raise _Skip("invalid_pair", f"invalid {normalized} package name")
-    if not (_VERSION.fullmatch(values["old"]) and _VERSION.fullmatch(values["new"])):
+    if not _VERSION.fullmatch(new) or (old is not None and not _VERSION.fullmatch(old)):
         raise _Skip("invalid_pair", "versions must be exact registry versions")
-    return _Pair(
-        normalized,
-        values["name"],
-        values["old"],
-        values["new"],
-        registry,
-    )
+    return _Pair(normalized, name, old, new, registry)
 
 
 def _check_policy(pair: _Pair, options: _Options) -> None:
@@ -273,7 +303,9 @@ def _check_policy(pair: _Pair, options: _Options) -> None:
         )
 
 
-def _scan_config(options: _Options, cache_dir: Path) -> fetch.ArtifactScanConfig:
+def _scan_config(
+    options: _Options, cache_dir: Path, deadline: float | None = None
+) -> fetch.ArtifactScanConfig:
     trusted = tuple(
         value
         for value in (*options.trusted_registries, *options.private_registries)
@@ -288,60 +320,119 @@ def _scan_config(options: _Options, cache_dir: Path) -> fetch.ArtifactScanConfig
             value for value in options.private_registries if value.lower().startswith("https://")
         ),
         allowed_local_roots=(),
+        request_timeout=options.request_timeout,
+        deadline=deadline,
     )
 
 
-def _review_pair(pair: _Pair, options: _Options, work_root: Path, cleanup: bool) -> dict[str, Any]:
+def _review_pair(
+    pair: _Pair, options: _Options, work_root: Path, cleanup: bool, deadline: float
+) -> dict[str, Any]:
     pair_dir = work_root
     if cleanup:
         pair_dir = Path(tempfile.mkdtemp(prefix="pair-", dir=work_root))
-    config = _scan_config(options, pair_dir)
+    config = _scan_config(options, pair_dir, deadline)
     try:
+        if pair.old is None:
+            return _review_new_package(pair, options, config, deadline)
         old_file, new_file = _release_files(pair, config)
-        for release in (old_file, new_file):
-            if release.size is not None and release.size > options.max_artifact_bytes:
-                raise _Skip(
-                    "artifact_too_large",
-                    f"{release.filename} is {release.size} bytes; max_artifact_mb is "
-                    f"{options.max_artifact_bytes // (1024 * 1024)}",
-                )
+        _check_sizes((old_file, new_file), options)
         old_snapshot, old_notes = _snapshot(pair, pair.old, old_file, config)
         new_snapshot, new_notes = _snapshot(pair, pair.new, new_file, config)
-        diff = diff_artifacts(old_snapshot, new_snapshot, pair.ecosystem)
+        diff = diff_artifacts(old_snapshot, new_snapshot, pair.ecosystem, deadline=deadline)
         warn = list(diff.warn)
         info = list(diff.info)
         publisher_warn, publisher_info = _publisher_deltas(pair, old_file, new_file)
         warn.extend(publisher_warn)
         info.extend(publisher_info)
-        block = sorted(
-            (item for item in diff.block if item["kind"] in BLOCK_KINDS), key=_delta_order
-        )
-        warn = sorted((item for item in warn if item["kind"] in WARN_KINDS), key=_delta_order)
-        result: dict[str, Any] = {
-            "ecosystem": pair.ecosystem,
-            "name": pair.name,
-            "old": pair.old,
-            "new": pair.new,
-            "status": "reviewed",
-            "block": block,
-            "warn": warn,
-            "info": sorted(info, key=_delta_order),
-            "unchanged_risky": sum(diff.unchanged_risky.values()),
-            "unchanged_risky_by_kind": dict(sorted(diff.unchanged_risky.items())),
-            "artifacts": {
-                "basis": new_file.basis,
-                "old": old_file.describe(),
-                "new": new_file.describe(),
-            },
-            "_fetched": 2,
+        result = _result(pair, "upgrade", diff, BLOCK_KINDS, WARN_KINDS, warn, info)
+        result["unchanged_risky"] = sum(diff.unchanged_risky.values())
+        result["unchanged_risky_by_kind"] = dict(sorted(diff.unchanged_risky.items()))
+        result["artifacts"] = {
+            "basis": new_file.basis,
+            "old": old_file.describe(),
+            "new": new_file.describe(),
         }
-        limitations = [*diff.limitations, *old_notes, *new_notes]
-        if limitations:
-            result["limitations"] = sorted(set(limitations))
+        result["_fetched"] = 2
+        _limitations(result, pair, new_file, [*diff.limitations, *old_notes, *new_notes])
         return result
     finally:
         if cleanup:
             shutil.rmtree(pair_dir, ignore_errors=True)
+
+
+def _review_new_package(
+    pair: _Pair, options: _Options, config: fetch.ArtifactScanConfig, deadline: float
+) -> dict[str, Any]:
+    new_file = _new_release_file(pair, config)
+    _check_sizes((new_file,), options)
+    snapshot, notes = _snapshot(pair, pair.new, new_file, config)
+    diff = diff_new_package(snapshot, pair.ecosystem, deadline=deadline)
+    result = _result(
+        pair, "new_package", diff, BLOCK_KINDS, NEW_PACKAGE_WARN_KINDS, diff.warn, diff.info
+    )
+    result["artifacts"] = {"basis": new_file.basis, "new": new_file.describe()}
+    result["_fetched"] = 1
+    _limitations(result, pair, new_file, [*diff.limitations, *notes])
+    return result
+
+
+def _result(
+    pair: _Pair,
+    basis: str,
+    diff: Any,
+    block_kinds: tuple[str, ...],
+    warn_kinds: tuple[str, ...],
+    warn: list[dict[str, Any]],
+    info: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "ecosystem": pair.ecosystem,
+        "name": pair.name,
+        "old": pair.old,
+        "new": pair.new,
+        "status": "reviewed",
+        "basis": basis,
+        "block": sorted(
+            (item for item in diff.block if item["kind"] in block_kinds), key=_delta_order
+        ),
+        "warn": sorted((item for item in warn if item["kind"] in warn_kinds), key=_delta_order),
+        "info": sorted(info, key=_delta_order),
+    }
+
+
+def _limitations(
+    result: dict[str, Any], pair: _Pair, release: ReleaseFile, notes: list[str]
+) -> None:
+    limitations = list(notes)
+    if pair.ecosystem == "pypi" and release.kind == "wheel":
+        limitations.append(SDIST_LIMITATION)
+    if limitations:
+        result["limitations"] = sorted(set(limitations))
+
+
+def _check_sizes(releases: tuple[ReleaseFile, ...], options: _Options) -> None:
+    for release in releases:
+        if release.size is not None and release.size > options.max_artifact_bytes:
+            raise _Skip(
+                "artifact_too_large",
+                f"{release.filename} is {release.size} bytes; max_artifact_mb is "
+                f"{options.max_artifact_bytes // (1024 * 1024)}",
+            )
+
+
+def _new_release_file(pair: _Pair, config: fetch.ArtifactScanConfig) -> ReleaseFile:
+    try:
+        if pair.ecosystem == "npm":
+            return _side(npm_release, pair, pair.new, config)
+        entries = _side(pypi_release_entries, pair, pair.new, config)
+    except fetch._UntrustedArtifactURL as exc:
+        raise _Skip("untrusted_registry", str(exc)) from None
+    selection = select_pypi_pair(entries, entries)
+    if selection is None:
+        raise _Skip("no_comparable_artifacts", "the release has no wheel or sdist to inspect")
+    _same, entry, basis = selection
+    return release_file(entry, basis)
 
 
 def _delta_order(item: dict[str, Any]) -> tuple:
@@ -412,7 +503,7 @@ def _side(function: Any, pair: _Pair, version: str, config: fetch.ArtifactScanCo
         ) from None
     except ReleaseMetadataError as exc:
         raise _Skip("registry_metadata_invalid", f"{side}: {exc}") from None
-    except fetch._UntrustedArtifactURL:
+    except (fetch._UntrustedArtifactURL, fetch.TransferTimeout):
         raise
     except (OSError, ValueError, http.client.HTTPException) as exc:
         raise _Skip("registry_unreachable", f"{side}: {exc}"[:300]) from None
@@ -449,6 +540,8 @@ def _snapshot(
             raise _Skip("untrusted_registry", reason[:300])
         if signal in {"artifact_unpack_error", "artifact_ambiguous_archive"}:
             raise _Skip("artifact_unpack_failed", f"{release.filename}: {reason}"[:300])
+        if "timed out" in reason:
+            raise _Skip("timeout", f"{release.filename}: {reason}"[:300])
         if "too large" in reason or "exceeds" in reason:
             raise _Skip("artifact_too_large", f"{release.filename}: {reason}"[:300])
         raise _Skip("artifact_fetch_failed", f"{release.filename}: {reason}"[:300])
@@ -601,6 +694,14 @@ def _parse_options(options: object, receipt: _Receipt) -> _Options:
             values["max_artifact_bytes"] = int(size * 1024 * 1024)
         else:
             receipt.invalid_options.append("max_artifact_mb")
+    for key, limit in (("max_seconds", 86400), ("request_timeout", 600)):
+        value = options.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= limit:
+            values[key] = float(value)
+        else:
+            receipt.invalid_options.append(key)
     cache_dir = options.get("cache_dir")
     if cache_dir is not None:
         if isinstance(cache_dir, (str, PurePath)) and str(cache_dir):
