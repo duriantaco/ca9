@@ -9,6 +9,8 @@ as unchanged. Package code is never installed, imported or executed.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import http.client
 import re
 import shutil
@@ -26,8 +28,10 @@ from ca9.artifacts.releases import (
     ReleaseFile,
     ReleaseMetadataError,
     ReleaseUnavailable,
+    comparable_pairs,
     is_public_registry,
     npm_release,
+    pip_choice,
     pypi_provenance_publisher,
     pypi_release_entries,
     release_file,
@@ -72,12 +76,15 @@ class _Receipt:
     pairs_with_warn: int = 0
     block_deltas: int = 0
     warn_deltas: int = 0
+    incomplete_results: int = 0
 
     def to_dict(self, network: bool) -> dict[str, Any]:
         skipped = [
             {"reason": reason, "count": count} for reason, count in sorted(self.skipped.items())
         ]
-        incomplete = any(reason not in _NON_BLOCKING_SKIPS for reason in self.skipped)
+        incomplete = self.incomplete_results > 0 or any(
+            reason not in _NON_BLOCKING_SKIPS for reason in self.skipped
+        )
         return {
             "schema": SCHEMA,
             "pairs": self.pairs,
@@ -91,6 +98,7 @@ class _Receipt:
             "pairs_with_warn": self.pairs_with_warn,
             "block_deltas": self.block_deltas,
             "warn_deltas": self.warn_deltas,
+            "incomplete_results": self.incomplete_results,
             "unchanged_risky_behaviours": sum(self.unchanged.values()),
             "unchanged_risky_by_kind": dict(sorted(self.unchanged.items())),
             "method": (
@@ -106,6 +114,7 @@ class _Options:
     max_pairs: int = DEFAULT_MAX_PAIRS
     max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_MB * 1024 * 1024
     max_seconds: float = DEFAULT_MAX_SECONDS
+    changed_binaries: str = "info"
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT
     cache_dir: Path | None = None
     trusted_registries: tuple[str, ...] = ()
@@ -120,6 +129,8 @@ class _Pair:
     old: str | None
     new: str
     registry: str | None
+    integrity: str | None = None
+    resolved: str | None = None
 
 
 class _Skip(Exception):
@@ -155,6 +166,7 @@ def review_upgrades(pairs: object, options: object = None) -> dict[str, Any]:
                 receipt.pairs_with_block += bool(result["block"])
                 receipt.pairs_with_warn += bool(result["warn"])
                 receipt.unchanged.update(result.get("unchanged_risky_by_kind", {}))
+                receipt.incomplete_results += not result.get("complete", True)
                 receipt.artifacts_fetched += result.pop("_fetched", 0)
             results.append(result)
     finally:
@@ -281,7 +293,14 @@ def _parse_pair(raw: object) -> _Pair:
         raise _Skip("invalid_pair", f"invalid {normalized} package name")
     if not _VERSION.fullmatch(new) or (old is not None and not _VERSION.fullmatch(old)):
         raise _Skip("invalid_pair", "versions must be exact registry versions")
-    return _Pair(normalized, name, old, new, registry)
+    lock = {}
+    for key in ("integrity", "resolved"):
+        value = raw.get(key)
+        if value is not None and (not isinstance(value, str) or len(value) > 4096):
+            raise _Skip("invalid_pair", f"{key} must be a string when given")
+        if isinstance(value, str) and value.strip():
+            lock[key] = value.strip()
+    return _Pair(normalized, name, old, new, registry, **lock)
 
 
 def _check_policy(pair: _Pair, options: _Options) -> None:
@@ -335,56 +354,121 @@ def _review_pair(
     try:
         if pair.old is None:
             return _review_new_package(pair, options, config, deadline)
-        old_file, new_file = _release_files(pair, config)
-        _check_sizes((old_file, new_file), options)
-        old_snapshot, old_notes = _snapshot(pair, pair.old, old_file, config)
-        new_snapshot, new_notes = _snapshot(pair, pair.new, new_file, config)
-        diff = diff_artifacts(old_snapshot, new_snapshot, pair.ecosystem, deadline=deadline)
-        warn = list(diff.warn)
-        info = list(diff.info)
+        comparisons, served = _release_files(pair, config)
+        _check_sizes(tuple(file for both in comparisons for file in both), options)
+        snapshots: dict[str, tuple[Any, list[str]]] = {}
+        diffs = []
+        for old_file, new_file in comparisons:
+            old_snapshot = _cached_snapshot(snapshots, pair, pair.old, old_file, config)
+            new_snapshot = _cached_snapshot(snapshots, pair, pair.new, new_file, config)
+            diffs.append(
+                diff_artifacts(
+                    old_snapshot,
+                    new_snapshot,
+                    pair.ecosystem,
+                    deadline=deadline,
+                    changed_binaries=options.changed_binaries,
+                )
+            )
+        old_file, new_file = comparisons[0]
+        block, warn, info = _merged(diffs)
         publisher_warn, publisher_info = _publisher_deltas(pair, old_file, new_file)
-        warn.extend(publisher_warn)
-        info.extend(publisher_info)
-        result = _result(pair, "upgrade", diff, BLOCK_KINDS, WARN_KINDS, warn, info)
-        result["unchanged_risky"] = sum(diff.unchanged_risky.values())
-        result["unchanged_risky_by_kind"] = dict(sorted(diff.unchanged_risky.items()))
+        lock_block, lock_notes = _lockfile_check(pair, served, new_file)
+        result = _result(
+            pair,
+            "upgrade",
+            [*block, *lock_block],
+            [*warn, *publisher_warn],
+            [*info, *publisher_info],
+            WARN_KINDS,
+        )
+        result["unchanged_risky"] = sum(diffs[0].unchanged_risky.values())
+        result["unchanged_risky_by_kind"] = dict(sorted(diffs[0].unchanged_risky.items()))
         result["artifacts"] = {
             "basis": new_file.basis,
             "old": old_file.describe(),
             "new": new_file.describe(),
         }
-        result["_fetched"] = 2
-        _limitations(result, pair, new_file, [*diff.limitations, *old_notes, *new_notes])
+        if len(comparisons) > 1:
+            result["artifacts"]["also"] = [
+                {"basis": new.basis, "old": old.describe(), "new": new.describe()}
+                for old, new in comparisons[1:]
+            ]
+        result["_fetched"] = len(snapshots)
+        notes = [note for _snapshot, extra in snapshots.values() for note in extra]
+        _finish(result, pair, new_file, diffs, [*notes, *lock_notes])
         return result
     finally:
         if cleanup:
             shutil.rmtree(pair_dir, ignore_errors=True)
 
 
+def _cached_snapshot(
+    snapshots: dict[str, tuple[Any, list[str]]],
+    pair: _Pair,
+    version: str,
+    release: ReleaseFile,
+    config: fetch.ArtifactScanConfig,
+) -> Any:
+    if release.url not in snapshots:
+        snapshots[release.url] = _snapshot(pair, version, release, config)
+    return snapshots[release.url][0]
+
+
+def _merged(diffs: list[Any]) -> tuple[list, list, list]:
+    merged: tuple[list, list, list] = ([], [], [])
+    seen: set[tuple] = set()
+    for diff in diffs:
+        for target, items in zip(merged, (diff.block, diff.warn, diff.info), strict=True):
+            for item in items:
+                key = (item["kind"], item["path"], item["line"], item["snippet"])
+                if key not in seen:
+                    seen.add(key)
+                    target.append(item)
+    return merged
+
+
+def _finish(
+    result: dict[str, Any], pair: _Pair, release: ReleaseFile, diffs: list[Any], notes: list[str]
+) -> None:
+    incomplete = sorted({reason for diff in diffs for reason in diff.incomplete})
+    limitations = [*notes, *incomplete, *(item for diff in diffs for item in diff.limitations)]
+    if pair.ecosystem == "pypi" and release.kind == "wheel":
+        limitations.append(SDIST_LIMITATION)
+    if limitations:
+        result["limitations"] = sorted(set(limitations))
+    result["complete"] = not incomplete
+
+
 def _review_new_package(
     pair: _Pair, options: _Options, config: fetch.ArtifactScanConfig, deadline: float
 ) -> dict[str, Any]:
-    new_file = _new_release_file(pair, config)
+    new_file, served = _new_release_file(pair, config)
     _check_sizes((new_file,), options)
     snapshot, notes = _snapshot(pair, pair.new, new_file, config)
     diff = diff_new_package(snapshot, pair.ecosystem, deadline=deadline)
+    lock_block, lock_notes = _lockfile_check(pair, served, new_file)
     result = _result(
-        pair, "new_package", diff, BLOCK_KINDS, NEW_PACKAGE_WARN_KINDS, diff.warn, diff.info
+        pair,
+        "new_package",
+        [*diff.block, *lock_block],
+        diff.warn,
+        diff.info,
+        NEW_PACKAGE_WARN_KINDS,
     )
     result["artifacts"] = {"basis": new_file.basis, "new": new_file.describe()}
     result["_fetched"] = 1
-    _limitations(result, pair, new_file, [*diff.limitations, *notes])
+    _finish(result, pair, new_file, [diff], [*notes, *lock_notes])
     return result
 
 
 def _result(
     pair: _Pair,
     basis: str,
-    diff: Any,
-    block_kinds: tuple[str, ...],
-    warn_kinds: tuple[str, ...],
+    block: list[dict[str, Any]],
     warn: list[dict[str, Any]],
     info: list[dict[str, Any]],
+    warn_kinds: tuple[str, ...],
 ) -> dict[str, Any]:
     return {
         "ecosystem": pair.ecosystem,
@@ -393,22 +477,61 @@ def _result(
         "new": pair.new,
         "status": "reviewed",
         "basis": basis,
-        "block": sorted(
-            (item for item in diff.block if item["kind"] in block_kinds), key=_delta_order
-        ),
+        "block": sorted((item for item in block if item["kind"] in BLOCK_KINDS), key=_delta_order),
         "warn": sorted((item for item in warn if item["kind"] in warn_kinds), key=_delta_order),
         "info": sorted(info, key=_delta_order),
     }
 
 
-def _limitations(
-    result: dict[str, Any], pair: _Pair, release: ReleaseFile, notes: list[str]
-) -> None:
-    limitations = list(notes)
-    if pair.ecosystem == "pypi" and release.kind == "wheel":
-        limitations.append(SDIST_LIMITATION)
-    if limitations:
-        result["limitations"] = sorted(set(limitations))
+def _lockfile_check(
+    pair: _Pair, served: set[tuple[str, str]], release: ReleaseFile
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """A lockfile digest the registry does not serve for this version means other bytes."""
+    notes: list[str] = []
+    block: list[dict[str, Any]] = []
+    if pair.resolved and pair.resolved.split("?", 1)[0] != release.url.split("?", 1)[0]:
+        notes.append(
+            "lockfile resolved URL differs from the registry file reviewed; the lockfile "
+            "artifact itself was not fetched"
+        )
+    if not pair.integrity:
+        return block, notes
+    pinned = _digests(pair.integrity)
+    algorithms = {algorithm for algorithm, _value in served}
+    comparable = {item for item in pinned if item[0] in algorithms}
+    if not comparable:
+        notes.append("lockfile integrity uses no digest algorithm the registry lists")
+        return block, notes
+    if not comparable & served:
+        block.append(
+            {
+                "kind": "lockfile_artifact_mismatch",
+                "path": "(lockfile)",
+                "line": None,
+                "snippet": pair.integrity[:200],
+                "detail": "the lockfile digest does not match any file the registry serves for "
+                "this version: the locked artifact is not the one reviewed",
+            }
+        )
+    return block, notes
+
+
+def _digests(value: str) -> set[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    for token in value.replace(",", " ").split():
+        sri = re.fullmatch(r"(sha1|sha256|sha384|sha512)-([A-Za-z0-9+/]+={0,2})", token)
+        if sri is not None:
+            try:
+                found.add((sri.group(1), base64.b64decode(sri.group(2), validate=True).hex()))
+            except (binascii.Error, ValueError):
+                continue
+            continue
+        hexed = re.fullmatch(r"(sha1|sha256|sha384|sha512)[:=]([0-9a-fA-F]+)", token)
+        if hexed is not None:
+            found.add((hexed.group(1), hexed.group(2).lower()))
+        elif re.fullmatch(r"[0-9a-fA-F]{64}", token):
+            found.add(("sha256", token.lower()))
+    return found
 
 
 def _check_sizes(releases: tuple[ReleaseFile, ...], options: _Options) -> None:
@@ -421,18 +544,24 @@ def _check_sizes(releases: tuple[ReleaseFile, ...], options: _Options) -> None:
             )
 
 
-def _new_release_file(pair: _Pair, config: fetch.ArtifactScanConfig) -> ReleaseFile:
+def _new_release_file(
+    pair: _Pair, config: fetch.ArtifactScanConfig
+) -> tuple[ReleaseFile, set[tuple[str, str]]]:
     try:
         if pair.ecosystem == "npm":
-            return _side(npm_release, pair, pair.new, config)
+            release = _side(npm_release, pair, pair.new, config)
+            return release, _digests(release.hash)
         entries = _side(pypi_release_entries, pair, pair.new, config)
     except fetch._UntrustedArtifactURL as exc:
         raise _Skip("untrusted_registry", str(exc)) from None
-    selection = select_pypi_pair(entries, entries)
-    if selection is None:
-        raise _Skip("no_comparable_artifacts", "the release has no wheel or sdist to inspect")
-    _same, entry, basis = selection
-    return release_file(entry, basis)
+    served = {("sha256", entry["sha256"]) for entry in entries}
+    choice = pip_choice(entries)
+    if choice is None:
+        selection = select_pypi_pair(entries, entries)
+        if selection is None:
+            raise _Skip("no_comparable_artifacts", "the release has no wheel or sdist to inspect")
+        choice = (selection[1], selection[2])
+    return release_file(choice[0], choice[1]), served
 
 
 def _delta_order(item: dict[str, Any]) -> tuple:
@@ -441,38 +570,43 @@ def _delta_order(item: dict[str, Any]) -> tuple:
 
 def _release_files(
     pair: _Pair, config: fetch.ArtifactScanConfig
-) -> tuple[ReleaseFile, ReleaseFile]:
+) -> tuple[list[tuple[ReleaseFile, ReleaseFile]], set[tuple[str, str]]]:
+    """Files to compare (what pip installs here first) and the digests the registry serves."""
+    old_version = pair.old or ""
     try:
         if pair.ecosystem == "npm":
-            return (
-                _side(npm_release, pair, pair.old, config),
-                _side(npm_release, pair, pair.new, config),
-            )
-        old_entries = _side(pypi_release_entries, pair, pair.old, config)
+            old_file = _side(npm_release, pair, old_version, config)
+            new_file = _side(npm_release, pair, pair.new, config)
+            return [(old_file, new_file)], _digests(new_file.hash)
+        old_entries = _side(pypi_release_entries, pair, old_version, config)
         new_entries = _side(pypi_release_entries, pair, pair.new, config)
     except fetch._UntrustedArtifactURL as exc:
         raise _Skip("untrusted_registry", str(exc)) from None
-    selection = select_pypi_pair(old_entries, new_entries)
-    if selection is None:
+    served = {("sha256", entry["sha256"]) for entry in new_entries}
+    pairs = comparable_pairs(old_entries, new_entries)
+    if not pairs:
         raise _Skip(
             "no_comparable_artifacts",
-            "the releases share no pure wheel, same-platform wheel or sdist",
+            "no wheel installs on this machine and the releases share no wheel or sdist",
         )
-    old_entry, new_entry, basis = selection
-    old_file = release_file(old_entry, basis)
-    new_file = release_file(new_entry, basis)
+    comparisons = [
+        (release_file(old, basis), release_file(new, basis)) for old, new, basis in pairs
+    ]
+    old_file, new_file = comparisons[0]
     if is_public_registry("pypi", pair.registry):
         publishers = []
-        for version, release in ((pair.old, old_file), (pair.new, new_file)):
+        for version, release in ((old_version, old_file), (pair.new, new_file)):
             try:
                 publishers.append(
                     pypi_provenance_publisher(pair.name, version, release.filename, config)
                 )
             except (OSError, ValueError, http.client.HTTPException):
                 publishers.append({"lookup": "failed"})
-        old_file = _with_publisher(old_file, publishers[0])
-        new_file = _with_publisher(new_file, publishers[1])
-    return old_file, new_file
+        comparisons[0] = (
+            _with_publisher(old_file, publishers[0]),
+            _with_publisher(new_file, publishers[1]),
+        )
+    return comparisons, served
 
 
 def _with_publisher(release: ReleaseFile, publisher: dict[str, Any] | None) -> ReleaseFile:
@@ -702,6 +836,14 @@ def _parse_options(options: object, receipt: _Receipt) -> _Options:
             values[key] = float(value)
         else:
             receipt.invalid_options.append(key)
+    strict_binaries = options.get("warn_on_changed_binaries")
+    if strict_binaries is not None:
+        if isinstance(strict_binaries, bool):
+            values["changed_binaries"] = "warn"
+            if not strict_binaries:
+                values["changed_binaries"] = "info"
+        else:
+            receipt.invalid_options.append("warn_on_changed_binaries")
     cache_dir = options.get("cache_dir")
     if cache_dir is not None:
         if isinstance(cache_dir, (str, PurePath)) and str(cache_dir):

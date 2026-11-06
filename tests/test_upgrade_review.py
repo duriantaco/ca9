@@ -9,6 +9,7 @@ import time
 import zipfile
 
 import pytest
+from packaging.tags import sys_tags
 
 from ca9 import api
 from ca9.artifacts import fetch
@@ -258,18 +259,19 @@ def test_sdist_compared_when_only_sdists_are_common(registry):
         "1.1",
         wheel={**BASE, "demo/_native.so": b"\x7fELF\x02\x01\x01" + b"\x00" * 64},
         sdist={"setup.py": setup_new, **BASE},
-        wheel_tag="cp312-cp312-manylinux_2_17_x86_64",
+        wheel_tag="cp27-cp27mu-manylinux1_x86_64",
     )
 
     result, _receipt = _one("pypi", "demo", "1.0", "1.1")
 
-    assert result["artifacts"]["basis"] == "sdist"
+    assert result["artifacts"]["basis"] == "sdist (no wheel matches this machine)"
+    assert result["artifacts"]["also"][0]["basis"] == "sdist"
     assert _kinds(result, "block") == ["new_install_hook"]
     assert result["block"][0]["path"] == "setup.py" and result["block"][0]["line"] == 3
 
 
 def test_platform_wheels_compared_when_no_pure_wheel(registry):
-    tag = "cp312-cp312-manylinux_2_17_x86_64"
+    tag = str(next(iter(sys_tags())))
     old_lib = {**BASE, "demo/_core.so": b"\x7fELF\x02" + b"\x00" * 64}
     new_lib = {**old_lib, "demo/_helper.so": b"\x7fELF\x02" + b"\x01" * 64}
     registry.pypi("demo", "1.0", wheel=old_lib, sdist=BASE, wheel_tag=tag)
@@ -277,7 +279,7 @@ def test_platform_wheels_compared_when_no_pure_wheel(registry):
 
     result, _receipt = _one("pypi", "demo", "1.0", "1.1")
 
-    assert result["artifacts"]["basis"] == "same-platform wheel"
+    assert result["artifacts"]["basis"] == "wheel pip selects on this machine"
     assert _kinds(result, "warn") == ["new_native_binary"]
     assert result["warn"][0]["path"] == "demo/_helper.so"
 
@@ -614,4 +616,4 @@ def test_new_pypi_package_blocks_only_high_signal_startup_code(registry):
     assert sorted(_kinds(benign, "warn")) == ["new_import_time_exec", "new_sitecustomize"]
     assert [delta["kind"] for delta in benign["info"]] == ["new_native_binary"]
     assert "sdist not compared" in " ".join(benign["limitations"])
-    assert _kinds(loader, "block") == ["new_decode_exec", "new_sitecustomize"]
+    assert _kinds(loader, "block") == ["new_decode_exec", "new_pth_code", "new_sitecustomize"]

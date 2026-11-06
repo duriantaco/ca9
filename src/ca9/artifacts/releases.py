@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import json
 import re
 import sys
@@ -18,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit
 
+from packaging.tags import Tag, sys_tags
 from packaging.utils import (
     InvalidSdistFilename,
     InvalidWheelFilename,
@@ -182,6 +184,68 @@ def select_pypi_pair(
     if old_sdist and new_sdist:
         return old_sdist[0], new_sdist[0], "sdist"
     return None
+
+
+@functools.lru_cache(maxsize=1)
+def _tag_ranks() -> dict[Tag, int]:
+    return {tag: index for index, tag in enumerate(sys_tags())}
+
+
+def pip_choice(entries: list[dict[str, Any]]) -> tuple[dict[str, Any], str] | None:
+    """The file pip would install on this machine: best-ranked compatible wheel, else sdist."""
+    ranks = _tag_ranks()
+    best: tuple[tuple[int, str], dict[str, Any]] | None = None
+    for entry in entries:
+        if entry["kind"] != "wheel":
+            continue
+        priorities = [ranks[tag] for tag in entry["tags"] if tag in ranks]
+        if not priorities:
+            continue
+        key = (min(priorities), entry["filename"])
+        if best is None or key < best[0]:
+            best = (key, entry)
+    if best is not None:
+        return best[1], "wheel pip selects on this machine"
+    sdists = sorted(
+        (entry for entry in entries if entry["kind"] == "sdist"),
+        key=lambda entry: entry["filename"],
+    )
+    if sdists:
+        return sdists[0], "sdist (no wheel matches this machine)"
+    return None
+
+
+def comparable_pairs(
+    old_entries: list[dict[str, Any]], new_entries: list[dict[str, Any]]
+) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
+    """What pip installs here for each version; plus a same-type pair when those differ."""
+    pairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    old_pick = pip_choice(old_entries)
+    new_pick = pip_choice(new_entries)
+    if old_pick is not None and new_pick is not None:
+        pairs.append((old_pick[0], new_pick[0], new_pick[1]))
+    same = select_pypi_pair(old_entries, new_entries)
+    if same is None:
+        return pairs
+    differing = (
+        not pairs
+        or _file_type(pairs[0][0]) != _file_type(pairs[0][1])
+        or same[1]["filename"] != pairs[0][1]["filename"]
+    )
+    if differing and not any(
+        same[0]["filename"] == old["filename"] and same[1]["filename"] == new["filename"]
+        for old, new, _basis in pairs
+    ):
+        pairs.append(same)
+    return pairs
+
+
+def _file_type(entry: dict[str, Any]) -> str:
+    if entry["kind"] == "sdist":
+        return "sdist"
+    if _pure_wheels([entry]):
+        return "pure"
+    return "platform"
 
 
 def release_file(entry: dict[str, Any], basis: str) -> ReleaseFile:
