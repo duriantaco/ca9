@@ -962,3 +962,69 @@ def parse_mcp_server(
         return parse_launch(command, args, version=version)
     except Exception:
         return None
+
+
+def hardening_settings(repo_root: str | Path) -> dict[str, Any]:
+    """Snapshot of the install-hardening settings committed at the repository root.
+
+    ``cooldown``: ``npm_days`` (.npmrc ``min-release-age``, days, npm >= 11.10),
+    ``pnpm_minutes`` (``minimumReleaseAge``, minutes; pnpm-workspace.yaml, else pnpm 10
+    .npmrc ``minimum-release-age`` or package.json ``pnpm``), ``yarn`` (.yarnrc.yml
+    ``npmMinimalAgeGate`` as written), ``bun_seconds`` (bunfig.toml
+    ``install.minimumReleaseAge``, seconds), ``uv`` (``exclude-newer`` from uv.toml or
+    pyproject ``[tool.uv]``, as written), ``pip`` (``uploaded-prior-to`` from
+    pip.conf/pip.ini or requirements files), ``dependabot_days`` (smallest
+    ``cooldown.default-days``), ``renovate`` (``minimumReleaseAge``); None when unset.
+    ``scripts``: ``npm_ignore_scripts``, ``npm12_allow_scripts``,
+    ``pnpm_strict_dep_builds``, ``pnpm_allow_builds`` (packages allowed to build);
+    optional ``pnpm_only_built_dependencies`` (pnpm 10), ``pnpm_dangerously_allow_all_builds``,
+    ``bun_trusted_dependencies``, ``bun_ignore_scripts``, ``yarn_enable_scripts``.
+    ``actions``: ``pinned``/``unpinned`` counts of third-party ``uses:`` refs (full commit
+    SHA or image digest = pinned; local ``./`` actions not counted), optional ``refs``
+    [{file, uses, ref, pinned, line}] and ``truncated``. ``sources``: setting key to
+    the file it came from. Optional: ``cooldown_minutes`` (each cooldown in minutes;
+    None when unset or an absolute date), ``exclusions`` (manager -> packages that skip
+    the cooldown), ``dependabot`` [{ecosystem, directory, default_days}], ``managers``
+    (from package.json ``packageManager``), ``renovate_presets``, ``errors``, ``status``.
+    Never raises.
+    """
+    from ca9.hardening import SCHEMA, settings
+
+    try:
+        return settings(repo_root)
+    except Exception as exc:
+        return {
+            "schema": SCHEMA,
+            "cooldown": {},
+            "scripts": {},
+            "actions": {"pinned": 0, "unpinned": 0},
+            "sources": {},
+            "errors": [{"file": ".", "reason": f"hardening scan failed: {exc}"}],
+            "status": "partial",
+        }
+
+
+def hardening_regressions(base: object, head: object) -> list[dict[str, Any]]:
+    """Ways ``head`` weakens the install hardening of ``base``.
+
+    ``base`` and ``head`` are ``hardening_settings`` snapshots or repository paths.
+    Items: ``kind``, ``detail``, ``path`` (file in head, else base), plus ``setting``,
+    ``base``, ``head`` and, for per-package items, ``package`` (and ``line`` for
+    actions). Kinds: cooldown_removed, cooldown_lowered (compared in minutes across
+    units; a removal that falls back to an equal or longer default such as pnpm 11's
+    1440 minutes or Dependabot's 3 days is not reported), cooldown_exclusion_added,
+    ignore_scripts_disabled, allow_builds_added (pnpm allowBuilds /
+    onlyBuiltDependencies / dangerouslyAllowAllBuilds, Bun trustedDependencies),
+    allow_scripts_added (npm allowScripts), strict_dep_builds_disabled,
+    action_unpinned (an action pinned to a SHA in base used at a tag or branch in
+    head). Exceptions are the caller's to apply. Never raises: an internal error
+    returns one ``check_failed`` item so a gate does not read it as "no regressions".
+    """
+    from ca9.hardening import regressions
+
+    try:
+        return regressions(base, head)
+    except Exception as exc:
+        return [
+            {"kind": "check_failed", "detail": f"hardening comparison failed: {exc}", "path": None}
+        ]
