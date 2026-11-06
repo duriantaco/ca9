@@ -888,3 +888,143 @@ def _optional_string(value: object) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def agent_config(repo_root: str | Path) -> dict[str, Any]:
+    """Committed agent/editor execution hooks, MCP server configs and API base-URL overrides.
+
+    Reads ``.claude/settings(.local).json``, ``.gemini/settings.json``,
+    ``.cursor/{hooks,mcp}.json``, ``.codex/{hooks.json,config.toml}``,
+    ``.vscode/{tasks,mcp,settings}.json``, ``*.code-workspace``, ``.mcp.json``,
+    ``.kiro/settings/mcp.json`` (and Roo / Amazon Q / Windsurf ``mcp.json``) at any
+    depth, skipping ``node_modules``, ``.git`` and virtualenvs. JSON with comments and
+    trailing commas parses; an unparseable hook file still reports the command strings
+    found in its text. Never raises.
+
+    Returns ``{"findings": [finding dict], "inventory": {...}}``. ``signal_type`` is one
+    of agent_hook_command (HIGH; CRITICAL when the command downloads remote code,
+    decodes and runs a payload, or runs a script disguised as a font/image),
+    editor_folder_open_task (same severities), mcp_server_unpinned (MEDIUM),
+    mcp_server_hidden_path (HIGH), mcp_server_impersonation (MEDIUM),
+    agent_base_url_override (HIGH). ``name`` is the hook event, task label, server
+    name or variable; ``ecosystem``/``version`` are set for MCP findings. Hook
+    evidence carries the exact ``command`` plus ``display_command``, ``executable``,
+    ``script``, ``fetches_remote``, ``decodes_and_executes``, ``disguised_script`` and
+    ``hidden_by_padding``. No command is trusted by name.
+
+    ``inventory``: ``schema`` "ca9.agent_hooks.v1", ``hooks`` [{file, kind, event,
+    command, line}] (kind: claude_hook, claude_setting, gemini_hook, gemini_setting,
+    cursor_hook, codex_hook, vscode_task; optional matcher, label, via,
+    handler_type), ``mcp_servers`` [{file, name, command, ecosystem, package,
+    version, pinned, line}] (optional argv, transport, fetches, launcher, url), plus
+    optional ``env_overrides``, ``files``, ``errors``, ``status``
+    ("complete"|"partial") and ``truncated``.
+    """
+    from ca9.agent_config import scan_repository
+
+    try:
+        return scan_repository(repo_root)
+    except Exception as exc:
+        return {
+            "findings": [],
+            "inventory": {
+                "schema": "ca9.agent_hooks.v1",
+                "hooks": [],
+                "mcp_servers": [],
+                "env_overrides": [],
+                "files": [],
+                "errors": [{"file": ".", "reason": f"agent config scan failed: {exc}"}],
+                "status": "partial",
+                "truncated": False,
+            },
+        }
+
+
+def parse_mcp_server(
+    command: object, args: object = None, *, version: object = None
+) -> dict[str, Any] | None:
+    """Package behind an MCP server launch, and whether it is pinned.
+
+    Understands npx / npm exec / pnpm dlx / yarn dlx / bunx / bun x / uvx / uv tool
+    run / pipx run / python -m / node and other interpreters / deno / docker and
+    podman run, through ``cmd /c``, ``sh -c`` and ``env`` wrappers. Returns
+    ``ecosystem`` (npm|pypi|docker|url|local), ``package``, ``version`` (or None),
+    ``pinned`` (exact version, full git commit, or image digest) and
+    ``pinned_command``: the same argv with ``version`` inserted when the caller
+    passes an exact ``version=`` (an image digest ``sha256:...`` for docker), else
+    None. Optional keys: ``launcher``, ``fetches`` (False for local files and
+    ``python -m``, which run what is already installed), ``spec``, ``source``
+    (registry|git|url|local|installed|image). None for unusable input; never raises.
+    """
+    from ca9.agent_config import parse_launch
+
+    try:
+        return parse_launch(command, args, version=version)
+    except Exception:
+        return None
+
+
+def hardening_settings(repo_root: str | Path) -> dict[str, Any]:
+    """Snapshot of the install-hardening settings committed at the repository root.
+
+    ``cooldown``: ``npm_days`` (.npmrc ``min-release-age``, days, npm >= 11.10),
+    ``pnpm_minutes`` (``minimumReleaseAge``, minutes; pnpm-workspace.yaml, else pnpm 10
+    .npmrc ``minimum-release-age`` or package.json ``pnpm``), ``yarn`` (.yarnrc.yml
+    ``npmMinimalAgeGate`` as written), ``bun_seconds`` (bunfig.toml
+    ``install.minimumReleaseAge``, seconds), ``uv`` (``exclude-newer`` from uv.toml or
+    pyproject ``[tool.uv]``, as written), ``pip`` (``uploaded-prior-to`` from
+    pip.conf/pip.ini or requirements files), ``dependabot_days`` (smallest
+    ``cooldown.default-days``), ``renovate`` (``minimumReleaseAge``); None when unset.
+    ``scripts``: ``npm_ignore_scripts``, ``npm12_allow_scripts``,
+    ``pnpm_strict_dep_builds``, ``pnpm_allow_builds`` (packages allowed to build);
+    optional ``pnpm_only_built_dependencies`` (pnpm 10), ``pnpm_dangerously_allow_all_builds``,
+    ``bun_trusted_dependencies``, ``bun_ignore_scripts``, ``yarn_enable_scripts``.
+    ``actions``: ``pinned``/``unpinned`` counts of third-party ``uses:`` refs (full commit
+    SHA or image digest = pinned; local ``./`` actions not counted), optional ``refs``
+    [{file, uses, ref, pinned, line}] and ``truncated``. ``sources``: setting key to
+    the file it came from. Optional: ``cooldown_minutes`` (each cooldown in minutes;
+    None when unset or an absolute date), ``exclusions`` (manager -> packages that skip
+    the cooldown), ``dependabot`` [{ecosystem, directory, default_days}], ``managers``
+    (from package.json ``packageManager``), ``renovate_presets``, ``errors``, ``status``.
+    Never raises.
+    """
+    from ca9.hardening import SCHEMA, settings
+
+    try:
+        return settings(repo_root)
+    except Exception as exc:
+        return {
+            "schema": SCHEMA,
+            "cooldown": {},
+            "scripts": {},
+            "actions": {"pinned": 0, "unpinned": 0},
+            "sources": {},
+            "errors": [{"file": ".", "reason": f"hardening scan failed: {exc}"}],
+            "status": "partial",
+        }
+
+
+def hardening_regressions(base: object, head: object) -> list[dict[str, Any]]:
+    """Ways ``head`` weakens the install hardening of ``base``.
+
+    ``base`` and ``head`` are ``hardening_settings`` snapshots or repository paths.
+    Items: ``kind``, ``detail``, ``path`` (file in head, else base), plus ``setting``,
+    ``base``, ``head`` and, for per-package items, ``package`` (and ``line`` for
+    actions). Kinds: cooldown_removed, cooldown_lowered (compared in minutes across
+    units; a removal that falls back to an equal or longer default such as pnpm 11's
+    1440 minutes or Dependabot's 3 days is not reported), cooldown_exclusion_added,
+    ignore_scripts_disabled, allow_builds_added (pnpm allowBuilds /
+    onlyBuiltDependencies / dangerouslyAllowAllBuilds, Bun trustedDependencies),
+    allow_scripts_added (npm allowScripts), strict_dep_builds_disabled,
+    action_unpinned (an action pinned to a SHA in base used at a tag or branch in
+    head). Exceptions are the caller's to apply. Never raises: an internal error
+    returns one ``check_failed`` item so a gate does not read it as "no regressions".
+    """
+    from ca9.hardening import regressions
+
+    try:
+        return regressions(base, head)
+    except Exception as exc:
+        return [
+            {"kind": "check_failed", "detail": f"hardening comparison failed: {exc}", "path": None}
+        ]
