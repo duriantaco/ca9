@@ -401,3 +401,35 @@ def test_bad_input_and_policy_skips_never_raise_or_fetch(registry):
     )
     assert offline["results"][0]["reason"] == "network_disabled"
     assert registry.requests == []
+
+
+def test_internal_package_reviewed_from_listed_private_index_only(registry):
+    index = "https://pypi.corp.example/simple"
+    files = []
+    for version, extra in (("1.0", {}), ("1.1", {"acme_boot.pth": "import acme_core\n"})):
+        raw = _wheel("acme_core", version, {"acme_core/__init__.py": "X = 1\n", **extra})
+        filename = f"acme_core-{version}-py3-none-any.whl"
+        url = f"https://pypi.corp.example/files/{filename}"
+        registry.archives[url] = raw
+        files.append(
+            {
+                "filename": filename,
+                "url": url,
+                "hashes": {"sha256": hashlib.sha256(raw).hexdigest()},
+            }
+        )
+    registry.documents[f"{index}/acme-core/"] = json.dumps(
+        {"name": "acme-core", "files": files}
+    ).encode()
+    pair = {"ecosystem": "pypi", "name": "acme-core", "old": "1.0", "new": "1.1"}
+
+    report = api.review_upgrades(
+        [{**pair, "registry": index}, pair],
+        options={"private_registries": [index], "internal_packages": ["acme-*"]},
+    )
+
+    private, public = report["results"]
+    assert private["status"] == "reviewed"
+    assert _kinds(private, "block") == ["new_pth_code"]
+    assert public["reason"] == "internal_package"
+    assert all(url.startswith("https://pypi.corp.example/") for url in registry.requests)
