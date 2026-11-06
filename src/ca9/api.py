@@ -1062,9 +1062,13 @@ def audit_workflows(repo_root: str | PurePath) -> dict[str, Any]:
     """Publish-job rules: ``{"findings": [finding dict], "receipt": {...}}``.
 
     Signal types: unpinned_tool_in_credentialed_job, unverified_download_into_publish,
-    oidc_publish_without_environment, publish_on_dispatch_or_any_branch. Findings use
-    the package finding shape with ``ecosystem`` github-actions|gitlab-ci, ``name``
-    the job id (or workflow file) and ``version`` None. Never raises.
+    oidc_publish_without_environment, publish_on_dispatch_or_any_branch, and
+    credentials_to_remote_reusable_workflow (investigate: secrets or tokens handed to a
+    workflow outside this repository). Findings use the package finding shape with
+    ``ecosystem`` github-actions|gitlab-ci, ``name`` the job id (or workflow file) and
+    ``version`` None. The receipt lists ``unknowns`` (remote reusable workflows, remote
+    GitLab includes) and ``incomplete_reasons``; ``complete`` is false whenever any part
+    of the pipeline could not be read. Never raises.
     """
     try:
         from ca9.ci.audit import audit_repository

@@ -186,7 +186,8 @@ class Job:
     local_actions: list[str] = field(default_factory=list)
     publish_credentials: dict[str, str] = field(default_factory=dict)
     credential_lines: dict[str, int] = field(default_factory=dict)
-    ref_guarded: bool = False
+    remote_reusable: bool = False
+    publish_guards: list[frozenset[tuple[str, ...]]] = field(default_factory=list)
     truncated: bool = False
 
     @property
@@ -239,6 +240,7 @@ class Job:
             "uses_cache": self.uses_cache,
             "other_tools": lists["other_tools"],
             "publish_credentials": sorted(self.publish_credentials),
+            "remote_reusable": self.remote_reusable,
         }
         if self.environment_dynamic:
             data["environment_dynamic"] = True

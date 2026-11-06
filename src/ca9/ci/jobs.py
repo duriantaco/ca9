@@ -61,12 +61,6 @@ _OUTSIDE_PREFIXES = (
     "$GITHUB_ACTION_PATH",
     "%",
 )
-_BRANCH_GUARD_RE = re.compile(
-    r"github\.ref\s*==\s*['\"]refs/heads/[^'\"*?\[\]]+['\"]|"
-    r"['\"]refs/heads/[^'\"*?\[\]]+['\"]\s*==\s*github\.ref\b|"
-    r"github\.ref_name\s*==\s*['\"][^'\"*?\[\]]+['\"]|"
-    r"['\"][^'\"*?\[\]]+['\"]\s*==\s*github\.ref_name\b"
-)
 
 
 def env_registry(name: str) -> str | None:
@@ -86,42 +80,6 @@ def secret_registry(name: str) -> str | None:
 def add_credential(job: Job, name: str, registry: str, line: int) -> None:
     job.publish_credentials.setdefault(name, registry)
     job.credential_lines.setdefault(name, line)
-
-
-def ref_guarded(condition: object) -> bool:
-    """True when every top-level ``||`` branch requires one literal branch ref."""
-    if not isinstance(condition, str) or not condition.strip():
-        return False
-    text = condition.strip()
-    if text.startswith("${{") and text.endswith("}}"):
-        text = text[3:-2]
-    return all(_BRANCH_GUARD_RE.search(part) for part in _top_level_or(text))
-
-
-def _top_level_or(text: str) -> list[str]:
-    parts: list[str] = []
-    depth = 0
-    quote: str | None = None
-    start = 0
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if quote:
-            if char == quote:
-                quote = None
-        elif char in {"'", '"'}:
-            quote = char
-        elif char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-        elif depth == 0 and text.startswith("||", index):
-            parts.append(text[start:index])
-            start = index + 2
-            index += 1
-        index += 1
-    parts.append(text[start:])
-    return parts
 
 
 def finalize(job: Job, facts: ScriptFacts, contexts: dict[tuple[int, ...], str]) -> None:
