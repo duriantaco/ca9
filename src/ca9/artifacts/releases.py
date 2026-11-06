@@ -13,6 +13,7 @@ import base64
 import binascii
 import json
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit
@@ -440,7 +441,9 @@ def _platform_pair(
         for old in old_wheels:
             old_keys = _wheel_keys(old)
             for key in new_keys & old_keys:
-                exact.append((key[0], _interpreter_order(key[1]), new["filename"], old, new))
+                exact.append(
+                    (key[0], _interpreter_order(key[1], key[2]), new["filename"], old, new)
+                )
             new_ranks = {key[0] for key in new_keys}
             for rank in new_ranks & {key[0] for key in old_keys}:
                 family_only.append((rank, 0, new["filename"] + old["filename"], old, new))
@@ -451,8 +454,16 @@ def _platform_pair(
     return None
 
 
-def _interpreter_order(interpreter: str) -> int:
+def _interpreter_order(interpreter: str, abi: str) -> tuple[int, int]:
+    """Prefer the running CPython's tag, then abi3, then the newest non-free-threaded tag."""
+    current = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    if interpreter == current and not abi.endswith("t"):
+        return (0, 0)
+    if abi == "abi3":
+        return (1, 0)
     digits = re.sub(r"\D", "", interpreter)
     if not digits:
-        return 0
-    return -int(digits[:4])
+        return (3, 0)
+    if abi.endswith("t"):
+        return (3, -int(digits[:4]))
+    return (2, -int(digits[:4]))

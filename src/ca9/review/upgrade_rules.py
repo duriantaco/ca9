@@ -14,6 +14,7 @@ import hashlib
 import json
 import posixpath
 import re
+import sys
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
@@ -134,6 +135,10 @@ _OBFUSCATED_IDENT_RE = re.compile(r"\b_0x[0-9a-f]{4,6}\b")
 _HEX_ESCAPE_RE = re.compile(r"\\x[0-9a-fA-F]{2}")
 _BLOB_RE = re.compile(r"[A-Za-z0-9+/=_-]{10000,}")
 _PY_EXEC_NAMES = frozenset({"exec", "eval", "execfile"})
+_DECODE_EXEC_HINT = re.compile(
+    r"exec|eval|compile|decode|loads|unhexlify|fromhex|Popen|system|spawn|subprocess|"
+    r"getattr|__import__|import_module|globals|builtins|sys\.modules|urlopen"
+)
 _NPM_CODE_RULE_KINDS = {
     "npm-encoded-execution": ("new_decode_exec", "decodes data and executes it"),
     "npm-obfuscated-require": (
@@ -195,10 +200,22 @@ class _Entry:
     file: ArtifactFile
 
 
+class _Cache:
+    """Parse results shared by both sides; identical files are analysed once."""
+
+    def __init__(self) -> None:
+        self.trees: dict[str, ast.Module | None] = {}
+        self.calls: dict[tuple[str, bool], list[_PyCall] | None] = {}
+        self.encoded: dict[str, list[int]] = {}
+
+
 class _Side:
     """One artifact: package-relative paths, content digests and bounded reads."""
 
-    def __init__(self, snapshot: ArtifactSnapshot, ecosystem: str) -> None:
+    def __init__(
+        self, snapshot: ArtifactSnapshot, ecosystem: str, cache: _Cache | None = None
+    ) -> None:
+        self.cache = cache or _Cache()
         self.snapshot = snapshot
         self.ecosystem = ecosystem
         self.kind = snapshot.artifact.kind
@@ -257,6 +274,49 @@ class _Side:
         raw = pc._read_bytes(self.entries[path].file, size)
         return raw or b""
 
+    def tree(self, path: str) -> ast.Module | None:
+        digest = self.digest(path)
+        if digest not in self.cache.trees:
+            self.cache.trees[digest] = _python_tree(self.text(path))
+        return self.cache.trees[digest]
+
+    def calls(self, path: str, import_time_only: bool) -> list[_PyCall] | None:
+        key = (self.digest(path), import_time_only)
+        if key not in self.cache.calls:
+            text = self.text(path)
+            tree = self.tree(path)
+            calls = None
+            if text is not None and tree is not None:
+                calls = _python_calls(text, tree, import_time_only=import_time_only)
+            self.cache.calls[key] = calls
+        return self.cache.calls[key]
+
+    def encoded_lines(self, path: str) -> list[int]:
+        digest = self.digest(path)
+        if digest not in self.cache.encoded:
+            lines: list[int] = []
+            tree = self.tree(path)
+            if tree is not None:
+                try:
+                    events = pc._tree_events(tree, 0)
+                except RecursionError:
+                    events = []
+                lines = sorted(event.line for event in events if event.kind == "encoded_exec")
+            self.cache.encoded[digest] = lines
+        return self.cache.encoded[digest]
+
+    def top_modules(self) -> set[str]:
+        modules = set()
+        for entry in self.entries.values():
+            first = entry.install_path.split("/", 1)[0]
+            if first.endswith((".dist-info", ".egg-info", ".data")) or first.startswith(".."):
+                continue
+            if "/" in entry.install_path:
+                modules.add(first)
+            elif first.endswith((".py", ".pyc", ".so", ".pyd")):
+                modules.add(first.split(".", 1)[0])
+        return modules
+
 
 def diff_artifacts(
     old: ArtifactSnapshot,
@@ -264,8 +324,9 @@ def diff_artifacts(
     ecosystem: str,
 ) -> DiffResult:
     """Behaviours of ``new`` whose identity is absent from ``old``."""
-    before = _Side(old, ecosystem)
-    after = _Side(new, ecosystem)
+    cache = _Cache()
+    before = _Side(old, ecosystem, cache)
+    after = _Side(new, ecosystem, cache)
     changed = _changed_paths(before, after)
     result = DiffResult()
     old_behaviours: list[Behaviour] = []
@@ -275,9 +336,10 @@ def diff_artifacts(
         _native_binary_behaviours,
     ]
     if ecosystem == "pypi":
+        old_behaviours.extend(_pth_behaviours(before, None))
+        new_behaviours.extend(_pth_behaviours(after, before.top_modules()))
         collectors.extend(
             [
-                _pth_behaviours,
                 _startup_module_behaviours,
                 _python_dependency_behaviours,
                 _build_hook_behaviours,
@@ -299,14 +361,14 @@ def diff_artifacts(
 def _assemble(
     old_behaviours: list[Behaviour], new_behaviours: list[Behaviour], result: DiffResult
 ) -> None:
-    old_ids = {(item.kind, item.identity) for item in old_behaviours}
-    reported: set[tuple[str, tuple]] = set()
+    old_ids = {item.identity for item in old_behaviours}
+    reported: set[tuple] = set()
     counts: Counter = Counter()
     ordered = sorted(
         new_behaviours, key=lambda item: (item.kind, item.path, item.line or 0, item.snippet)
     )
     for item in ordered:
-        key = (item.kind, item.identity)
+        key = item.identity
         if key in reported:
             continue
         reported.add(key)
@@ -397,7 +459,14 @@ def _ast_fingerprint(text: str | None, raw_digest: str) -> str:
     return hashlib.sha256(ast.dump(tree, include_attributes=False).encode()).hexdigest()
 
 
-def _pth_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]:
+def _pth_behaviours(side: _Side, baseline_modules: set[str] | None) -> list[Behaviour]:
+    """Executable .pth lines; ``baseline_modules`` are the old release's top-level modules.
+
+    A new line blocks when it runs process, network, decode or dynamic exec code, cannot
+    be parsed, or imports a module that the old release did not ship. A new line that
+    only imports standard-library modules or modules already in the old release still
+    runs at every interpreter start and is reported as import-time execution.
+    """
     behaviours = []
     for path in side.entries:
         if not path.lower().endswith(".pth"):
@@ -419,24 +488,71 @@ def _pth_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]:
         for number, line in enumerate(text.splitlines(), start=1):
             if not line.startswith(("import ", "import\t")):
                 continue
-            normalized = " ".join(line.split())
-            verdict = pc._pth_line_verdict(line.strip())
-            shape = {
-                "critical": "runs process, network, decode or exec code",
-                "investigate": "is not a known packaging-tool shape",
-            }.get(verdict or "", "matches a known packaging-tool shape")
+            kind, level, detail = _pth_line_level(line.strip(), baseline_modules)
             behaviours.append(
                 Behaviour(
-                    "new_pth_code",
-                    ("pth", normalized),
+                    kind,
+                    ("pth", " ".join(line.split())),
                     path,
                     number,
                     line,
-                    f".pth import line runs at every interpreter start and {shape}",
-                    "block",
+                    detail,
+                    level,
                 )
             )
     return behaviours
+
+
+def _pth_line_level(line: str, baseline_modules: set[str] | None) -> tuple[str, str, str]:
+    prefix = ".pth import line runs at every interpreter start"
+    verdict = pc._pth_line_verdict(line)
+    tree = pc._parse_python(line)
+    if verdict == "critical" or tree is None:
+        return "new_pth_code", "block", f"{prefix} and runs process, network, decode or exec code"
+    if baseline_modules is None:
+        return "new_pth_code", "block", prefix
+    imported = _pth_imports(tree, 0)
+    unknown = sorted(
+        name
+        for name in imported
+        if name not in sys.stdlib_module_names and name not in baseline_modules
+    )
+    if unknown:
+        return (
+            "new_pth_code",
+            "block",
+            f"{prefix} and imports modules the old release did not ship: {', '.join(unknown)}",
+        )
+    return (
+        "new_import_time_exec",
+        "warn",
+        f"{prefix}; it imports only standard-library modules or modules already in the "
+        "old release and runs no process, network, decode or dynamic exec code",
+    )
+
+
+def _pth_imports(tree: ast.Module, depth: int) -> set[str]:
+    ctx = pc._PyContext(tree)
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module.split(".")[0])
+        elif isinstance(node, ast.Call) and node.args:
+            name, _obfuscated = ctx.resolve(node.func)
+            folded, _built = pc._fold(node.args[0], ctx, 0)
+            if folded is None:
+                continue
+            if name in {"__import__", "importlib.import_module"}:
+                names.add(folded.split(".")[0])
+            elif name in _PY_EXEC_NAMES and depth < 2:
+                nested = pc._parse_python(folded)
+                if nested is None:
+                    names.add("<unparsed exec>")
+                else:
+                    names.update(_pth_imports(nested, depth + 1))
+    return names
 
 
 def _startup_module_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]:
@@ -450,7 +566,7 @@ def _startup_module_behaviours(side: _Side, result: DiffResult) -> list[Behaviou
         text = None
         if install_name.endswith(".py"):
             text = side.text(path)
-            tree = _python_tree(text)
+            tree = side.tree(path)
             if text is not None and tree is not None and not _has_code(tree):
                 continue
             fingerprint = _ast_fingerprint(text, side.digest(path))
@@ -785,10 +901,7 @@ class _PyCall:
     snippet: str
 
 
-def _python_calls(text: str, *, import_time_only: bool) -> list[_PyCall] | None:
-    tree = _python_tree(text)
-    if tree is None:
-        return None
+def _python_calls(text: str, tree: ast.Module, *, import_time_only: bool) -> list[_PyCall] | None:
     try:
         ctx = pc._PyContext(tree)
         import_time = None
@@ -910,7 +1023,7 @@ def _build_hook_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]:
         text = side.text(path)
         if text is None:
             continue
-        calls = _python_calls(text, import_time_only=False)
+        calls = side.calls(path, False)
         if calls is None:
             match = pc._SETUP_EXEC_RE.search(text)
             if match:
@@ -962,7 +1075,7 @@ def _python_import_time_behaviours(side: _Side, result: DiffResult) -> list[Beha
         text = side.text(path)
         if text is None:
             continue
-        tree = _python_tree(text)
+        tree = side.tree(path)
         if tree is None:
             continue
         package = module
@@ -972,7 +1085,7 @@ def _python_import_time_behaviours(side: _Side, result: DiffResult) -> list[Beha
             for prefix in _prefixes(target):
                 if prefix in modules and prefix not in seen:
                     queue.append(prefix)
-        for call in _python_calls(text, import_time_only=True) or []:
+        for call in side.calls(path, True) or []:
             if call.category == "decode_exec":
                 continue
             kind = "new_import_time_network"
@@ -1247,9 +1360,9 @@ def _file_code_behaviours(side: _Side, path: str) -> list[Behaviour]:
     text = side.text(path)
     if text is None:
         return behaviours
-    if not re.search(r"exec|eval|decode|loads|unhexlify|fromhex|Popen|system|spawn|run|call", text):
+    if not _DECODE_EXEC_HINT.search(text):
         return behaviours
-    calls = _python_calls(text, import_time_only=False)
+    calls = side.calls(path, False)
     if calls is None:
         match = pc._ENCODED_EXEC_RE.search(text)
         if match:
@@ -1257,8 +1370,7 @@ def _file_code_behaviours(side: _Side, path: str) -> list[Behaviour]:
             calls = [_PyCall("decode_exec", "exec", line, snippet)]
         else:
             calls = []
-    events = pc._python_events(text) or []
-    encoded_lines = sorted(event.line for event in events if event.kind == "encoded_exec")
+    encoded_lines = side.encoded_lines(path)
     first = next((call for call in calls if call.category == "decode_exec"), None)
     if first is None and encoded_lines:
         line = encoded_lines[0]

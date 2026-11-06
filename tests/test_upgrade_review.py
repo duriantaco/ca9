@@ -149,6 +149,7 @@ def test_new_startup_hooks_block_but_path_only_pth_does_not(registry):
             "demo_paths.pth": "/opt/demo/lib\nextra/path\n",
             "demo_init.pth": "import os, subprocess; subprocess.Popen(['python', '-c', 'x'])\n",
             "demo_boot.pth": "import _demo_boot\n",
+            "demo_cov.pth": "import sys; exec('import os\\nif os.getenv(\"X\"):\\n import demo\\n')\n",
             "_demo_boot.py": "import os\nos.system('true')\n",
             "demo-1.1.data/purelib/sitecustomize.py": "import _demo_boot\n",
             "demo/usercustomize.py": '"""docstring only"""\n',
@@ -163,6 +164,8 @@ def test_new_startup_hooks_block_but_path_only_pth_does_not(registry):
     assert paths == {"demo_init.pth", "demo_boot.pth", "demo-1.1.data/purelib/sitecustomize.py"}
     pth = next(delta for delta in result["block"] if delta["path"] == "demo_init.pth")
     assert pth["line"] == 1 and "subprocess.Popen" in pth["snippet"]
+    shipped = [delta for delta in result["warn"] if delta["path"] == "demo_cov.pth"]
+    assert [delta["kind"] for delta in shipped] == ["new_import_time_exec"]
     assert receipt["pairs_with_block"] == 1 and receipt["complete"] is True
 
 
@@ -179,7 +182,7 @@ def test_behaviour_present_in_both_versions_is_counted_not_reported(registry):
     result, receipt = _one("pypi", "demo", "1.0", "1.1")
 
     assert result["block"] == [] and result["warn"] == []
-    assert result["unchanged_risky_by_kind"] == {"new_decode_exec": 1, "new_pth_code": 1}
+    assert result["unchanged_risky_by_kind"] == {"new_decode_exec": 1, "new_import_time_exec": 1}
     assert receipt["unchanged_risky_behaviours"] == 2
 
 
@@ -406,7 +409,7 @@ def test_bad_input_and_policy_skips_never_raise_or_fetch(registry):
 def test_internal_package_reviewed_from_listed_private_index_only(registry):
     index = "https://pypi.corp.example/simple"
     files = []
-    for version, extra in (("1.0", {}), ("1.1", {"acme_boot.pth": "import acme_core\n"})):
+    for version, extra in (("1.0", {}), ("1.1", {"acme_boot.pth": "import os; os.system('id')\n"})):
         raw = _wheel("acme_core", version, {"acme_core/__init__.py": "X = 1\n", **extra})
         filename = f"acme_core-{version}-py3-none-any.whl"
         url = f"https://pypi.corp.example/files/{filename}"
