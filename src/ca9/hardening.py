@@ -16,6 +16,7 @@ install scripts off unless allowed (``allowScripts``).
 from __future__ import annotations
 
 import configparser
+import fnmatch
 import json
 import re
 from collections.abc import Mapping
@@ -36,6 +37,9 @@ except ImportError:
 
 SCHEMA = "ca9.hardening.v1"
 MAX_ACTION_REFS = 2000
+MAX_ACTION_FILES = 500
+MAX_CHECK_FAILED = 20
+PNPM_SETTINGS_IN_WORKSPACE_ONLY = 11
 MAX_BYTES = 4 * 1024 * 1024
 DEPENDABOT_DEFAULT_DAYS = 3
 COOLDOWN_KEYS = (
@@ -98,6 +102,32 @@ _ISO_DURATION = re.compile(
 _FRIENDLY_PART = re.compile(r"(\d+(?:\.\d+)?)\s*([a-z]+)", re.IGNORECASE)
 _USES = re.compile(r"^\s*(?:-\s*)?uses\s*:\s*(['\"]?)([^'\"\s#]+)\1", re.MULTILINE)
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+_SCRIPT_OVERRIDES = re.compile(
+    r"\b(?P<npm>npm_config_ignore_scripts)\s*[:=]\s*['\"]?(?P<npm_value>false|0|no|off)\b"
+    r"|(?P<flag>--ignore-scripts)=(?P<flag_value>false|0)\b"
+    r"|\bnpm\s+config\s+set\s+(?P<config>ignore-scripts)[\s=]+['\"]?(?P<config_value>false|0)\b"
+    r"|\b(?P<yarn>yarn_enable_scripts)\s*[:=]\s*['\"]?(?P<yarn_value>true|1|yes|on)\b",
+    re.IGNORECASE,
+)
+_RENOVATE_PACKAGE_MATCHERS = (
+    "matchPackageNames",
+    "matchPackagePatterns",
+    "matchPackagePrefixes",
+    "matchDepNames",
+    "matchDepPatterns",
+    "matchDepPrefixes",
+    "matchSourceUrls",
+    "matchSourceUrlPrefixes",
+)
+_MATCH_ALL = frozenset({"*", "**", ".*", "/.*/", "/.+/", "/^.*$/", "/^.+$/"})
+_PNPM_NPMRC_KEYS = (
+    "minimum-release-age",
+    "minimum-release-age-exclude",
+    "strict-dep-builds",
+    "only-built-dependencies",
+    "never-built-dependencies",
+    "dangerously-allow-all-builds",
+)
 _RENOVATE_FILES = (
     "renovate.json",
     "renovate.json5",
@@ -117,6 +147,7 @@ def settings(repo_root: str | Path) -> dict[str, Any]:
     if not root.is_dir():
         state.error(".", "repository root is not a directory")
         return state.result()
+    _managers(state)
     _npmrc(state)
     _package_json(state)
     _pnpm_workspace(state)
@@ -144,6 +175,8 @@ class _State:
             "bun_trusted_dependencies": [],
             "bun_ignore_scripts": None,
             "yarn_enable_scripts": None,
+            "pnpm_never_built_dependencies": [],
+            "workflow_overrides": [],
         }
         self.actions: dict[str, Any] = {"pinned": 0, "unpinned": 0, "refs": [], "truncated": False}
         self.sources: dict[str, str] = {}
@@ -151,7 +184,16 @@ class _State:
         self.dependabot: list[dict[str, Any]] = []
         self.managers: dict[str, str] = {}
         self.renovate_presets: list[str] = []
+        self.renovate_rules: list[dict[str, Any]] = []
+        self.ignored: list[dict[str, str]] = []
+        self.pnpm_major: int | None = None
         self.errors: list[dict[str, str]] = []
+
+    def pnpm_workspace_only(self) -> bool:
+        return self.pnpm_major is not None and self.pnpm_major >= PNPM_SETTINGS_IN_WORKSPACE_ONLY
+
+    def ignore(self, setting: str, rel: str, reason: str) -> None:
+        self.ignored.append({"setting": setting, "file": rel, "reason": reason})
 
     def text(self, rel: str) -> str | None:
         path = self.root / rel
@@ -198,6 +240,8 @@ class _State:
             "dependabot": self.dependabot,
             "managers": self.managers,
             "renovate_presets": self.renovate_presets,
+            "renovate_rules": self.renovate_rules,
+            "ignored": self.ignored,
             "errors": self.errors,
             "status": status,
         }
@@ -220,6 +264,10 @@ def _npmrc(state: _State) -> None:
         else:
             values[key] = [value]
     rel = ".npmrc"
+    if state.pnpm_workspace_only():
+        for key in _PNPM_NPMRC_KEYS:
+            if values.pop(key, None) is not None:
+                state.ignore(key, rel, "pnpm 11 reads pnpm settings from pnpm-workspace.yaml only")
     if "min-release-age" in values:
         state.set(state.cooldown, "npm_days", _number(values["min-release-age"][-1]), rel)
     if "ignore-scripts" in values:
@@ -235,6 +283,9 @@ def _npmrc(state: _State) -> None:
     if "dangerously-allow-all-builds" in values:
         allow_all = _bool(values["dangerously-allow-all-builds"][-1])
         state.set(state.scripts, "pnpm_dangerously_allow_all_builds", allow_all, rel)
+    if "never-built-dependencies" in values:
+        names = _split_list(values["never-built-dependencies"])
+        state.set(state.scripts, "pnpm_never_built_dependencies", names, rel)
     for key in ("allow-scripts", "allowscripts"):
         if key in values:
             state.set(state.scripts, "npm12_allow_scripts", _split_list(values[key]), rel)
@@ -256,15 +307,9 @@ def _package_json(state: _State) -> None:
     if not isinstance(data, dict):
         return
     rel = "package.json"
-    manager = data.get("packageManager")
-    if isinstance(manager, str) and "@" in manager:
-        name, _, version = manager.partition("@")
-        state.managers[name.strip()] = version.split("+")[0].strip()
     pnpm = data.get("pnpm")
     if isinstance(pnpm, dict):
-        if "onlyBuiltDependencies" in pnpm:
-            names = _names(pnpm["onlyBuiltDependencies"])
-            state.set(state.scripts, "pnpm_only_built_dependencies", names, rel)
+        _pnpm_build_lists(state, pnpm, rel)
         if "allowBuilds" in pnpm:
             state.set(state.scripts, "pnpm_allow_builds", _allowed(pnpm["allowBuilds"]), rel)
         if "strictDepBuilds" in pnpm:
@@ -282,6 +327,46 @@ def _package_json(state: _State) -> None:
         _renovate_config(state, data["renovate"], "package.json")
 
 
+def _managers(state: _State) -> None:
+    text = state.text("package.json")
+    if text is None:
+        return
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return
+    if not isinstance(data, dict):
+        return
+    manager = data.get("packageManager")
+    if isinstance(manager, str) and "@" in manager:
+        name, _, version = manager.partition("@")
+        state.managers[name.strip()] = version.split("+")[0].strip()
+    dev_engines = data.get("devEngines")
+    if isinstance(dev_engines, dict) and isinstance(dev_engines.get("packageManager"), dict):
+        declared = dev_engines["packageManager"]
+        if isinstance(declared.get("name"), str) and isinstance(declared.get("version"), str):
+            state.managers.setdefault(declared["name"].strip(), declared["version"].strip())
+    engines = data.get("engines")
+    if isinstance(engines, dict) and isinstance(engines.get("pnpm"), str):
+        state.managers.setdefault("pnpm", engines["pnpm"].strip())
+    match = re.search(r"(\d+)", state.managers.get("pnpm", ""))
+    if match:
+        state.pnpm_major = int(match.group(1))
+
+
+def _pnpm_build_lists(state: _State, data: dict[str, Any], rel: str) -> None:
+    for key, setting in (
+        ("onlyBuiltDependencies", "pnpm_only_built_dependencies"),
+        ("neverBuiltDependencies", "pnpm_never_built_dependencies"),
+    ):
+        if key not in data:
+            continue
+        if state.pnpm_workspace_only():
+            state.ignore(key, rel, "removed in pnpm 11 (replaced by allowBuilds)")
+            continue
+        state.set(state.scripts, setting, _names(data[key]), rel)
+
+
 def _pnpm_workspace(state: _State) -> None:
     rel = "pnpm-workspace.yaml"
     data = _yaml_mapping(state, rel)
@@ -295,9 +380,7 @@ def _pnpm_workspace(state: _State) -> None:
         state.set(state.scripts, "pnpm_strict_dep_builds", _bool(data["strictDepBuilds"]), rel)
     if "allowBuilds" in data:
         state.set(state.scripts, "pnpm_allow_builds", _allowed(data["allowBuilds"]), rel)
-    if "onlyBuiltDependencies" in data:
-        names = _names(data["onlyBuiltDependencies"])
-        state.set(state.scripts, "pnpm_only_built_dependencies", names, rel)
+    _pnpm_build_lists(state, data, rel)
     if "dangerouslyAllowAllBuilds" in data:
         allow_all = _bool(data["dangerouslyAllowAllBuilds"])
         state.set(state.scripts, "pnpm_dangerously_allow_all_builds", allow_all, rel)
@@ -385,9 +468,11 @@ def _dependabot(state: _State) -> None:
         for update in updates:
             if not isinstance(update, dict):
                 continue
-            directory = update.get("directory")
-            if not isinstance(directory, str):
-                directory = ",".join(_names(update.get("directories")))
+            directories = _names(update.get("directories"))
+            if isinstance(update.get("directory"), str):
+                directories = [update["directory"], *directories]
+            directories = [_normal_directory(item) for item in directories] or ["/"]
+            directory = ",".join(directories)
             cooldown = update.get("cooldown")
             default_days = None
             if isinstance(cooldown, dict):
@@ -398,7 +483,8 @@ def _dependabot(state: _State) -> None:
             state.dependabot.append(
                 {
                     "ecosystem": str(update.get("package-ecosystem") or ""),
-                    "directory": directory or "/",
+                    "directory": directory,
+                    "directories": directories,
                     "default_days": default_days,
                 }
             )
@@ -406,6 +492,11 @@ def _dependabot(state: _State) -> None:
         if days:
             state.set(state.cooldown, "dependabot_days", min(days), rel)
         return
+
+
+def _normal_directory(value: str) -> str:
+    directory = "/" + value.strip().strip("/")
+    return directory
 
 
 def _renovate(state: _State) -> None:
@@ -431,44 +522,159 @@ def _renovate_config(state: _State, data: dict[str, Any], rel: str) -> None:
     presets = data.get("extends")
     if isinstance(presets, list):
         state.renovate_presets = [str(item) for item in presets if isinstance(item, str)]
+    rules = data.get("packageRules")
+    if not isinstance(rules, list):
+        return
+    for rule in rules:
+        if not isinstance(rule, dict) or "minimumReleaseAge" not in rule:
+            continue
+        patterns: list[str] = []
+        for key in _RENOVATE_PACKAGE_MATCHERS:
+            patterns.extend(_names(rule.get(key)))
+        raw = rule["minimumReleaseAge"]
+        value = None
+        if isinstance(raw, str):
+            value = raw.strip()
+        state.renovate_rules.append(
+            {
+                "match": sorted(patterns),
+                "all": not patterns or any(item in _MATCH_ALL for item in patterns),
+                "minimum_release_age": value,
+            }
+        )
+    if state.renovate_rules:
+        state.sources["renovate_rules"] = rel
 
 
 def _actions(state: _State) -> None:
-    paths: list[Path] = []
-    for pattern in (".github/workflows/*.yml", ".github/workflows/*.yaml"):
-        paths.extend(state.root.glob(pattern))
-    for pattern in (".github/actions/**/action.yml", ".github/actions/**/action.yaml"):
-        paths.extend(state.root.glob(pattern))
+    queue: list[Path] = []
+    for pattern in (
+        ".github/workflows/*.yml",
+        ".github/workflows/*.yaml",
+        ".github/actions/**/action.yml",
+        ".github/actions/**/action.yaml",
+    ):
+        queue.extend(sorted(state.root.glob(pattern)))
     for name in ("action.yml", "action.yaml"):
-        paths.append(state.root / name)
-    for path in sorted(set(paths)):
-        rel = path.relative_to(state.root).as_posix()
+        queue.append(state.root / name)
+    try:
+        root = state.root.resolve()
+    except OSError:
+        return
+    seen: set[Path] = set()
+    while queue:
+        path = queue.pop(0)
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen or root not in resolved.parents or not resolved.is_file():
+            continue
+        if len(seen) >= MAX_ACTION_FILES:
+            state.actions["truncated"] = True
+            break
+        seen.add(resolved)
+        rel = resolved.relative_to(root).as_posix()
         text = state.text(rel)
         if text is None:
             continue
-        for match in _USES.finditer(text):
-            uses = match.group(2)
+        _workflow_overrides(state, rel, text)
+        for uses, line in _uses_values(text):
             if uses.startswith(("./", ".\\")):
+                queue.extend(_local_action_files(root, uses))
                 continue
-            pinned, ref = _ref_pinned(uses)
-            key = "unpinned"
-            if pinned:
-                key = "pinned"
-            state.actions[key] += 1
-            if len(state.actions["refs"]) >= MAX_ACTION_REFS:
-                state.actions["truncated"] = True
-                continue
-            state.actions["refs"].append(
-                {
-                    "file": rel,
-                    "uses": _action_name(uses),
-                    "ref": ref,
-                    "pinned": pinned,
-                    "line": text.count("\n", 0, match.start(2)) + 1,
-                }
-            )
+            _count_action(state, rel, uses, line)
     if state.actions["refs"]:
         state.sources["actions"] = ".github/workflows"
+
+
+def _count_action(state: _State, rel: str, uses: str, line: int) -> None:
+    pinned, ref = _ref_pinned(uses)
+    key = "unpinned"
+    if pinned:
+        key = "pinned"
+    state.actions[key] += 1
+    if len(state.actions["refs"]) >= MAX_ACTION_REFS:
+        state.actions["truncated"] = True
+        return
+    state.actions["refs"].append(
+        {"file": rel, "uses": _action_name(uses), "ref": ref, "pinned": pinned, "line": line}
+    )
+
+
+def _local_action_files(root: Path, uses: str) -> list[Path]:
+    target = root / uses[2:].split("@")[0]
+    if target.suffix in {".yml", ".yaml"}:
+        return [target]
+    return [target / "action.yml", target / "action.yaml"]
+
+
+def _uses_values(text: str) -> list[tuple[str, int]]:
+    hits = [
+        (match.group(2), text.count("\n", 0, match.start(2)) + 1)
+        for match in _USES.finditer(text)
+        if not match.group(2).startswith(("*", "&"))
+    ]
+    parsed = _yaml_uses(text)
+    if parsed is None:
+        return hits
+    values: list[tuple[str, int]] = []
+    for value in parsed:
+        hit = next((item for item in hits if item[0] == value), None)
+        if hit is not None:
+            hits.remove(hit)
+            values.append(hit)
+            continue
+        position = text.find(value)
+        values.append((value, text.count("\n", 0, max(position, 0)) + 1))
+    return values
+
+
+def _yaml_uses(text: str) -> list[str] | None:
+    if yaml is None:
+        return None
+    try:
+        document = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    found: list[str] = []
+    stack = [document]
+    visited: set[int] = set()
+    while stack:
+        node = stack.pop()
+        if id(node) in visited:
+            continue
+        if isinstance(node, dict):
+            visited.add(id(node))
+            for key, value in node.items():
+                if key == "uses" and isinstance(value, str):
+                    found.append(value.strip())
+                elif isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            visited.add(id(node))
+            stack.extend(reversed(node))
+    return found
+
+
+def _workflow_overrides(state: _State, rel: str, text: str) -> None:
+    for match in _SCRIPT_OVERRIDES.finditer(text):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        if text[line_start : match.start()].strip().startswith("#"):
+            continue
+        groups = match.groupdict()
+        for name in ("npm", "flag", "config", "yarn"):
+            if groups[name]:
+                state.scripts["workflow_overrides"].append(
+                    {
+                        "file": rel,
+                        "line": text.count("\n", 0, match.start()) + 1,
+                        "setting": groups[name].lower(),
+                        "value": groups[f"{name}_value"].lower(),
+                    }
+                )
+                state.sources["workflow_overrides"] = rel
+                break
 
 
 def _ref_pinned(uses: str) -> tuple[bool, str]:
@@ -660,24 +866,51 @@ def cooldown_minutes(cooldown: Mapping[str, Any], key: str) -> float | None:
 
 
 def regressions(base: Any, head: Any) -> list[dict[str, Any]]:
-    old = _snapshot(base)
-    new = _snapshot(head)
     found: list[dict[str, Any]] = []
-    _cooldown_regressions(old, new, found)
-    _dependabot_regressions(old, new, found)
-    _exclusion_regressions(old, new, found)
-    _script_regressions(old, new, found)
-    _action_regressions(old, new, found)
+    old = _snapshot("base", base, found)
+    new = _snapshot("head", head, found)
+    if old is not None and new is not None:
+        _cooldown_regressions(old, new, found)
+        _renovate_rule_regressions(old, new, found)
+        _dependabot_regressions(old, new, found)
+        _exclusion_regressions(old, new, found)
+        _script_regressions(old, new, found)
+        _override_regressions(old, new, found)
+        _action_regressions(old, new, found)
     found.sort(key=lambda item: (item["kind"], item["path"] or "", item["detail"]))
     return found
 
 
-def _snapshot(value: Any) -> dict[str, Any]:
-    if isinstance(value, Mapping):
-        return dict(value)
+def _failed(side: str, detail: str, path: Any) -> dict[str, Any]:
+    item = _item("check_failed", detail, None, "", None, None)
+    if isinstance(path, str):
+        item["path"] = path
+    item["side"] = side
+    return item
+
+
+def _snapshot(side: str, value: Any, found: list[dict[str, Any]]) -> dict[str, Any] | None:
     if isinstance(value, (str, Path)):
-        return settings(value)
-    return {}
+        value = settings(value)
+    if not isinstance(value, Mapping) or value.get("schema") != SCHEMA:
+        found.append(_failed(side, f"{side} is not a {SCHEMA} snapshot or a repository path", None))
+        return None
+    snapshot = dict(value)
+    errors = snapshot.get("errors")
+    listed: list[Mapping[str, Any]] = []
+    if isinstance(errors, list):
+        listed = [error for error in errors if isinstance(error, Mapping)]
+    status = snapshot.get("status")
+    if status not in {None, "complete"} and not listed:
+        found.append(
+            _failed(side, f"{side} snapshot is {status}; some settings were not read", None)
+        )
+    for error in listed[:MAX_CHECK_FAILED]:
+        detail = f"{side}: could not read {error.get('file')}: {error.get('reason')}"
+        found.append(_failed(side, detail, error.get("file")))
+    if any(error.get("file") == "." for error in listed):
+        return None
+    return snapshot
 
 
 def _group(snapshot: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -759,15 +992,37 @@ def _cooldown_regressions(
             found.append(_item("cooldown_lowered", detail, path, key, base_value, head_value))
 
 
-def _dependabot_entries(snapshot: Mapping[str, Any]) -> dict[tuple[str, str], Any]:
-    entries: dict[tuple[str, str], Any] = {}
+def _dependabot_entries(snapshot: Mapping[str, Any]) -> list[tuple[str, list[str], Any]]:
+    entries: list[tuple[str, list[str], Any]] = []
     raw = snapshot.get("dependabot")
-    if isinstance(raw, list):
-        for entry in raw:
-            if isinstance(entry, Mapping):
-                key = (str(entry.get("ecosystem")), str(entry.get("directory")))
-                entries[key] = entry.get("default_days")
+    if not isinstance(raw, list):
+        return entries
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            continue
+        directories = entry.get("directories")
+        if not isinstance(directories, list):
+            directories = str(entry.get("directory") or "/").split(",")
+        normal = [_normal_directory(str(item)) for item in directories]
+        days = entry.get("default_days")
+        if isinstance(days, bool) or not isinstance(days, (int, float)):
+            days = None
+        entries.append((str(entry.get("ecosystem") or "").lower(), normal, days))
     return entries
+
+
+def _covers(head_directory: str, base_directory: str) -> bool:
+    return (
+        head_directory == base_directory
+        or fnmatch.fnmatchcase(base_directory, head_directory)
+        or fnmatch.fnmatchcase(head_directory, base_directory)
+    )
+
+
+def _effective_days(days: Any) -> float:
+    if days is None:
+        return DEPENDABOT_DEFAULT_DAYS
+    return days
 
 
 def _has_dependabot_entries(snapshot: Mapping[str, Any]) -> bool:
@@ -781,35 +1036,145 @@ def _dependabot_regressions(
     if not _has_dependabot_entries(old):
         return
     before = _dependabot_entries(old)
-    after = _dependabot_entries(new)
     path = _path(old, new, "dependabot")
-    for key, head_days in after.items():
-        ecosystem, directory = key
-        base_days = before.get(key)
-        base_effective = DEPENDABOT_DEFAULT_DAYS
-        if base_days is not None:
-            base_effective = base_days
-        head_effective = DEPENDABOT_DEFAULT_DAYS
-        if head_days is not None:
-            head_effective = head_days
-        if head_effective >= base_effective:
-            continue
-        where = f"{ecosystem} in {directory}"
-        if head_days is None:
-            detail = (
-                f"Dependabot cooldown for {where} was removed (was {base_days} days); "
-                f"the {DEPENDABOT_DEFAULT_DAYS}-day default applies"
-            )
-            found.append(
-                _item("cooldown_removed", detail, path, "dependabot_days", base_days, None)
-            )
-            continue
+    for ecosystem, directories, head_days in _dependabot_entries(new):
+        head_effective = _effective_days(head_days)
+        matched = False
+        for base_ecosystem, base_directories, base_days in before:
+            if base_ecosystem != ecosystem:
+                continue
+            covered = [
+                directory
+                for directory in base_directories
+                if any(_covers(head, directory) for head in directories)
+            ]
+            if not covered:
+                continue
+            matched = True
+            base_effective = _effective_days(base_days)
+            if head_effective < base_effective:
+                where = f"{ecosystem} in {', '.join(covered)}"
+                found.append(_dependabot_item(where, path, base_days, base_effective, head_days))
+        if not matched and head_effective < DEPENDABOT_DEFAULT_DAYS:
+            where = f"{ecosystem} in {', '.join(directories)}"
+            found.append(_dependabot_item(where, path, None, DEPENDABOT_DEFAULT_DAYS, head_days))
+
+
+def _dependabot_item(
+    where: str, path: str | None, base_days: Any, base_effective: float, head_days: Any
+) -> dict[str, Any]:
+    if head_days is None:
         detail = (
-            f"Dependabot cooldown for {where} lowered from {base_effective} to {head_days} days"
+            f"Dependabot cooldown for {where} was removed (was {base_days} days); "
+            f"the {DEPENDABOT_DEFAULT_DAYS}-day default applies"
         )
-        found.append(
-            _item("cooldown_lowered", detail, path, "dependabot_days", base_days, head_days)
+        return _item("cooldown_removed", detail, path, "dependabot_days", base_days, None)
+    detail = f"Dependabot cooldown for {where} lowered from {base_effective} to {head_days} days"
+    return _item("cooldown_lowered", detail, path, "dependabot_days", base_days, head_days)
+
+
+def _rules(snapshot: Mapping[str, Any]) -> dict[tuple[bool, tuple[str, ...]], Any]:
+    rules: dict[tuple[bool, tuple[str, ...]], Any] = {}
+    raw = snapshot.get("renovate_rules")
+    if not isinstance(raw, list):
+        return rules
+    for rule in raw:
+        if not isinstance(rule, Mapping) or not isinstance(rule.get("match"), list):
+            continue
+        key = (bool(rule.get("all")), tuple(str(item) for item in rule["match"]))
+        age = rule.get("minimum_release_age")
+        minutes: float | None = 0.0
+        if isinstance(age, str):
+            minutes = duration_minutes(age, None)
+        if minutes is not None:
+            rules[key] = (age, minutes)
+    return rules
+
+
+def _renovate_baseline(snapshot: Mapping[str, Any], rules: dict[Any, Any]) -> float | None:
+    top = cooldown_minutes(_group(snapshot, "cooldown"), "renovate")
+    if top is not None:
+        return top
+    broad = [minutes for (all_packages, _), (_, minutes) in rules.items() if all_packages]
+    if broad:
+        return broad[-1]
+    return None
+
+
+def _renovate_rule_regressions(
+    old: Mapping[str, Any], new: Mapping[str, Any], found: list[dict[str, Any]]
+) -> None:
+    before = _rules(old)
+    after = _rules(new)
+    base_baseline = _renovate_baseline(old, before)
+    head_baseline = _renovate_baseline(new, after)
+    path = _path(old, new, "renovate_rules")
+    for key, (age, minutes) in after.items():
+        reference = base_baseline
+        if key in before:
+            reference = before[key][1]
+        if reference is None or minutes >= reference:
+            continue
+        found.extend(_rule_items(key, age, minutes, path))
+    for key, (_, base_minutes) in before.items():
+        remaining = head_baseline or 0.0
+        if key not in after and base_minutes > remaining:
+            found.extend(_rule_items(key, None, remaining, path))
+
+
+def _rule_items(
+    key: tuple[bool, tuple[str, ...]], age: Any, minutes: float, path: str | None
+) -> list[dict[str, Any]]:
+    all_packages, patterns = key
+    shown = age or "no minimum"
+    if all_packages:
+        kind = "cooldown_lowered"
+        if minutes <= 0:
+            kind = "cooldown_removed"
+        detail = f"Renovate packageRules set minimumReleaseAge to {shown} for every package"
+        return [_item(kind, detail, path, "renovate", None, age)]
+    items = []
+    for pattern in patterns:
+        kind = "cooldown_lowered"
+        if minutes <= 0:
+            kind = "cooldown_exclusion_added"
+        detail = f"Renovate packageRules set minimumReleaseAge to {shown} for {pattern}"
+        item = _item(kind, detail, path, "renovate", None, age)
+        item["package"] = pattern
+        items.append(item)
+    return items
+
+
+def _override_regressions(
+    old: Mapping[str, Any], new: Mapping[str, Any], found: list[dict[str, Any]]
+) -> None:
+    before = {
+        (item.get("file"), item.get("setting"), item.get("value"))
+        for item in _group(old, "scripts").get("workflow_overrides") or []
+        if isinstance(item, Mapping)
+    }
+    reported: set[tuple[Any, Any, Any]] = set()
+    for item in _group(new, "scripts").get("workflow_overrides") or []:
+        if not isinstance(item, Mapping):
+            continue
+        key = (item.get("file"), item.get("setting"), item.get("value"))
+        if key in before or key in reported:
+            continue
+        reported.add(key)
+        detail = (
+            f"{item.get('file')} sets {item.get('setting')}={item.get('value')}, which lets "
+            "dependency install scripts run in CI"
         )
+        entry = _item(
+            "ignore_scripts_disabled",
+            detail,
+            item.get("file"),
+            "workflow_overrides",
+            None,
+            item.get("value"),
+        )
+        entry["line"] = item.get("line")
+        found.append(entry)
 
 
 def _exclusion_regressions(
@@ -893,6 +1258,23 @@ def _script_regressions(
         )
         item["package"] = "*"
         found.append(item)
+    pnpm_allowed = set(before.get("pnpm_allow_builds") or []) | set(
+        before.get("pnpm_only_built_dependencies") or []
+    )
+    version = _major(new, "pnpm")
+    if version is None or version < PNPM_SETTINGS_IN_WORKSPACE_ONLY * 1000:
+        never_after = set(after.get("pnpm_never_built_dependencies") or [])
+        for name in sorted(set(before.get("pnpm_never_built_dependencies") or []) - never_after):
+            item = _item(
+                "allow_builds_added",
+                f"{name} removed from pnpm neverBuiltDependencies; it may now run build scripts",
+                _path(old, new, "pnpm_never_built_dependencies"),
+                "pnpm_never_built_dependencies",
+                name,
+                None,
+            )
+            item["package"] = name
+            found.append(item)
     for key, kind, label in (
         ("pnpm_allow_builds", "allow_builds_added", "pnpm allowBuilds"),
         ("pnpm_only_built_dependencies", "allow_builds_added", "pnpm onlyBuiltDependencies"),
@@ -900,6 +1282,8 @@ def _script_regressions(
         ("npm12_allow_scripts", "allow_scripts_added", "npm allowScripts"),
     ):
         known = set(before.get(key) or [])
+        if key.startswith("pnpm_"):
+            known = pnpm_allowed
         for name in after.get(key) or []:
             if name in known:
                 continue
@@ -914,10 +1298,12 @@ def _action_regressions(
     base_refs = _group(old, "actions").get("refs") or []
     head_refs = _group(new, "actions").get("refs") or []
     pinned_before = {
-        ref.get("uses") for ref in base_refs if isinstance(ref, Mapping) and ref.get("pinned")
+        str(ref.get("uses")).lower()
+        for ref in base_refs
+        if isinstance(ref, Mapping) and ref.get("pinned")
     }
     unpinned_before = {
-        (ref.get("uses"), ref.get("ref"))
+        (str(ref.get("uses")).lower(), ref.get("ref"))
         for ref in base_refs
         if isinstance(ref, Mapping) and not ref.get("pinned")
     }
@@ -925,7 +1311,7 @@ def _action_regressions(
     for ref in head_refs:
         if not isinstance(ref, Mapping) or ref.get("pinned"):
             continue
-        uses = ref.get("uses")
+        uses = str(ref.get("uses")).lower()
         key = (uses, ref.get("ref"), ref.get("file"))
         if (
             uses not in pinned_before
@@ -936,7 +1322,8 @@ def _action_regressions(
         reported.add(key)
         item = _item(
             "action_unpinned",
-            f"{uses} was pinned to a commit SHA and is now used at {ref.get('ref') or 'no ref'}",
+            f"{ref.get('uses')} was pinned to a commit SHA and is now used at "
+            f"{ref.get('ref') or 'no ref'}",
             ref.get("file"),
             "actions",
             "sha",
