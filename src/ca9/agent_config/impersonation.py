@@ -41,7 +41,13 @@ _VENDORS: dict[str, dict[str, frozenset[str]]] = {
         "npm": frozenset({"postmark"}),
         "pypi": frozenset(),
     },
+    "modelcontextprotocol": {
+        "npm_scopes": frozenset({"@modelcontextprotocol"}),
+        "npm": frozenset(),
+        "pypi": frozenset(),
+    },
 }
+LONG_BRAND = 12
 _DICTIONARY_WORDS = frozenset({"openapi", "openal", "openui", "clause"})
 
 
@@ -81,6 +87,24 @@ def check(ecosystem: str | None, package: str | None) -> dict[str, str] | None:
                     "matched": word,
                     "expected": _expected(ecosystem, official),
                 }
+        if len(vendor) >= LONG_BRAND:
+            window = _near_window(compact, vendor)
+            if window is not None:
+                return {
+                    "vendor": vendor,
+                    "reason": "near_miss",
+                    "matched": window,
+                    "expected": _expected(ecosystem, official),
+                }
+    return None
+
+
+def _near_window(compact: str, vendor: str) -> str | None:
+    for size in (len(vendor) - 1, len(vendor), len(vendor) + 1):
+        for start in range(len(compact) - size + 1):
+            window = compact[start : start + size]
+            if window != vendor and _within_one_edit(window, vendor):
+                return window
     return None
 
 
