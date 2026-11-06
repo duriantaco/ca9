@@ -906,7 +906,7 @@ def _python_calls(text: str, tree: ast.Module, *, import_time_only: bool) -> lis
         ctx = pc._PyContext(tree)
         import_time = None
         if import_time_only:
-            import_time = pc._import_time_nodes(tree)
+            import_time = _import_time_with_local_calls(tree)
         calls: list[_PyCall] = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -922,6 +922,39 @@ def _python_calls(text: str, tree: ast.Module, *, import_time_only: bool) -> lis
         return calls
     except RecursionError:
         return None
+
+
+def _import_time_with_local_calls(tree: ast.Module) -> set[int]:
+    """Module-level nodes plus the bodies of module functions called at import time."""
+    found = pc._import_time_nodes(tree)
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    pending = [tree]
+    expanded: set[str] = set()
+    for _round in range(4):
+        called = set()
+        for scope in pending:
+            for node in ast.walk(scope):
+                if (
+                    isinstance(node, ast.Call)
+                    and id(node) in found
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in functions
+                    and node.func.id not in expanded
+                ):
+                    called.add(node.func.id)
+        if not called:
+            break
+        pending = []
+        for name in sorted(called):
+            expanded.add(name)
+            body = ast.Module(body=functions[name].body, type_ignores=[])
+            found |= pc._import_time_nodes(body)
+            pending.append(body)
+    return found
 
 
 def _call_category(node: ast.Call, name: str | None, ctx: Any) -> str | None:

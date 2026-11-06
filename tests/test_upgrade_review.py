@@ -208,15 +208,19 @@ def test_decode_and_exec_split_across_variables_blocks(registry):
 def test_import_time_process_warns_only_for_module_level_code(registry):
     registry.pypi("demo", "1.0", wheel={**BASE, "demo/cli.py": "def main():\n    pass\n"})
     init = "import subprocess, sys\nfrom . import cli\nsubprocess.Popen([sys.executable, 'x.py'])\n"
-    cli = "import subprocess\n\ndef main():\n    subprocess.run(['ls'])\n"
+    cli = (
+        "import subprocess, urllib.request\n\ndef main():\n    subprocess.run(['ls'])\n\n"
+        "def _beacon():\n    urllib.request.urlopen('https://example.invalid')\n\n_beacon()\n"
+    )
     registry.pypi("demo", "1.1", wheel={"demo/__init__.py": init, "demo/cli.py": cli})
 
     result, _receipt = _one("pypi", "demo", "1.0", "1.1")
 
     assert result["block"] == []
-    assert _kinds(result, "warn") == ["new_import_time_exec"]
-    warn = result["warn"][0]
-    assert warn["path"] == "demo/__init__.py" and warn["line"] == 3
+    assert _kinds(result, "warn") == ["new_import_time_exec", "new_import_time_network"]
+    exec_warn, network_warn = result["warn"]
+    assert exec_warn["path"] == "demo/__init__.py" and exec_warn["line"] == 3
+    assert network_warn["path"] == "demo/cli.py" and network_warn["line"] == 7
 
 
 def test_url_requirement_blocks_and_registry_requirement_is_info(registry):
