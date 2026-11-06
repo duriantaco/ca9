@@ -171,6 +171,63 @@ PYPI_PACKAGES = (
     "transformers",
 )
 
+HELDOUT_NPM = (
+    "classnames",
+    "prop-types",
+    "@reduxjs/toolkit",
+    "styled-components",
+    "framer-motion",
+    "chart.js",
+    "d3",
+    "luxon",
+    "joi",
+    "yup",
+    "ajv",
+    "qs",
+    "cookie",
+    "helmet",
+    "morgan",
+    "winston",
+    "pino",
+    "bcrypt",
+    "knex",
+    "sequelize",
+    "typeorm",
+    "@nestjs/common",
+    "class-transformer",
+    "inquirer",
+    "nanoid",
+)
+HELDOUT_PYPI = (
+    "pyjwt",
+    "bcrypt",
+    "pymysql",
+    "sqlmodel",
+    "marshmallow",
+    "pyparsing",
+    "regex",
+    "simplejson",
+    "msgpack",
+    "google-auth",
+    "azure-core",
+    "kubernetes",
+    "docker",
+    "paramiko",
+    "networkx",
+    "huggingface-hub",
+    "safetensors",
+    "flake8",
+    "pylint",
+    "isort",
+    "tox",
+    "pre-commit",
+    "hatchling",
+    "keyring",
+    "tenacity",
+    "structlog",
+    "loguru",
+)
+
 
 def _get_json(url: str, accept: str = "application/json", limit: int = 64 * 1024 * 1024) -> Any:
     request = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "ca9-eval"})
@@ -215,10 +272,15 @@ def _previous(versions: list[Version], latest: Version, bump: str) -> tuple[Vers
     return None
 
 
-def select(out: Path) -> None:
+def select(out: Path, heldout: bool = False) -> None:
     pairs = []
     bumps = ("patch", "minor", "major")
-    for index, name in enumerate(NPM_PACKAGES):
+    npm_names = NPM_PACKAGES
+    pypi_names = PYPI_PACKAGES
+    if heldout:
+        npm_names = HELDOUT_NPM
+        pypi_names = HELDOUT_PYPI
+    for index, name in enumerate(npm_names):
         try:
             document = _get_json(
                 f"https://registry.npmjs.org/{name.replace('/', '%2f')}",
@@ -234,7 +296,7 @@ def select(out: Path) -> None:
             pairs.append(
                 _pair("npm", name, str(choice[0]), document["dist-tags"]["latest"], choice[1])
             )
-    for index, name in enumerate(PYPI_PACKAGES):
+    for index, name in enumerate(pypi_names):
         try:
             document = _get_json(f"https://pypi.org/pypi/{name}/json")
             versions = [key for key, files in document["releases"].items() if files]
@@ -1106,7 +1168,7 @@ def replay(out: Path, only: set[str] | None = None) -> None:
 
 def main(argv: list[str]) -> int:
     if len(argv) >= 2 and argv[0] == "select":
-        select(Path(argv[1]))
+        select(Path(argv[1]), heldout="--heldout" in argv[2:])
         return 0
     if len(argv) >= 3 and argv[0] == "benign":
         benign(Path(argv[1]), Path(argv[2]))
