@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import urllib.error
 import urllib.parse
@@ -23,10 +24,12 @@ from ca9.package_feed import (
     release_window_covers,
 )
 from ca9.package_policy import PackagePolicy, action_for_mode, find_policy_exception
+from ca9.release_age import cached_publish_time, remember_npm_packument
 
 DEFAULT_NPM_REGISTRY = "https://registry.npmjs.org"
 GATEWAY_SCHEMA = "ca9.npm.gateway.v1"
 EVALUATION_FAILURE_POLICY_ID = "ca9.npm_gateway_evaluation_failed"
+_SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 
 
 @dataclass(frozen=True)
@@ -86,11 +89,14 @@ class NpmGatewayState:
     removed_versions: list[NpmGatewayDecision] | None = None
     applied_exceptions: list[dict[str, Any]] | None = None
     evaluation_failures: list[NpmGatewayEvaluationFailure] | None = None
+    packument_times: dict[str, dict[str, Any]] | None = None
+    release_age_defaulted: bool = False
 
     def __post_init__(self) -> None:
         self.removed_versions = []
         self.applied_exceptions = []
         self.evaluation_failures = []
+        self.packument_times = {}
 
 
 class NpmMetadataGateway:
@@ -101,12 +107,14 @@ class NpmMetadataGateway:
         policy: PackagePolicy,
         feed_cache_dir: Path | None = None,
         now: datetime | None = None,
+        release_age_defaulted: bool = False,
     ) -> None:
         self.state = NpmGatewayState(
             upstream_registry=upstream_registry.rstrip("/"),
             policy=policy,
             feed_cache_dir=feed_cache_dir,
             now=now,
+            release_age_defaulted=release_age_defaulted,
         )
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -329,6 +337,25 @@ def _handler_for_state(state: NpmGatewayState):
                 return
 
             upstream_url = state.upstream_registry + self.path
+            # A path that does not start with "/" would extend the upstream host
+            # (`registry.npmjs.org.attacker.example`) or add userinfo to it.
+            if not self.path.startswith("/") or not _same_origin(
+                upstream_url, state.upstream_registry
+            ):
+                self.send_error(403, "gateway only proxies paths on the upstream registry")
+                return
+
+            tarball = _tarball_request(self.path)
+            if tarball is not None:
+                try:
+                    decision = _tarball_decision(*tarball, state)
+                except NpmGatewayEvaluationError as exc:
+                    _deny_metadata(self, state, exc.failure, include_body=include_body)
+                    return
+                if decision is not None:
+                    _deny_tarball(self, state, decision, include_body=include_body)
+                    return
+
             try:
                 status, headers, body = _fetch_upstream(upstream_url)
             except urllib.error.HTTPError as exc:
@@ -379,10 +406,186 @@ def _deny_metadata(
         handler.wfile.write(body)
 
 
+def _deny_tarball(
+    handler: BaseHTTPRequestHandler,
+    state: NpmGatewayState,
+    decision: NpmGatewayDecision,
+    *,
+    include_body: bool,
+) -> None:
+    if state.removed_versions is not None and decision not in state.removed_versions:
+        state.removed_versions.append(decision)
+    body = b"npm tarball is blocked by the configured policy\n"
+    handler.send_response(403)
+    handler.send_header("Content-Type", "text/plain; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    if include_body:
+        handler.wfile.write(body)
+
+
+class _UpstreamRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _redirect_allowed(req.full_url, newurl):
+            fp.close()
+            raise urllib.error.URLError(
+                f"refusing upstream redirect to {_sanitize_url_for_evidence(newurl)}"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _fetch_upstream(url: str) -> tuple[int, dict[str, str], bytes]:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(request, timeout=30) as response:
+    opener = urllib.request.build_opener(_UpstreamRedirectHandler)
+    with opener.open(request, timeout=30) as response:
         return response.status, dict(response.headers.items()), response.read()
+
+
+def _redirect_allowed(source_url: str, target_url: str) -> bool:
+    # Follow redirects only within the upstream host, and never downgrade from
+    # https; anything else is fetched by npm without the gateway's checks.
+    try:
+        source = urllib.parse.urlsplit(source_url)
+        target = urllib.parse.urlsplit(target_url)
+        if not source.hostname or not target.hostname or target.username or target.password:
+            return False
+        if source.hostname.lower() != target.hostname.lower():
+            return False
+        if target.scheme == source.scheme:
+            return target.port == source.port
+    except ValueError:
+        return False
+    return source.scheme == "http" and target.scheme == "https"
+
+
+def _same_origin(url: str, base: str) -> bool:
+    try:
+        candidate = urllib.parse.urlsplit(url)
+        expected = urllib.parse.urlsplit(base)
+        return (
+            candidate.scheme == expected.scheme
+            and candidate.netloc == expected.netloc
+            and candidate.port == expected.port
+        )
+    except ValueError:
+        return False
+
+
+def _tarball_request(path: str) -> tuple[str, str | None] | None:
+    """Return (package, version) for a registry tarball path.
+
+    The version is None when the path is a tarball path whose filename does not
+    belong to the package, which is denied rather than passed through.
+    """
+    decoded = urllib.parse.unquote(urllib.parse.urlsplit(path).path)
+    if "/-/" not in decoded or not decoded.lower().endswith(".tgz"):
+        return None
+    package_path, _, filename = decoded.rpartition("/-/")
+    package = package_path.removeprefix("/")
+    parts = package.split("/")
+    scoped = package.startswith("@")
+    if (
+        not all(parts)
+        or len(parts) != (2 if scoped else 1)
+        or any(part in {".", ".."} for part in parts)
+    ):
+        return package, None
+    basename = parts[-1]
+    # Unscoped: /name/-/name-1.0.0.tgz. Scoped: /@scope/name/-/name-1.0.0.tgz,
+    # or /@scope/name/-/@scope/name-1.0.0.tgz on some registries.
+    prefixes = [f"{basename}-"]
+    if scoped:
+        prefixes.append(f"{package}-")
+    for prefix in prefixes:
+        if filename.lower().startswith(prefix.lower()):
+            version = filename[len(prefix) : -len(".tgz")]
+            return package, version or None
+    return package, None
+
+
+def _tarball_decision(
+    package_name: str,
+    version: str | None,
+    state: NpmGatewayState,
+) -> NpmGatewayDecision | None:
+    if not state.policy.malware.enabled and not state.policy.package_age.enabled:
+        return None
+    if version is None:
+        raise NpmGatewayEvaluationError(
+            package=package_name,
+            failure_kind="unparseable_tarball_path",
+            reason="npm tarball path does not name a version of its package",
+        )
+    snapshot = _evaluation_snapshot(state, package_name)
+    if snapshot is None:
+        return None
+    metadata_time = None
+    if _needs_registry_release_time(package_name, version, state, snapshot):
+        cached = cached_publish_time(
+            "npm",
+            package_name,
+            version,
+            registry=state.upstream_registry,
+            cache_dir=_release_cache_root(state),
+        )
+        if cached:
+            metadata_time = {version: cached}
+        else:
+            metadata_time = _packument_time(package_name, state)
+    return _denied_version(package_name, version, state.policy, snapshot, state, metadata_time)
+
+
+def _release_cache_root(state: NpmGatewayState) -> Path | None:
+    if state.feed_cache_dir is None:
+        return None
+    return Path(state.feed_cache_dir).parent
+
+
+def _needs_registry_release_time(
+    package_name: str,
+    version: str,
+    state: NpmGatewayState,
+    snapshot: FeedSnapshot,
+) -> bool:
+    policy = state.policy
+    if not policy.package_age.enabled or _is_age_excluded(
+        "npm", package_name, version, policy.package_age.exclusions
+    ):
+        return False
+    if lookup_release_time("npm", package_name, version, snapshot=snapshot):
+        return False
+    return not release_window_covers(
+        snapshot,
+        "npm",
+        now=state.now or datetime.now(timezone.utc),
+        minimum_hours=policy.package_age.minimum_hours,
+    )
+
+
+def _packument_time(package_name: str, state: NpmGatewayState) -> dict[str, Any] | None:
+    # Tarball requests carry no release time. Reuse the packument `time` field the
+    # gateway already saw, or fetch the packument once (npm ci skips packuments).
+    cache = state.packument_times if state.packument_times is not None else {}
+    key = package_name.lower()
+    if key in cache:
+        return cache[key]
+    url = f"{state.upstream_registry}/{urllib.parse.quote(package_name, safe='@')}"
+    try:
+        _, _, body = _fetch_upstream(url)
+        metadata = json.loads(body.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    metadata_time = metadata.get("time") if isinstance(metadata, dict) else None
+    if not isinstance(metadata_time, dict):
+        return None
+    cache[key] = metadata_time
+    remember_npm_packument(
+        package_name,
+        metadata,
+        registry=state.upstream_registry,
+        cache_dir=_release_cache_root(state),
+    )
+    return metadata_time
 
 
 def _rewrite_metadata(body: bytes, state: NpmGatewayState) -> bytes | None:
@@ -399,30 +602,18 @@ def _rewrite_metadata(body: bytes, state: NpmGatewayState) -> bytes | None:
     if not package_name:
         return None
 
-    feed = _ensure_feed(state)
-    unavailable = feed.state != "ready" or feed.snapshot is None
-    if (
-        feed.action == "block"
-        or feed.state == "tampered"
-        or unavailable
-        and state.policy.malware.enabled
-        and state.policy.malware.fail_closed
-    ):
-        feed_state = feed.state if feed.state in {"missing", "stale", "tampered"} else "unavailable"
-        raise NpmGatewayEvaluationError(
-            package=package_name,
-            failure_kind=f"feed_{feed_state}",
-            reason=f"npm policy feed is {feed_state} and the configured policy requires blocking",
-        )
-    if feed.snapshot is None:
+    snapshot = _evaluation_snapshot(state, package_name)
+    if snapshot is None:
         return None
 
     versions = dict(metadata["versions"])
     metadata_time = metadata.get("time") if isinstance(metadata.get("time"), dict) else None
+    if metadata_time is not None and state.packument_times is not None:
+        state.packument_times[package_name.lower()] = metadata_time
     removed: list[NpmGatewayDecision] = []
     for version in list(versions):
         decision = _denied_version(
-            package_name, version, state.policy, feed.snapshot, state, metadata_time
+            package_name, version, state.policy, snapshot, state, metadata_time
         )
         if decision is None:
             continue
@@ -439,6 +630,25 @@ def _rewrite_metadata(body: bytes, state: NpmGatewayState) -> bytes | None:
     if state.removed_versions is not None:
         state.removed_versions.extend(removed)
     return (json.dumps(rewritten, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _evaluation_snapshot(state: NpmGatewayState, package_name: str) -> FeedSnapshot | None:
+    feed = _ensure_feed(state)
+    unavailable = feed.state != "ready" or feed.snapshot is None
+    if (
+        feed.action == "block"
+        or feed.state == "tampered"
+        or unavailable
+        and state.policy.malware.enabled
+        and state.policy.malware.fail_closed
+    ):
+        feed_state = feed.state if feed.state in {"missing", "stale", "tampered"} else "unavailable"
+        raise NpmGatewayEvaluationError(
+            package=package_name,
+            failure_kind=f"feed_{feed_state}",
+            reason=f"npm policy feed is {feed_state} and the configured policy requires blocking",
+        )
+    return feed.snapshot
 
 
 def _ensure_feed(state: NpmGatewayState) -> FeedStatus:
@@ -492,6 +702,8 @@ def _denied_version(
             if release_window_covers(
                 snapshot, "npm", now=now, minimum_hours=policy.package_age.minimum_hours
             ):
+                return None
+            if state.release_age_defaulted:
                 return None
             if action_for_mode("block", policy.mode.offline) == "block":
                 return _apply_gateway_exception(
@@ -582,9 +794,25 @@ def _rewrite_dist_tags(raw_dist_tags: Any, versions: dict[str, Any]) -> dict[str
     for tag, version in raw_dist_tags.items():
         if isinstance(version, str) and version in versions:
             rewritten[str(tag)] = version
-    if "latest" not in rewritten and versions:
-        rewritten["latest"] = next(reversed(versions))
+    if "latest" not in rewritten:
+        # Packument key order is not release order, so pick the highest remaining
+        # stable release; never promote a prerelease to latest.
+        latest = _highest_stable_version(versions)
+        if latest is not None:
+            rewritten["latest"] = latest
     return rewritten
+
+
+def _highest_stable_version(versions: dict[str, Any]) -> str | None:
+    best: tuple[tuple[int, int, int], str] | None = None
+    for version in versions:
+        match = _SEMVER_RE.fullmatch(version)
+        if match is None or match.group(4) is not None:
+            continue
+        key = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        if best is None or key > best[0]:
+            best = (key, version)
+    return best[1] if best is not None else None
 
 
 def _sanitize_url_for_evidence(value: str) -> str:

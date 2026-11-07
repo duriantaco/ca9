@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
+from ca9.agent_config import jsonc
+from ca9.agent_config.mcp_launch import parse_launch
 from ca9.capabilities.models import Capability, Component, Property, generate_bom_ref, hash_content
 
 _YAML_AVAILABLE = True
@@ -18,7 +19,7 @@ def detect_mcp(repo_path: Path) -> tuple[list[Component], list[Capability]]:
     capabilities: list[Capability] = []
 
     config_files: list[Path] = []
-    for pattern in ["mcp.json", "mcp.yaml", "mcp.yml", "servers.json"]:
+    for pattern in [".mcp.json", "mcp.json", "mcp.yaml", "mcp.yml", "servers.json"]:
         config_files.extend(repo_path.rglob(pattern))
 
     mcp_dir = repo_path / ".mcp"
@@ -50,7 +51,7 @@ def parse_mcp_config(
                 return components, capabilities
             config = yaml.safe_load(f)
         else:
-            config = json.load(f)
+            config = jsonc.parse(f.read()).value
 
     if not config:
         return components, capabilities
@@ -61,9 +62,12 @@ def parse_mcp_config(
     with open(config_path) as f:
         content_hash = hash_content(f.read())
 
-    servers = config.get("servers", config.get("mcpServers", {}))
+    servers: dict[str, Any] = {}
+    for key in ("mcpServers", "servers"):
+        if isinstance(config.get(key), dict):
+            servers.update(config[key])
 
-    if isinstance(servers, dict):
+    if servers:
         for server_name, server_config in servers.items():
             server_component, server_capabilities = parse_mcp_server(
                 server_name, server_config, evidence_prefix, content_hash
@@ -106,6 +110,7 @@ def parse_mcp_server(
         properties.append(Property(name="ca9.mcp.transport", value="http"))
     elif command:
         properties.append(Property(name="ca9.mcp.transport", value="stdio"))
+        properties.extend(launch_properties(command, server_config.get("args")))
 
     component = Component(
         type="service",
@@ -153,6 +158,22 @@ def parse_mcp_server(
         )
 
     return component, capabilities
+
+
+def launch_properties(command: Any, args: Any) -> list[Property]:
+    if not isinstance(args, list):
+        args = []
+    launch = parse_launch(command, [str(arg) for arg in args])
+    if launch is None:
+        return []
+    properties = [
+        Property(name="ca9.mcp.package.ecosystem", value=launch["ecosystem"]),
+        Property(name="ca9.mcp.package.name", value=launch["package"]),
+        Property(name="ca9.mcp.package.pinned", value=str(launch["pinned"]).lower()),
+    ]
+    if launch["version"]:
+        properties.append(Property(name="ca9.mcp.package.version", value=launch["version"]))
+    return properties
 
 
 def is_filesystem_server(server_name: str, config: dict[str, Any]) -> bool:

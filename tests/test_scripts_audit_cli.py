@@ -57,3 +57,27 @@ def test_scripts_audit_rejects_commands_with_json_format(tmp_path):
 
     assert result.exit_code == 2
     assert "--emit commands cannot be combined with --format json" in result.output
+
+
+def test_scripts_audit_trusts_policy_registries_for_artifact_fetches(tmp_path):
+    (tmp_path / "ca9-policy.toml").write_text(
+        '[registries]\nallow = ["registry.npmjs.org", "https://npm.corp.example/api/npm/"]\n'
+    )
+    with patch(
+        "ca9.scripts_audit.build_scripts_audit_report",
+        side_effect=ScriptsAuditError("stop"),
+    ) as build:
+        CliRunner().invoke(
+            main,
+            [
+                "scripts",
+                "audit",
+                str(tmp_path),
+                "--policy",
+                str(tmp_path / "ca9-policy.toml"),
+            ],
+        )
+
+    config = build.call_args.kwargs["artifact_config"]
+    assert "https://npm.corp.example/api/npm/" in config.trusted_indexes
+    assert config.private_indexes == ("https://npm.corp.example/api/npm/",)

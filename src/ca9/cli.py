@@ -121,6 +121,7 @@ def _load_cli_config() -> dict:
         "format": "output_format",
         "output": "output_path",
         "verbose": "verbose",
+        "auto_coverage": "auto_coverage",
         "no_auto_coverage": "no_auto_coverage",
         "proof_standard": "proof_standard",
         "accepted_risks": "accepted_risks_path",
@@ -151,6 +152,21 @@ def _get_config_default(ctx: click.Context, param_name: str, fallback):
     else:
         config = {}
     return config.get(param_name, fallback)
+
+
+def _custom_registry_hosts(registries: tuple[str, ...]) -> tuple[str, ...]:
+    from ca9.artifacts.fetch import DEFAULT_ARTIFACT_INDEXES
+
+    public = {_registry_host(value) for value in DEFAULT_ARTIFACT_INDEXES}
+    return tuple(value for value in registries if _registry_host(value) not in public)
+
+
+def _registry_host(value: str) -> str:
+    from urllib.parse import urlparse
+
+    raw = value.strip()
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    return (parsed.hostname or "").lower()
 
 
 def _resolve_option(ctx: click.Context, option_name: str, current_value):
@@ -396,7 +412,7 @@ def policy_group() -> None:
 )
 def policy_validate_cmd(policy_path: Path | None) -> None:
     """Validate ca9 package policy."""
-    from ca9.package_policy import validate_package_policy
+    from ca9.package_policy import policy_trust_warnings, validate_package_policy
 
     try:
         policy = validate_package_policy(policy_path)
@@ -405,6 +421,8 @@ def policy_validate_cmd(policy_path: Path | None) -> None:
 
     source = ", ".join(policy.sources) if policy.sources else "built-in defaults"
     click.echo(f"Policy valid: {source}")
+    for warning in policy_trust_warnings(policy):
+        click.echo(f"ca9: warning: {warning}", err=True)
 
 
 @policy_group.command(name="explain")
@@ -461,7 +479,27 @@ def feed_group() -> None:
     default="table",
     help="Output format.",
 )
-def feed_update_cmd(source: str | None, output_format: str) -> None:
+@click.option(
+    "--allow-downgrade",
+    is_flag=True,
+    default=False,
+    help="Install a snapshot even if it is older than the installed one (rollback).",
+)
+@click.option(
+    "--require-attestation",
+    is_flag=True,
+    default=False,
+    help=(
+        "Verify the downloaded bundle with `gh attestation verify` against the ca9 feed "
+        "workflow before installing it; fail if gh is missing or verification fails."
+    ),
+)
+def feed_update_cmd(
+    source: str | None,
+    output_format: str,
+    allow_downgrade: bool,
+    require_attestation: bool,
+) -> None:
     """Install a package intelligence feed snapshot into the local ca9 cache."""
     import os
 
@@ -470,7 +508,11 @@ def feed_update_cmd(source: str | None, output_format: str) -> None:
     resolved_source = source or os.environ.get("CA9_FEED_URL") or DEFAULT_FEED_URL
 
     try:
-        snapshot = update_feed_from_source(resolved_source)
+        snapshot = update_feed_from_source(
+            resolved_source,
+            allow_downgrade=allow_downgrade,
+            require_attestation=require_attestation,
+        )
     except FeedError as exc:
         raise click.ClickException(str(exc)) from None
 
@@ -481,6 +523,7 @@ def feed_update_cmd(source: str | None, output_format: str) -> None:
                     "schema_version": "ca9.feed.update.v1",
                     "cache_dir": str(snapshot.cache_dir),
                     "source": resolved_source,
+                    "attestation_verified": require_attestation,
                     "snapshot": snapshot.to_dict(),
                 },
                 indent=2,
@@ -489,6 +532,8 @@ def feed_update_cmd(source: str | None, output_format: str) -> None:
     else:
         click.echo(f"Feed updated: {snapshot.snapshot_id}")
         click.echo(f"Source: {resolved_source}")
+        if require_attestation:
+            click.echo("Attestation: verified (gh attestation verify)")
         click.echo(f"Cache: {snapshot.cache_dir}")
         click.echo(f"Expires: {snapshot.expires_at}")
 
@@ -573,9 +618,12 @@ def run_cmd(
 ) -> None:
     """Preflight and run supported package-manager install commands."""
     import os
-    import subprocess
 
-    from ca9.package_policy import load_effective_package_policy, validate_package_policy
+    from ca9.package_policy import (
+        load_effective_package_policy,
+        policy_trust_warnings,
+        validate_package_policy,
+    )
     from ca9.runtime.npm_gateway import (
         DEFAULT_NPM_REGISTRY,
         NpmMetadataGateway,
@@ -584,7 +632,6 @@ def run_cmd(
     )
     from ca9.runtime.preflight import (
         LedgerEvent,
-        append_ledger_events,
         child_environment,
         child_process_exited_event,
         child_process_started_event,
@@ -594,6 +641,7 @@ def run_cmd(
         new_ledger_session_id,
         preflight_ledger_events,
         primary_registry_url,
+        runtime_release_age_policy,
         session_ended_event,
     )
     from ca9.runtime.pypi_gateway import (
@@ -612,34 +660,52 @@ def run_cmd(
             if policy_path is not None
             else load_effective_package_policy(cwd=Path.cwd())
         )
+        package_policy, release_age_defaulted = runtime_release_age_policy(package_policy)
         preflight = evaluate_runtime_preflight(
             command,
             package_policy,
             env=dict(os.environ),
+            release_age_defaulted=release_age_defaulted,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from None
 
+    if output_format != "json":
+        # JSON output carries these in its "warnings" list instead.
+        for warning in preflight.warnings:
+            click.echo(f"ca9: warning: {warning}", err=True)
+
     if output_format == "json" and not dry_run and not preflight.blocked:
         raise click.ClickException("use --dry-run with -f json, or omit -f json to execute")
+
+    policy_warnings = policy_trust_warnings(package_policy)
+    for warning in policy_warnings:
+        click.echo(f"ca9: warning: {warning}", err=True)
 
     executed = False
     child_exit_code = None
     exit_code = 1 if preflight.blocked else 0
     session_id = new_ledger_session_id()
     gateway_events: list[LedgerEvent] = []
-    ledger_path = append_ledger_events(
-        preflight_ledger_events(preflight, session_id=session_id, dry_run=dry_run),
-        ledger_path=audit_log_path,
-    )
+    ledger = _RunLedger(audit_log_path)
+    ledger.append(preflight_ledger_events(preflight, session_id=session_id, dry_run=dry_run))
+    if package_policy.ignored_settings:
+        ledger.append(
+            [
+                LedgerEvent(
+                    "policy_settings_ignored",
+                    {"settings": [item.to_dict() for item in package_policy.ignored_settings]},
+                    session_id,
+                )
+            ]
+        )
 
     if not dry_run and not preflight.blocked:
         click.echo(format_preflight(preflight), err=True)
-        append_ledger_events(
-            [child_process_started_event(preflight, session_id=session_id)],
-            ledger_path=ledger_path,
-        )
+        ledger.append([child_process_started_event(preflight, session_id=session_id)])
         child_env = child_environment(dict(os.environ), preflight)
+        # Nested installs started by lifecycle scripts must go back through the shims.
+        child_env.pop("CA9_SHIM_BYPASS", None)
         if should_start_npm_gateway(preflight.command.family, package_policy, preflight.feed):
             upstream_registry = (
                 os.environ.get("CA9_NPM_UPSTREAM_REGISTRY")
@@ -649,8 +715,9 @@ def run_cmd(
             with NpmMetadataGateway(
                 upstream_registry=upstream_registry,
                 policy=package_policy,
+                release_age_defaulted=release_age_defaulted,
             ) as gateway:
-                completed = subprocess.run(
+                completed = _run_child(
                     list(gateway_child_command(preflight.command)),
                     env=npm_gateway_child_env(
                         child_env,
@@ -669,8 +736,9 @@ def run_cmd(
             with PyPISimpleGateway(
                 upstream_base=upstream_base,
                 policy=package_policy,
+                release_age_defaulted=release_age_defaulted,
             ) as gateway:
-                completed = subprocess.run(
+                completed = _run_child(
                     list(
                         gateway_child_command(
                             preflight.command,
@@ -681,21 +749,29 @@ def run_cmd(
                 )
                 gateway_events = _gateway_ledger_events(gateway.to_dict(), session_id=session_id)
         else:
-            completed = subprocess.run(
+            completed = _run_child(
                 list(command),
                 env=child_env,
             )
-        executed = True
-        child_exit_code = completed.returncode
-        exit_code = completed.returncode
+        # Leaving the gateway block above already removed its temporary npm config.
+        executed = completed.started
+        exit_code = completed.exit_code
         if gateway_events:
-            append_ledger_events(gateway_events, ledger_path=ledger_path)
-        append_ledger_events(
-            [child_process_exited_event(session_id=session_id, child_exit_code=child_exit_code)],
-            ledger_path=ledger_path,
-        )
+            ledger.append(gateway_events)
+        if executed:
+            child_exit_code = exit_code
+            ledger.append(
+                [
+                    child_process_exited_event(
+                        session_id=session_id,
+                        child_exit_code=child_exit_code,
+                        signal_number=completed.signal_number,
+                        forwarded_signals=completed.received_signal_names,
+                    )
+                ]
+            )
 
-    append_ledger_events(
+    ledger.append(
         [
             session_ended_event(
                 preflight,
@@ -703,25 +779,185 @@ def run_cmd(
                 executed=executed,
                 child_exit_code=child_exit_code,
             )
-        ],
-        ledger_path=ledger_path,
+        ]
     )
 
     if output_format == "json":
-        click.echo(
-            json.dumps(
-                preflight.to_dict(
-                    executed=executed,
-                    child_exit_code=child_exit_code,
-                    ledger_path=ledger_path,
-                ),
-                indent=2,
-            )
+        payload = preflight.to_dict(
+            executed=executed,
+            child_exit_code=child_exit_code,
+            ledger_path=ledger.path,
         )
+        if policy_warnings:
+            payload["policy_warnings"] = list(policy_warnings)
+        click.echo(json.dumps(payload, indent=2))
     elif dry_run or preflight.blocked:
         click.echo(format_preflight(preflight))
 
     sys.exit(exit_code)
+
+
+# Time a child gets to exit after ca9 forwards SIGINT/SIGTERM/SIGHUP before it is killed.
+CHILD_SIGNAL_GRACE_SECONDS = 5.0
+
+
+class _RunLedger:
+    """Append-only audit ledger writer that never aborts ``ca9 run``."""
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+        self._warned = False
+
+    def append(self, events) -> None:
+        from ca9.runtime.preflight import append_ledger_events, default_ledger_path
+
+        try:
+            self.path = self.path or default_ledger_path()
+            append_ledger_events(events, ledger_path=self.path)
+        except (OSError, RuntimeError, ValueError) as exc:
+            if not self._warned:
+                target = self.path or "the default audit log"
+                click.echo(
+                    f"ca9: warning: cannot write audit ledger {target}: {exc}; continuing",
+                    err=True,
+                )
+                self._warned = True
+
+
+def _run_child(argv: list[str], *, env: dict[str, str]) -> _ChildProcess:
+    from ca9.runtime.ci import resolve_real_executable
+
+    child = _ChildProcess()
+    # Execute the real binary directly (skipping ca9 shims) instead of exporting a bypass
+    # variable that lifecycle scripts would inherit.
+    executable = resolve_real_executable(argv[0], env=env)
+    if executable is None:
+        click.echo(
+            f"ca9: cannot find the real {argv[0]} executable on PATH (ca9 shims are skipped)",
+            err=True,
+        )
+        child.returncode = 127
+        return child
+    child.run([executable, *argv[1:]], env=env)
+    return child
+
+
+class _ChildProcess:
+    """Run the package manager, forwarding SIGINT/SIGTERM/SIGHUP to it.
+
+    The signal handler only forwards the signal and arms a timer that kills the child
+    after the grace period, so gateway cleanup and the ledger writes still run once the
+    child is gone.
+    """
+
+    FORWARDED_SIGNALS = ("SIGINT", "SIGTERM", "SIGHUP")
+
+    def __init__(self, grace_seconds: float | None = None) -> None:
+        self.grace_seconds = CHILD_SIGNAL_GRACE_SECONDS if grace_seconds is None else grace_seconds
+        self.process: Any = None
+        self.returncode: int | None = None
+        self.received: list[int] = []
+        self._kill_timer: Any = None
+        self._previous_handlers: dict[int, Any] = {}
+
+    def run(self, argv: list[str], *, env: dict[str, str]) -> None:
+        import subprocess
+
+        self._install_signal_handlers()
+        try:
+            try:
+                self.process = subprocess.Popen(argv, env=env)
+            except OSError as exc:
+                click.echo(f"ca9: cannot execute {argv[0]}: {exc}", err=True)
+                self.returncode = 126
+                return
+            for signum in tuple(self.received):
+                # Delivered while the child was being spawned.
+                self._signal_child(signum)
+            while self.returncode is None:
+                # Poll instead of blocking in waitpid(): a signal delivered to a gateway
+                # thread does not interrupt a blocking wait, so the handler could not run.
+                try:
+                    self.returncode = self.process.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            if self._kill_timer is not None:
+                self._kill_timer.cancel()
+            self._restore_signal_handlers()
+
+    @property
+    def started(self) -> bool:
+        return self.process is not None
+
+    @property
+    def signal_number(self) -> int | None:
+        if self.returncode is not None and self.returncode < 0:
+            return -self.returncode
+        return None
+
+    @property
+    def exit_code(self) -> int:
+        if self.returncode is None:
+            return 1
+        if self.returncode < 0:
+            # Shell convention: a child killed by signal N exits 128+N.
+            return 128 - self.returncode
+        return self.returncode
+
+    @property
+    def received_signal_names(self) -> tuple[str, ...]:
+        import signal
+
+        names: list[str] = []
+        for signum in self.received:
+            try:
+                names.append(signal.Signals(signum).name)
+            except ValueError:
+                names.append(str(signum))
+        return tuple(names)
+
+    def _install_signal_handlers(self) -> None:
+        import signal
+
+        for name in self.FORWARDED_SIGNALS:
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                self._previous_handlers[signum] = signal.signal(signum, self._handle_signal)
+            except (OSError, ValueError):
+                # Not on the main thread; keep the default signal behaviour.
+                continue
+
+    def _restore_signal_handlers(self) -> None:
+        import signal
+
+        for signum, handler in self._previous_handlers.items():
+            signal.signal(signum, handler)
+        self._previous_handlers.clear()
+
+    def _handle_signal(self, signum: int, _frame: Any) -> None:
+        self.received.append(signum)
+        if self.process is not None:
+            self._signal_child(signum)
+
+    def _signal_child(self, signum: int) -> None:
+        import contextlib
+        import threading
+
+        with contextlib.suppress(OSError):
+            self.process.send_signal(signum)
+        if self._kill_timer is None:
+            self._kill_timer = threading.Timer(self.grace_seconds, self._kill_child)
+            self._kill_timer.daemon = True
+            self._kill_timer.start()
+
+    def _kill_child(self) -> None:
+        import contextlib
+
+        with contextlib.suppress(OSError):
+            self.process.kill()
 
 
 def _gateway_ledger_events(gateway_payload: dict[str, Any], *, session_id: str):
@@ -951,7 +1187,8 @@ def protect_cmd(
     "--scan-publisher-changes",
     is_flag=True,
     default=False,
-    help="Query public npm metadata for recent publisher changes after release dormancy.",
+    help="Query public npm metadata for publisher changes after release dormancy and "
+    "provenance regressions.",
 )
 @click.option(
     "--scan-artifacts",
@@ -977,6 +1214,15 @@ def protect_cmd(
     default=100,
     show_default=True,
     help="Maximum artifact download size for --scan-artifacts.",
+)
+@click.option(
+    "--local-artifact-root",
+    "local_artifact_roots",
+    multiple=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Extra directory whose local lockfile artifacts --scan-artifacts may read. Can be "
+    "repeated. Local artifacts inside the vetted repository are always readable; paths outside "
+    "it and these roots are not read.",
 )
 @click.option(
     "--deny-license",
@@ -1025,6 +1271,7 @@ def vet_cmd(
     scan_workflows: bool,
     allow_unhashed_downloads: bool,
     max_artifact_mb: int,
+    local_artifact_roots: tuple[Path, ...],
     denied_licenses: tuple[str, ...],
     require_known_license: bool,
     offline: bool,
@@ -1045,7 +1292,11 @@ def vet_cmd(
     else:
         repo_path = path
 
-    from ca9.package_policy import load_effective_package_policy, validate_package_policy
+    from ca9.package_policy import (
+        load_effective_package_policy,
+        policy_trust_warnings,
+        validate_package_policy,
+    )
 
     policy_warnings: list[str] = []
     try:
@@ -1055,6 +1306,7 @@ def vet_cmd(
             package_policy = load_effective_package_policy(cwd=repo_path)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from None
+    policy_warnings.extend(policy_trust_warnings(package_policy))
 
     inventory = build_inventory(repo_path)
     if offline and scan_publisher_changes:
@@ -1078,6 +1330,7 @@ def vet_cmd(
             policy_findings, feed_warnings = package_age_findings(
                 inventory.packages,
                 package_policy,
+                network=not offline,
             )
         except FeedError as exc:
             raise click.ClickException(str(exc)) from None
@@ -1136,11 +1389,21 @@ def vet_cmd(
         from ca9.analyzers.package_code import analyze_package_snapshots
         from ca9.artifacts.fetch import ArtifactScanConfig, collect_artifact_snapshots
 
+        # Lockfile URLs are untrusted input: fetch only from known or configured indexes,
+        # and read local artifacts only inside the repository or roots the operator names.
         artifact_result = collect_artifact_snapshots(
             inventory,
             ArtifactScanConfig(
                 allow_unhashed_downloads=allow_unhashed_downloads,
                 max_artifact_bytes=max_artifact_mb * 1024 * 1024,
+                allowed_local_roots=(
+                    Path(repo_path).resolve(),
+                    *(root.resolve() for root in local_artifact_roots),
+                ),
+                trusted_indexes=(*trusted_indexes, *package_policy.registries.allow),
+                private_indexes=private_indexes,
+                resolve_pypi_artifacts=True,
+                internal_package_patterns=internal_package_patterns,
             ),
         )
         artifact_findings = [*artifact_result.findings]
@@ -1322,6 +1585,10 @@ def scripts_audit_cmd(
             artifact_config=ArtifactScanConfig(
                 allow_unhashed_downloads=allow_unhashed_downloads,
                 max_artifact_bytes=max_artifact_mb * 1024 * 1024,
+                # Repository policy cannot widen registries.allow, so these hosts come
+                # from trusted policy and may include internal registries.
+                trusted_indexes=package_policy.registries.allow,
+                private_indexes=_custom_registry_hosts(package_policy.registries.allow),
             ),
             fetch_artifacts=not offline,
         )
@@ -1442,10 +1709,19 @@ def ingest_sarif_cmd(
     "-v", "--verbose", is_flag=True, default=False, help="Show reasoning trace for each verdict."
 )
 @click.option(
+    "--auto-coverage",
+    is_flag=True,
+    default=False,
+    help=(
+        "Discover coverage.json in the repo, or run the repo's pytest suite to generate it. "
+        "Executes repository code; off by default."
+    ),
+)
+@click.option(
     "--no-auto-coverage",
     is_flag=True,
     default=False,
-    help="Disable automatic coverage discovery and generation.",
+    help="Deprecated no-op: automatic coverage is off unless --auto-coverage is given.",
 )
 @click.option(
     "--show-confidence",
@@ -1527,6 +1803,7 @@ def check(
     output_format: str,
     output_path: Path | None,
     verbose: bool,
+    auto_coverage: bool,
     no_auto_coverage: bool,
     show_confidence: bool,
     show_evidence_source: bool,
@@ -1546,13 +1823,19 @@ def check(
     output_format = _resolve_option(ctx, "output_format", output_format)
     output_path = _resolve_option(ctx, "output_path", output_path)
     verbose = _resolve_option(ctx, "verbose", verbose)
+    auto_coverage = _resolve_option(ctx, "auto_coverage", auto_coverage)
     no_auto_coverage = _resolve_option(ctx, "no_auto_coverage", no_auto_coverage)
     proof_standard = _resolve_option(ctx, "proof_standard", proof_standard)
     accepted_risks_path = _resolve_option(ctx, "accepted_risks_path", accepted_risks_path)
     baseline_path = _resolve_option(ctx, "baseline_path", baseline_path)
     new_only = _resolve_option(ctx, "new_only", new_only)
 
-    coverage_path = resolve_coverage(coverage_path, repo_path, auto_generate=not no_auto_coverage)
+    # Generating coverage runs the repo's tests, so it happens only on request.
+    coverage_path = resolve_coverage(
+        coverage_path,
+        repo_path,
+        auto_generate=bool(auto_coverage) and not no_auto_coverage,
+    )
 
     try:
         data = json.loads(sca_report.read_text())
@@ -1667,10 +1950,19 @@ def check(
     "-v", "--verbose", is_flag=True, default=False, help="Show reasoning trace for each verdict."
 )
 @click.option(
+    "--auto-coverage",
+    is_flag=True,
+    default=False,
+    help=(
+        "Discover coverage.json in the repo, or run the repo's pytest suite to generate it. "
+        "Executes repository code; off by default."
+    ),
+)
+@click.option(
     "--no-auto-coverage",
     is_flag=True,
     default=False,
-    help="Disable automatic coverage discovery and generation.",
+    help="Deprecated no-op: automatic coverage is off unless --auto-coverage is given.",
 )
 @click.option(
     "--offline",
@@ -1775,6 +2067,7 @@ def scan(
     output_format: str,
     output_path: Path | None,
     verbose: bool,
+    auto_coverage: bool,
     no_auto_coverage: bool,
     offline: bool,
     refresh_cache: bool,
@@ -1800,13 +2093,19 @@ def scan(
     output_format = _resolve_option(ctx, "output_format", output_format)
     output_path = _resolve_option(ctx, "output_path", output_path)
     verbose = _resolve_option(ctx, "verbose", verbose)
+    auto_coverage = _resolve_option(ctx, "auto_coverage", auto_coverage)
     no_auto_coverage = _resolve_option(ctx, "no_auto_coverage", no_auto_coverage)
     proof_standard = _resolve_option(ctx, "proof_standard", proof_standard)
     accepted_risks_path = _resolve_option(ctx, "accepted_risks_path", accepted_risks_path)
     baseline_path = _resolve_option(ctx, "baseline_path", baseline_path)
     new_only = _resolve_option(ctx, "new_only", new_only)
 
-    coverage_path = resolve_coverage(coverage_path, repo_path, auto_generate=not no_auto_coverage)
+    # Generating coverage runs the repo's tests, so it happens only on request.
+    coverage_path = resolve_coverage(
+        coverage_path,
+        repo_path,
+        auto_generate=bool(auto_coverage) and not no_auto_coverage,
+    )
 
     inventory = resolve_scan_inventory(
         repo_path,

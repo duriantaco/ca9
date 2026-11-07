@@ -210,9 +210,322 @@ def test_feed_update_reports_download_errors_cleanly(tmp_path):
         ["feed", "update"],
         env={
             "CA9_CACHE_DIR": str(tmp_path / "cache"),
-            "CA9_FEED_URL": "http://127.0.0.1:9/no-feed.json",
+            "CA9_FEED_URL": "https://127.0.0.1:9/no-feed.json",
         },
     )
 
     assert update.exit_code == 1
     assert "cannot download feed" in update.output
+
+
+def _openssf_record(
+    record_id: str,
+    name: str,
+    *,
+    ecosystem: str = "npm",
+    ranges: list[dict] | None = None,
+    versions: list[str] | None = None,
+    origins: list[dict] | None = None,
+    withdrawn: str | None = None,
+) -> dict:
+    """A record shaped like ossf/malicious-packages entries in the OSV export."""
+    affected: dict = {"package": {"ecosystem": ecosystem, "name": name}}
+    if ranges is not None:
+        affected["ranges"] = ranges
+    if versions is not None:
+        affected["versions"] = versions
+    record: dict = {
+        "schema_version": "1.5.0",
+        "id": record_id,
+        "modified": "2026-09-30T00:00:00Z",
+        "published": "2026-09-01T00:00:00Z",
+        "summary": f"Malicious code in {name} ({ecosystem})",
+        "details": "\n---\n_-= Per source details. Do not edit below this line.=-_\n",
+        "affected": [affected],
+        "database_specific": {
+            "malicious-packages-origins": origins
+            or [{"source": "ghsa-malware", "id": "GHSA-xxxx-yyyy-zzzz"}]
+        },
+    }
+    if withdrawn:
+        record["withdrawn"] = withdrawn
+    return record
+
+
+WHOLE_PACKAGE_SEMVER = [{"type": "SEMVER", "events": [{"introduced": "0"}]}]
+WHOLE_PACKAGE_ECOSYSTEM = [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}]}]
+BOUNDED_RANGE = [{"type": "SEMVER", "events": [{"introduced": "1.0.0"}, {"fixed": "1.0.2"}]}]
+
+
+def test_malware_entries_whole_package_ranges_become_name_only_entries():
+    stats: dict[str, int] = {}
+    entries = malware_entries(
+        [_openssf_record("MAL-2026-1", "Whole-Semver", ranges=WHOLE_PACKAGE_SEMVER)],
+        "npm",
+        stats=stats,
+    )
+    pypi_entries = malware_entries(
+        [
+            _openssf_record(
+                "MAL-2026-2", "Whole_Eco", ecosystem="PyPI", ranges=WHOLE_PACKAGE_ECOSYSTEM
+            )
+        ],
+        "pypi",
+    )
+
+    assert entries == [
+        {
+            "name": "whole-semver",
+            "id": "MAL-2026-1",
+            "summary": "Malicious code in Whole-Semver (npm)",
+        }
+    ]
+    assert pypi_entries == [
+        {"name": "whole-eco", "id": "MAL-2026-2", "summary": "Malicious code in Whole_Eco (PyPI)"}
+    ]
+    assert stats["whole_package"] == 1
+    assert stats["bounded_skipped"] == 0
+
+
+def test_malware_entries_bounded_range_uses_origin_versions():
+    record = _openssf_record(
+        "MAL-2026-3",
+        "bounded-pkg",
+        ranges=BOUNDED_RANGE,
+        origins=[
+            {"source": "ghsa-malware", "versions": ["1.0.0"]},
+            {"source": "ossf-package-analysis", "versions": ["1.0.1", "1.0.0"]},
+        ],
+    )
+
+    entries = malware_entries([record], "npm")
+
+    assert [(entry["name"], entry["version"]) for entry in entries] == [
+        ("bounded-pkg", "1.0.0"),
+        ("bounded-pkg", "1.0.1"),
+    ]
+
+
+def test_malware_entries_skip_and_count_bounded_range_without_versions():
+    stats: dict[str, int] = {}
+    entries = malware_entries(
+        [
+            _openssf_record("MAL-2026-4", "bounded-only", ranges=BOUNDED_RANGE),
+            _openssf_record(
+                "MAL-2026-5",
+                "open-ended",
+                ranges=[{"type": "SEMVER", "events": [{"introduced": "2.0.0"}]}],
+            ),
+            _openssf_record(
+                "MAL-2026-6",
+                "last-affected",
+                ranges=[
+                    {"type": "SEMVER", "events": [{"introduced": "0"}, {"last_affected": "1.0.0"}]}
+                ],
+            ),
+            _openssf_record(
+                "MAL-2026-7",
+                "git-only",
+                ranges=[{"type": "GIT", "repo": "https://x", "events": [{"introduced": "0"}]}],
+            ),
+        ],
+        "npm",
+        stats=stats,
+    )
+
+    assert entries == []
+    assert stats["bounded_skipped"] == 4
+    assert stats["malicious_records"] == 4
+
+
+def test_malware_entries_versions_plus_ranges():
+    entries = malware_entries(
+        [
+            _openssf_record(
+                "MAL-2026-8",
+                "listed-and-bounded",
+                ranges=BOUNDED_RANGE,
+                versions=["1.0.0", "1.0.1"],
+            ),
+            # An unbounded range from "0" covers every version, listed or not.
+            _openssf_record(
+                "MAL-2026-9",
+                "listed-and-whole",
+                ranges=WHOLE_PACKAGE_SEMVER,
+                versions=["3.0.0"],
+            ),
+        ],
+        "npm",
+    )
+
+    assert [(entry["name"], entry.get("version")) for entry in entries] == [
+        ("listed-and-bounded", "1.0.0"),
+        ("listed-and-bounded", "1.0.1"),
+        ("listed-and-whole", None),
+    ]
+
+
+def test_malware_entries_skip_withdrawn_records():
+    stats: dict[str, int] = {}
+    entries = malware_entries(
+        [
+            _openssf_record(
+                "MAL-2024-1398",
+                "false-positive",
+                ranges=WHOLE_PACKAGE_SEMVER,
+                withdrawn="2024-05-01T00:00:00Z",
+            ),
+            _openssf_record("MAL-2026-10", "still-bad", ranges=WHOLE_PACKAGE_SEMVER),
+        ],
+        "npm",
+        stats=stats,
+    )
+
+    assert [entry["name"] for entry in entries] == ["still-bad"]
+    assert stats["withdrawn_skipped"] == 1
+    assert stats["malicious_records"] == 1
+
+
+def test_whole_package_record_blocks_any_version_through_feed_engine(tmp_path):
+    from ca9.package_feed import update_feed_from_source
+
+    bundle = build_bundle_from_records(
+        {"npm": [_openssf_record("MAL-2026-11", "whole-semver", ranges=WHOLE_PACKAGE_SEMVER)]}
+    )
+    bundle_path = tmp_path / "latest.json"
+    bundle_path.write_text(json.dumps(bundle))
+    cache_dir = tmp_path / "cache" / "feed"
+    update_feed_from_source(str(bundle_path), cache_dir=cache_dir)
+
+    matches = lookup_malware("npm", "whole-semver", "4.5.6", cache_dir=cache_dir)
+    assert [match["id"] for match in matches] == ["MAL-2026-11"]
+
+
+def test_build_stats_reach_manifest_and_summary():
+    from scripts.build_feed import build_manifest, format_build_stats
+
+    stats: dict[str, dict[str, int]] = {}
+    bundle = build_bundle_from_records(
+        {
+            "npm": [
+                _openssf_record("MAL-2026-12", "bounded-only", ranges=BOUNDED_RANGE),
+                _openssf_record("MAL-2026-13", "whole", ranges=WHOLE_PACKAGE_SEMVER),
+            ]
+        },
+        now=datetime(2026, 10, 2, tzinfo=timezone.utc),
+        stats=stats,
+    )
+    manifest = build_manifest(bundle, stats=stats)
+
+    assert manifest["malware_stats"]["npm-malware"]["bounded_skipped"] == 1
+    assert manifest["malware_stats"]["npm-malware"]["whole_package"] == 1
+    lines = format_build_stats(stats)
+    assert any(line.startswith("npm-malware:") and "bounded_skipped=1" in line for line in lines)
+
+
+def test_feed_update_rejects_plain_http_url(tmp_path):
+    runner = CliRunner()
+
+    update = runner.invoke(
+        main,
+        ["feed", "update", "--from", "http://example.invalid/latest.json"],
+        env={"CA9_CACHE_DIR": str(tmp_path / "cache")},
+    )
+
+    assert update.exit_code == 1
+    assert "insecure http://" in update.output
+
+
+SOLANA_RECORD = {
+    "id": "MAL-2024-11183",
+    "aliases": ["GHSA-2mhj-xmf4-pr8m"],
+    "summary": "Malicious code in @solana/web3.js (npm)",
+    "affected": [
+        {
+            "package": {"ecosystem": "npm", "name": "@solana/web3.js"},
+            "ranges": [
+                {"type": "SEMVER", "events": [{"introduced": "1.95.6"}, {"fixed": "1.95.8"}]}
+            ],
+        }
+    ],
+}
+XRPL_RECORD = {
+    "id": "GHSA-33qr-m49q-rxfx",
+    "aliases": ["CVE-2025-32965"],
+    "summary": "Compromised xrpl.js versions 4.2.1, 4.2.2, 4.2.3, 4.2.4, and 2.14.2",
+    "database_specific": {"cwe_ids": ["CWE-506"], "severity": "CRITICAL"},
+    "affected": [
+        {
+            "package": {"ecosystem": "npm", "name": "xrpl"},
+            "ranges": [{"type": "SEMVER", "events": [{"introduced": "4.2.1"}, {"fixed": "4.2.5"}]}],
+        },
+        {
+            "package": {"ecosystem": "npm", "name": "xrpl"},
+            "ranges": [
+                {"type": "SEMVER", "events": [{"introduced": "2.14.2"}, {"fixed": "2.14.3"}]}
+            ],
+            "versions": ["2.14.2"],
+        },
+    ],
+}
+
+
+def test_cwe_506_advisories_are_malicious_but_other_cwes_are_not():
+    assert is_malicious(XRPL_RECORD)
+    assert is_malicious(
+        {
+            "id": "GHSA-aff-level",
+            "affected": [{"database_specific": {"cwes": [{"cweId": "CWE-506"}]}}],
+        }
+    )
+    assert not is_malicious(
+        {"id": "GHSA-plain", "database_specific": {"cwe_ids": ["CWE-79", "CWE-5060"]}}
+    )
+
+
+def test_range_only_records_are_kept_as_ranges_never_as_whole_package():
+    stats: dict[str, dict[str, int]] = {}
+    bundle = build_bundle_from_records({"npm": [SOLANA_RECORD, XRPL_RECORD]}, stats=stats)
+
+    exact = bundle["datasets"]["npm-malware"]["packages"]
+    ranges = bundle["datasets"]["npm-malware-ranges"]["packages"]
+    assert [(entry["name"], entry.get("version")) for entry in exact] == [("xrpl", "2.14.2")]
+    assert sorted(
+        (entry["name"], entry["ranges"][0]["events"][0]["introduced"]) for entry in ranges
+    ) == [
+        ("@solana/web3.js", "1.95.6"),
+        ("xrpl", "2.14.2"),
+        ("xrpl", "4.2.1"),
+    ]
+    assert all("version" not in entry for entry in ranges)
+    assert ranges[0]["ranges"] == SOLANA_RECORD["affected"][0]["ranges"]
+    assert stats["npm-malware"]["cwe506_records"] == 1
+    assert stats["npm-malware-ranges"]["ranged"] == 3
+
+
+def test_withdrawn_cwe_506_and_git_only_ranges_stay_out_of_every_dataset():
+    withdrawn = {**XRPL_RECORD, "id": "GHSA-withdrawn", "withdrawn": "2025-05-01T00:00:00Z"}
+    git_only = _openssf_record(
+        "MAL-2026-20",
+        "git-only",
+        ranges=[{"type": "GIT", "repo": "https://x", "events": [{"introduced": "abc"}]}],
+    )
+    stats: dict[str, dict[str, int]] = {}
+    bundle = build_bundle_from_records({"npm": [withdrawn, git_only]}, stats=stats)
+
+    assert bundle["datasets"]["npm-malware"]["packages"] == []
+    assert bundle["datasets"]["npm-malware-ranges"]["packages"] == []
+    assert stats["npm-malware"]["withdrawn_skipped"] == 1
+    assert stats["npm-malware-ranges"]["range_unusable"] == 1
+
+
+def test_range_counts_are_reported_but_not_held_to_the_malware_floor():
+    from scripts.build_feed import build_manifest, count_guard_errors
+
+    bundle = build_bundle_from_records({"npm": [SOLANA_RECORD], "PyPI": PYPI_RECORDS})
+    manifest = build_manifest(bundle)
+
+    assert manifest["malware_range_counts"] == {"npm-malware-ranges": 1, "pypi-malware-ranges": 0}
+    assert "npm-malware-ranges" not in manifest["malware_counts"]
+    assert count_guard_errors(manifest["malware_range_counts"], previous={}) == []
+    assert count_guard_errors({"npm-malware-ranges": 10}, previous={"npm-malware-ranges": 100})

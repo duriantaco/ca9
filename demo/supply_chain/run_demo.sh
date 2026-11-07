@@ -16,6 +16,7 @@ CMD=(
   python3 -m ca9.cli vet
   --repo "$SCRIPT_DIR/repo"
   --scan-artifacts
+  --local-artifact-root "$SCRIPT_DIR/artifacts"
   --internal-package "acme-*"
   --private-index "https://packages.acme.internal/simple"
   --deny-license "AGPL-3.0"

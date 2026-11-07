@@ -174,9 +174,10 @@ def load_lock(path: Path, label: str | None = None) -> LockState:
         metadata["issues"] = list(dict.fromkeys(entry_issues))
         occurrences[lock_path] = LockOccurrence(lock_path, package, (), metadata)
         issues.extend(entry_issues)
-    chains, chain_issues, cycle_references = _dependency_chains(entries, paths)
+    chains, chain_issues, cycle_references, chain_limits = _dependency_chains(entries, paths)
     issues.extend(chain_issues)
     for lock_path, occurrence in occurrences.items():
+        limits = chain_limits.get(lock_path, [])
         occurrences[lock_path] = replace(
             occurrence,
             chains=chains.get(lock_path, ()),
@@ -184,6 +185,10 @@ def load_lock(path: Path, label: str | None = None) -> LockState:
                 **occurrence.metadata,
                 "chain_semantics": "simple root-to-occurrence paths",
                 "cycle_references": sorted(cycle_references.get(lock_path, ())),
+                "chain_limits": limits,
+                # Truncated chains only limit evidence about this occurrence,
+                # so review scopes them to occurrences whose resolution changed.
+                "issues": list(dict.fromkeys([*occurrence.metadata["issues"], *limits])),
             },
         )
     return LockState(
@@ -468,15 +473,21 @@ def _display_source(value: str) -> str:
 
 def _dependency_chains(
     entries: dict[str, dict[str, object]], paths: set[str]
-) -> tuple[dict[str, tuple[tuple[str, ...], ...]], list[str], dict[str, set[str]]]:
+) -> tuple[
+    dict[str, tuple[tuple[str, ...], ...]],
+    list[str],
+    dict[str, set[str]],
+    dict[str, list[str]],
+]:
     """Enumerate simple root paths; keep cycle edges as references.
 
     Repeating a node cannot add a new simple path, so a cycle is not missing
     scope. Resource limits that omit otherwise distinct paths are explicit
-    issues instead.
+    issues instead, also recorded per occurrence whose chains were truncated.
     """
     edges: dict[str, set[str]] = {}
     issues: list[str] = []
+    limits: dict[str, list[str]] = {}
     for parent, entry in entries.items():
         children = edges.setdefault(parent, set())
         if entry.get("link") is True:
@@ -522,16 +533,21 @@ def _dependency_chains(
                     {path: tuple(value) for path, value in collected.items()},
                     issues,
                     cycle_references,
+                    {path: list(dict.fromkeys(value)) for path, value in limits.items()},
                 )
             if child in chain:
                 cycle_references.setdefault(parent, set()).add(child)
                 continue
             if len(chain) >= MAX_CHAIN_DEPTH:
-                issues.append(f"{child}: dependency chain depth limit reached")
+                issue = f"{child}: dependency chain depth limit reached"
+                issues.append(issue)
+                limits.setdefault(child, []).append(issue)
                 continue
             child_chains = collected.setdefault(child, [])
             if len(child_chains) >= MAX_CHAINS_PER_OCCURRENCE:
-                issues.append(f"{child}: dependency chain count limit reached")
+                issue = f"{child}: dependency chain count limit reached"
+                issues.append(issue)
+                limits.setdefault(child, []).append(issue)
                 continue
             child_chain = (*chain, child)
             child_chains.append(child_chain)
@@ -540,4 +556,5 @@ def _dependency_chains(
         {path: tuple(value) for path, value in collected.items()},
         list(dict.fromkeys(issues)),
         cycle_references,
+        {path: list(dict.fromkeys(value)) for path, value in limits.items()},
     )

@@ -4,8 +4,13 @@ name: Publish package feed
 # branch as latest.json. `ca9 feed update` (zero-arg) points at:
 #   https://raw.githubusercontent.com/duriantaco/ca9/feed/latest.json
 #
-# Review before enabling. To use GitHub Pages instead, serve the `feed` branch
-# and set DEFAULT_FEED_URL / CA9_FEED_URL accordingly.
+# The build job runs third-party code (pip, the feed builder) with a read-only
+# token. Only the publish job can write, and it runs no project code. Each
+# published bundle carries a GitHub artifact attestation signed by this
+# workflow. `ca9 feed update --require-attestation` checks it with:
+#   gh attestation verify latest.json --repo duriantaco/ca9 \
+#     --cert-identity https://github.com/duriantaco/ca9/.github/workflows/feed.yml@refs/heads/main \
+#     --source-ref refs/heads/main --deny-self-hosted-runners
 
 on:
   schedule:
@@ -13,19 +18,22 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: publish-feed
   cancel-in-progress: false
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      # Recommendation: pin these to commit SHAs (see tj-actions/CVE-2025-30066).
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
 
@@ -48,6 +56,35 @@ jobs:
             --manifest feed_build/manifest.json \
             --min-malware 100 \
             --compare-manifest feed_build/prev-manifest.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload feed bundle
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: feed-bundle
+          path: |
+            feed_build/latest.json
+            feed_build/manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download feed bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: feed-bundle
+          path: feed_build
+
+      - name: Attest feed bundle
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: feed_build/latest.json
 
       - name: Publish to the feed branch
         env:

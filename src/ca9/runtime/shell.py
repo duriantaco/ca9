@@ -7,7 +7,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ca9.runtime.ci import SHIM_NAMES, install_ci_shims
+from ca9.runtime.ci import (
+    SHIM_NAMES,
+    find_shadowed_shims,
+    install_ci_shims,
+    path_contains_dir,
+    shadowed_shim_warning,
+    shadowed_shims_to_dicts,
+)
 
 SHELL_SETUP_SCHEMA = "ca9.shell.setup.v1"
 SHELL_TEARDOWN_SCHEMA = "ca9.shell.teardown.v1"
@@ -59,10 +66,15 @@ class ShellDoctorResult:
     path_contains_shim_dir: bool
     missing_shims: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    shadowed_shims: tuple[tuple[str, str], ...] = ()
 
     @property
     def ok(self) -> bool:
-        return self.shims_installed and (self.profile_contains_block or self.path_contains_shim_dir)
+        return (
+            self.shims_installed
+            and (self.profile_contains_block or self.path_contains_shim_dir)
+            and not self.shadowed_shims
+        )
 
     @property
     def exit_code(self) -> int:
@@ -78,6 +90,7 @@ class ShellDoctorResult:
             "missing_shims": list(self.missing_shims),
             "profile_contains_block": self.profile_contains_block,
             "path_contains_shim_dir": self.path_contains_shim_dir,
+            "shadowed_shims": shadowed_shims_to_dicts(self.shadowed_shims),
             "warnings": list(self.warnings),
         }
 
@@ -154,7 +167,9 @@ def doctor_shell(
     missing = tuple(name for name in SHIM_NAMES if not _is_executable_file(target_dir / name))
     profile_text = _read_text(target_profile)
     profile_contains = _contains_managed_block(profile_text)
-    path_contains = _path_contains(active_env.get("PATH", ""), target_dir)
+    path_value = active_env.get("PATH", "")
+    path_contains = _path_contains(path_value, target_dir)
+    shadowed = find_shadowed_shims(target_dir, path_value) if path_contains else ()
     warnings: list[str] = []
     if missing:
         warnings.append("missing or non-executable shims: " + ", ".join(missing))
@@ -162,6 +177,19 @@ def doctor_shell(
         warnings.append(f"profile does not contain ca9 managed block: {target_profile}")
     if not path_contains and profile_contains:
         warnings.append("current shell has not sourced the ca9 managed block yet")
+    warnings.extend(
+        shadowed_shim_warning(
+            name,
+            resolved,
+            target_dir,
+            fix=(
+                f"keep the ca9 managed block last in {target_profile} (after pyenv, nvm, or "
+                "virtualenv setup), or run "
+                f'`export PATH="{target_dir}:$PATH"` after activating a virtualenv'
+            ),
+        )
+        for name, resolved in shadowed
+    )
 
     return ShellDoctorResult(
         profile_path=target_profile,
@@ -171,6 +199,7 @@ def doctor_shell(
         profile_contains_block=profile_contains,
         path_contains_shim_dir=path_contains,
         warnings=tuple(warnings),
+        shadowed_shims=shadowed,
     )
 
 
@@ -304,6 +333,4 @@ def _is_executable_file(path: Path) -> bool:
 
 
 def _path_contains(path_value: str, target_dir: Path) -> bool:
-    return any(
-        Path(part).expanduser() == target_dir for part in path_value.split(os.pathsep) if part
-    )
+    return path_contains_dir(path_value, target_dir)

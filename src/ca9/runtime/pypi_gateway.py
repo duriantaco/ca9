@@ -6,6 +6,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
@@ -15,13 +16,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from packaging.utils import (
-    InvalidSdistFilename,
     InvalidWheelFilename,
     canonicalize_name,
-    parse_sdist_filename,
     parse_wheel_filename,
 )
+from packaging.version import InvalidVersion, Version
 
+from ca9 import release_age as release_age_module
 from ca9.package_feed import (
     FeedSnapshot,
     FeedStatus,
@@ -31,10 +32,25 @@ from ca9.package_feed import (
     release_window_covers,
 )
 from ca9.package_policy import PackagePolicy, action_for_mode, find_policy_exception
+from ca9.release_age import check_release_age, prime_release_times
 
 DEFAULT_PYPI_UPSTREAM = "https://pypi.org"
 GATEWAY_SCHEMA = "ca9.pypi.gateway.v1"
 EVALUATION_FAILURE_POLICY_ID = "ca9.pypi_gateway_evaluation_failed"
+# pip's non-wheel ARCHIVE_EXTENSIONS: links with any other extension are ignored by pip.
+_PIP_SDIST_SUFFIXES = (
+    ".tar.gz",
+    ".zip",
+    ".tar.bz2",
+    ".tbz",
+    ".tar.xz",
+    ".txz",
+    ".tlz",
+    ".tar.lz",
+    ".tar.lzma",
+    ".tgz",
+    ".tar",
+)
 
 
 @dataclass(frozen=True)
@@ -85,12 +101,18 @@ class PyPIGatewayState:
     removed_links: list[PyPIGatewayDecision] | None = None
     applied_exceptions: list[dict[str, Any]] | None = None
     evaluation_failures: list[PyPIGatewayEvaluationFailure] | None = None
+    release_age_defaulted: bool = False
+    release_fetch: Callable[[str], Any] | None = None
+    release_memo: dict[str, Any] | None = None
+    primed_projects: set[str] | None = None
 
     def __post_init__(self) -> None:
         self.upstream_base = _normalize_upstream_base(self.upstream_base)
         self.removed_links = []
         self.applied_exceptions = []
         self.evaluation_failures = []
+        self.release_memo = {}
+        self.primed_projects = set()
 
 
 class PyPISimpleGateway:
@@ -101,12 +123,16 @@ class PyPISimpleGateway:
         policy: PackagePolicy,
         feed_cache_dir: Path | None = None,
         now: datetime | None = None,
+        release_age_defaulted: bool = False,
+        release_fetch: Callable[[str], Any] | None = None,
     ) -> None:
         self.state = PyPIGatewayState(
             upstream_base=upstream_base,
             policy=policy,
             feed_cache_dir=feed_cache_dir,
             now=now,
+            release_age_defaulted=release_age_defaulted,
+            release_fetch=release_fetch,
         )
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -231,6 +257,12 @@ def _handler_for_state(state: PyPIGatewayState):
                 return
 
             upstream_url = state.upstream_base + self.path
+            # A path that does not start with "/" would extend the upstream host
+            # or add userinfo to it.
+            if not self.path.startswith("/") or not _same_origin(upstream_url, state.upstream_base):
+                self.send_error(403, "gateway only proxies paths on the upstream index")
+                return
+
             try:
                 status, headers, body = _fetch_upstream(upstream_url)
             except urllib.error.HTTPError as exc:
@@ -310,13 +342,54 @@ def _deny_project_page(
         handler.wfile.write(body)
 
 
+class _UpstreamRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _redirect_allowed(req.full_url, newurl):
+            fp.close()
+            raise urllib.error.URLError(
+                f"refusing upstream redirect to {_sanitize_url_for_evidence(newurl)}"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _fetch_upstream(url: str) -> tuple[int, dict[str, str], bytes]:
     request = urllib.request.Request(
         url,
         headers={"Accept": "application/vnd.pypi.simple.v1+html, text/html"},
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
+    opener = urllib.request.build_opener(_UpstreamRedirectHandler)
+    with opener.open(request, timeout=30) as response:
         return response.status, dict(response.headers.items()), response.read()
+
+
+def _redirect_allowed(source_url: str, target_url: str) -> bool:
+    # Follow redirects only within the upstream host, and never downgrade from
+    # https; a page served from elsewhere was not requested through policy.
+    try:
+        source = urllib.parse.urlsplit(source_url)
+        target = urllib.parse.urlsplit(target_url)
+        if not source.hostname or not target.hostname or target.username or target.password:
+            return False
+        if source.hostname.lower() != target.hostname.lower():
+            return False
+        if target.scheme == source.scheme:
+            return target.port == source.port
+    except ValueError:
+        return False
+    return source.scheme == "http" and target.scheme == "https"
+
+
+def _same_origin(url: str, base: str) -> bool:
+    try:
+        candidate = urllib.parse.urlsplit(url)
+        expected = urllib.parse.urlsplit(base)
+        return (
+            candidate.scheme == expected.scheme
+            and candidate.netloc == expected.netloc
+            and candidate.port == expected.port
+        )
+    except ValueError:
+        return False
 
 
 def _rewrite_simple_html(
@@ -354,16 +427,15 @@ def _rewrite_simple_html(
 
     kept: list[_SimpleLink] = []
     removed: list[PyPIGatewayDecision] = []
+    skipped = False
     for link in links.links:
         version = _version_from_href(link.href, package_name)
         if version is None:
-            raise _ProjectPageEvaluationError(
-                "unparseable_distribution_link",
-                (
-                    "PyPI project page contains a distribution link with an unparseable "
-                    "filename or version"
-                ),
-            )
+            # pip ignores links it cannot install from (.egg, .exe, another
+            # project's files, invalid versions). Drop them instead of denying the
+            # whole page, so nothing unevaluated reaches pip.
+            skipped = True
+            continue
         decision = _denied_version(
             package_name, version, link.href, state.policy, feed.snapshot, state
         )
@@ -372,12 +444,13 @@ def _rewrite_simple_html(
             continue
         removed.append(decision)
 
-    if not removed:
+    if not removed and not skipped:
         return None
 
-    state.rewrite_count += 1
-    if state.removed_links is not None:
-        state.removed_links.extend(removed)
+    if removed:
+        state.rewrite_count += 1
+        if state.removed_links is not None:
+            state.removed_links.extend(removed)
     return _render_simple_page(package_name, kept).encode("utf-8")
 
 
@@ -424,6 +497,14 @@ def _denied_version(
                 snapshot, "pypi", now=now, minimum_hours=policy.package_age.minimum_hours
             ):
                 return None
+            result = _registry_release_age(package_name, version, state, now=now)
+            if result["status"] == "old_enough":
+                return None
+            if result["status"] == "too_new" and result.get("published_at"):
+                released_at = str(result["published_at"])
+        if not released_at:
+            if state.release_age_defaulted:
+                return None
             if action_for_mode("block", policy.mode.offline) == "block":
                 return _apply_gateway_exception(
                     PyPIGatewayDecision(
@@ -456,6 +537,52 @@ def _denied_version(
                     state,
                 )
     return None
+
+
+def _registry_release_age(
+    package_name: str,
+    version: str,
+    state: PyPIGatewayState,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    """Release age from PyPI metadata, fetching each URL at most once per gateway run."""
+    memo = state.release_memo
+    if memo is None:
+        memo = {}
+    upstream_fetch = state.release_fetch
+
+    def fetch_once(url: str) -> Any:
+        if url not in memo:
+            try:
+                if upstream_fetch is not None:
+                    memo[url] = ("ok", upstream_fetch(url))
+                else:
+                    memo[url] = ("ok", release_age_module._default_fetch(url))
+            except Exception as exc:
+                memo[url] = ("error", exc)
+        outcome, value = memo[url]
+        if outcome == "error":
+            raise value
+        return value
+
+    cache_root = None
+    if state.feed_cache_dir is not None:
+        cache_root = Path(state.feed_cache_dir).parent
+    primed = state.primed_projects
+    project = str(canonicalize_name(package_name))
+    if primed is not None and project not in primed:
+        primed.add(project)
+        prime_release_times("pypi", package_name, cache_dir=cache_root, fetch=fetch_once, now=now)
+    return check_release_age(
+        "pypi",
+        package_name,
+        version,
+        min_hours=state.policy.package_age.minimum_hours,
+        cache_dir=cache_root,
+        fetch=fetch_once,
+        now=now,
+    )
 
 
 def _apply_gateway_exception(
@@ -623,19 +750,34 @@ def _package_from_simple_path(path: str) -> str | None:
 
 
 def _version_from_href(href: str, package_name: str) -> str | None:
+    """Return the version pip would install from this link, or None if pip skips it."""
     filename = PurePosixPath(_href_path(href)).name
     if not filename:
         return None
-    try:
-        name, version, _, _ = parse_wheel_filename(filename)
-    except InvalidWheelFilename:
+    lowered = filename.lower()
+    if lowered.endswith(".whl"):
         try:
-            name, version = parse_sdist_filename(filename)
-        except InvalidSdistFilename:
+            name, version, _, _ = parse_wheel_filename(filename)
+        except InvalidWheelFilename:
             return None
-    if str(canonicalize_name(str(name))) != str(canonicalize_name(package_name)):
+        if str(canonicalize_name(str(name))) != str(canonicalize_name(package_name)):
+            return None
+        return str(version)
+    suffix = next((item for item in _PIP_SDIST_SUFFIXES if lowered.endswith(item)), None)
+    if suffix is None:
         return None
-    return str(version)
+    # Like pip's _extract_version_from_fragment(), split the name from the version
+    # at the first dash whose prefix is the project name; this also covers legacy
+    # archives (.tar.bz2, .tgz, ...) that pip still installs.
+    stem = filename[: -len(suffix)]
+    canonical = canonicalize_name(package_name)
+    for index, character in enumerate(stem):
+        if character == "-" and canonicalize_name(stem[:index]) == canonical:
+            try:
+                return str(Version(stem[index + 1 :]))
+            except InvalidVersion:
+                return None
+    return None
 
 
 def _href_path(href: str) -> str:

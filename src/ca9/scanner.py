@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import os
-import re
 import time
 import urllib.error
 import urllib.request
@@ -12,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 from ca9.advisory import attach_cache_freshness, metadata_from_osv, normalize_ecosystem
 from ca9.analysis.ast_scanner import discover_declared_dependency_inventory
@@ -29,14 +29,14 @@ OSV_ECOSYSTEM_NAMES = {
     "pypi": "PyPI",
     "npm": "npm",
 }
-_MALWARE_TEXT_RE = re.compile(
-    r"\bmalware\b|"
-    r"\bmalicious\s+(?:package|code|payload|release|version|dependency|dropper|artifact)\b|"
-    r"\bcontains\s+malicious\b|"
-    r"\bcredential\s+exfiltration\b|"
-    r"\bexfiltrat(?:e|es|ed|ing|ion)\b",
-    re.I,
-)
+# OSV rejects querybatch requests with more than 1000 queries (HTTP 400).
+OSV_BATCH_MAX_QUERIES = 1000
+OSV_BATCH_MAX_ATTEMPTS = 5
+OSV_BATCH_MAX_BACKOFF_SECONDS = 8.0
+# Bound next_page_token follow-ups so a misbehaving server cannot loop forever.
+OSV_BATCH_MAX_PAGES = 50
+_RETRYABLE_HTTP_CODES = (429, 500, 502, 503, 504)
+_VERSION_RANGE_TYPES = ("ECOSYSTEM", "SEMVER")
 
 
 @dataclass(frozen=True)
@@ -325,6 +325,12 @@ def _osv_ecosystem_name(ecosystem: str) -> str:
 
 
 def _is_malicious_osv(data: dict, vuln_id: str = "") -> bool:
+    """Classify an OSV record as malware from structured markers only.
+
+    Free text is not evidence: ordinary advisories routinely say "malicious" or
+    "exfiltrate" (SSRF, XSS, ...). Only ``MAL-`` ids/aliases (OpenSSF
+    malicious-packages) and OSV's explicit malicious markers count.
+    """
     aliases = data.get("aliases", [])
     if not isinstance(aliases, list):
         aliases = []
@@ -332,52 +338,22 @@ def _is_malicious_osv(data: dict, vuln_id: str = "") -> bool:
     if any(_is_malware_advisory_id(advisory_id) for advisory_id in advisory_ids):
         return True
 
-    for value in _walk_values(data):
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, str) and _MALWARE_TEXT_RE.search(value):
-            return True
-
     return _has_explicit_malicious_marker(data)
 
 
 def _has_explicit_malicious_marker(data: dict) -> bool:
-    for key, value in _walk_items(data):
-        normalized_key = key.lower().replace("_", "-")
-        if normalized_key in {"malicious", "is-malicious", "malware"} and value is True:
-            return True
-        if normalized_key in {"type", "classification", "category"}:
-            if isinstance(value, str) and value.strip().lower() in {"malware", "malicious"}:
-                return True
-    return False
+    database_specific = data.get("database_specific")
+    if not isinstance(database_specific, dict):
+        return False
+    origins = database_specific.get("malicious-packages-origins")
+    if isinstance(origins, list) and origins:
+        return True
+    return database_specific.get("malicious") is True
 
 
 def _is_malware_advisory_id(value: str) -> bool:
     upper = value.upper()
     return upper.startswith("MAL-") or upper.startswith("PYSEC-MAL-")
-
-
-def _walk_values(value):
-    if isinstance(value, dict):
-        for child in value.values():
-            yield from _walk_values(child)
-        return
-    if isinstance(value, list | tuple | set):
-        for child in value:
-            yield from _walk_values(child)
-        return
-    yield value
-
-
-def _walk_items(value):
-    if isinstance(value, dict):
-        for key, child in value.items():
-            yield str(key), child
-            yield from _walk_items(child)
-        return
-    if isinstance(value, list | tuple | set):
-        for child in value:
-            yield from _walk_items(child)
 
 
 def _cache_path(vuln_id: str) -> Path:
@@ -449,6 +425,77 @@ def _fetch_vuln_details(vuln_id: str, offline: bool = False) -> dict:
     return {}
 
 
+def _query_osv_batch_results(queries: list[dict]) -> list[list[dict]]:
+    """Run OSV querybatch for any number of queries; return vulns per query, in order.
+
+    Queries are sent in chunks of at most ``OSV_BATCH_MAX_QUERIES`` and any
+    per-query ``next_page_token`` is followed until OSV reports no more pages.
+    """
+    results: list[list[dict]] = [[] for _ in queries]
+    for start in range(0, len(queries), OSV_BATCH_MAX_QUERIES):
+        pending = [
+            (index, queries[index])
+            for index in range(start, min(start + OSV_BATCH_MAX_QUERIES, len(queries)))
+        ]
+        pages = 0
+        while pending:
+            pages += 1
+            if pages > OSV_BATCH_MAX_PAGES:
+                raise ValueError(
+                    f"OSV.dev returned more than {OSV_BATCH_MAX_PAGES} result pages; "
+                    "refusing to continue with incomplete results"
+                )
+            data = _post_osv_batch([query for _, query in pending])
+            batch_results = data.get("results") if isinstance(data, dict) else None
+            if not isinstance(batch_results, list):
+                batch_results = []
+            next_pending: list[tuple[int, dict]] = []
+            for (index, query), result in zip(pending, batch_results, strict=False):
+                if not isinstance(result, dict):
+                    continue
+                vulns = result.get("vulns") or []
+                if isinstance(vulns, list):
+                    results[index].extend(v for v in vulns if isinstance(v, dict))
+                token = result.get("next_page_token")
+                if isinstance(token, str) and token:
+                    next_pending.append((index, {**query, "page_token": token}))
+            pending = next_pending
+    return results
+
+
+def _post_osv_batch(queries: list[dict]) -> dict:
+    """POST one querybatch request, retrying 429/5xx with bounded exponential backoff."""
+    payload = json.dumps({"queries": queries}).encode()
+    for attempt in range(OSV_BATCH_MAX_ATTEMPTS):
+        req = urllib.request.Request(
+            OSV_BATCH_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in _RETRYABLE_HTTP_CODES and attempt < OSV_BATCH_MAX_ATTEMPTS - 1:
+                time.sleep(_osv_retry_delay(attempt, e))
+                continue
+            raise ConnectionError(f"OSV.dev API request failed: {e}") from e
+        except (urllib.error.URLError, OSError) as e:
+            raise ConnectionError(f"OSV.dev API request failed: {e}") from e
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise ValueError(f"OSV.dev returned malformed JSON: {e}") from e
+    raise ConnectionError("OSV.dev API request failed: retries exhausted")
+
+
+def _osv_retry_delay(attempt: int, error: urllib.error.HTTPError) -> float:
+    delay = RETRY_BACKOFF_BASE * (2**attempt)
+    retry_after = error.headers.get("Retry-After") if error.headers is not None else None
+    if isinstance(retry_after, str) and retry_after.strip().isdigit():
+        delay = max(delay, float(retry_after.strip()))
+    return min(delay, OSV_BATCH_MAX_BACKOFF_SECONDS)
+
+
 def query_osv_batch(
     packages: list[tuple[str, str]],
     offline: bool = False,
@@ -479,36 +526,13 @@ def query_osv_batch(
         for name, version in packages
     ]
 
-    payload = json.dumps({"queries": queries}).encode()
-    req = urllib.request.Request(
-        OSV_BATCH_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
-        raise ConnectionError(f"OSV.dev API request failed: {e}") from e
-    except json.JSONDecodeError as e:
-        raise ValueError(f"OSV.dev returned malformed JSON: {e}") from e
-
     seen_keys: set[tuple[str, str, str]] = set()
     vuln_refs: list[tuple[str, str, str]] = []
 
-    for i, result in enumerate(data.get("results", [])):
-        if i < len(packages):
-            pkg_name = packages[i][0]
-        else:
-            pkg_name = "unknown"
-        if i < len(packages):
-            pkg_version = packages[i][1]
-        else:
-            pkg_version = "unknown"
+    for i, result_vulns in enumerate(_query_osv_batch_results(queries)):
+        pkg_name, pkg_version = packages[i]
 
-        for osv_vuln in result.get("vulns", []):
+        for osv_vuln in result_vulns:
             vuln_id = osv_vuln.get("id", "")
             if not vuln_id:
                 continue
@@ -625,13 +649,7 @@ def _query_from_cache_only(
 
     for pkg_name, pkg_version in packages:
         for vuln_id, details in cached_vulns.items():
-            affected_pkgs = set()
-            for affected in details.get("affected", []):
-                pkg = affected.get("package", {})
-                if normalize_ecosystem(pkg.get("ecosystem", "")) == normalized_ecosystem:
-                    affected_pkgs.add(pkg.get("name", "").lower())
-
-            if pkg_name.lower() not in affected_pkgs:
+            if not _cached_advisory_affects(details, pkg_name, pkg_version, normalized_ecosystem):
                 continue
 
             key = finding_key(vuln_id, pkg_name, pkg_version)
@@ -667,6 +685,103 @@ def _query_from_cache_only(
             )
 
     return vulns
+
+
+def _cached_advisory_affects(
+    details: dict,
+    package_name: str,
+    package_version: str,
+    ecosystem: str,
+) -> bool:
+    """Offline stand-in for OSV's server-side version matching.
+
+    An ``affected`` entry matches when the version is listed explicitly, falls in
+    an ECOSYSTEM/SEMVER range, or the entry has no version constraints at all
+    (whole-package records). Versions ca9 cannot compare are kept, so offline
+    mode errs toward reporting rather than silently dropping an advisory.
+    """
+    target = _comparable_package_name(package_name, ecosystem)
+    for affected in details.get("affected") or []:
+        if not isinstance(affected, dict):
+            continue
+        pkg = affected.get("package") or {}
+        if normalize_ecosystem(pkg.get("ecosystem", "")) != ecosystem:
+            continue
+        if _comparable_package_name(str(pkg.get("name") or ""), ecosystem) != target:
+            continue
+        if _affected_entry_includes(affected, package_version):
+            return True
+    return False
+
+
+def _comparable_package_name(name: str, ecosystem: str) -> str:
+    if ecosystem == "pypi":
+        return str(canonicalize_name(name))
+    return name.strip().lower()
+
+
+def _affected_entry_includes(affected: dict, version: str) -> bool:
+    versions = [str(v) for v in affected.get("versions") or []]
+    ranges = [r for r in affected.get("ranges") or [] if isinstance(r, dict)]
+    if not versions and not ranges:
+        return True
+    if version in versions:
+        return True
+    for osv_range in ranges:
+        if osv_range.get("type") not in _VERSION_RANGE_TYPES:
+            continue
+        included = _osv_range_includes(osv_range.get("events") or [], version)
+        if included is None or included:
+            return True
+    return False
+
+
+def _osv_range_includes(events: list, version: str) -> bool | None:
+    """Evaluate OSV range events for ``version``; None when versions cannot be compared."""
+    installed = _parse_osv_version(version)
+    if installed is None:
+        return None
+    bounds: list[tuple[str, Version | None]] = []
+    limits: list[Version | None] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        for kind in ("introduced", "fixed", "last_affected", "limit"):
+            if kind not in event:
+                continue
+            raw = str(event[kind])
+            if (kind == "introduced" and raw == "0") or (kind == "limit" and raw == "*"):
+                parsed = None
+            else:
+                parsed = _parse_osv_version(raw)
+                if parsed is None:
+                    return None
+            if kind == "limit":
+                limits.append(parsed)
+            else:
+                bounds.append((kind, parsed))
+
+    # OSV evaluation: walk events in version order (introduced "0" first).
+    affected = False
+    for kind, bound in sorted(bounds, key=lambda item: (item[1] is not None, item[1] or 0)):
+        if kind == "introduced":
+            if bound is None or installed >= bound:
+                affected = True
+        elif kind == "fixed":
+            if bound is not None and installed >= bound:
+                affected = False
+        elif bound is not None and installed > bound:
+            affected = False
+    if affected and limits:
+        affected = any(limit is None or installed < limit for limit in limits)
+    return affected
+
+
+def _parse_osv_version(value: str) -> Version | None:
+    try:
+        return Version(value)
+    except InvalidVersion:
+        return None
 
 
 def scan_installed(

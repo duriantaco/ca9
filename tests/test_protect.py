@@ -273,7 +273,9 @@ def _write_feed_bundle(tmp_path):
     expires = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=1)).isoformat()
     bundle = {
         "schema": "ca9.feed.v1",
-        "created_at": "2026-07-25T00:00:00Z",
+        "created_at": (
+            datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=1)
+        ).isoformat(),
         "expires_at": expires,
         "datasets": {
             "pypi-malware": {

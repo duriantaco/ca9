@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -122,21 +124,55 @@ def load_rule_from_dict(data: dict) -> list[VulnIntelRule]:
     return rules
 
 
-def load_rules_from_yaml(path: Path) -> list[VulnIntelRule]:
+class RuleFileError(ValueError):
+    """A rule file could not be read or parsed."""
+
+
+def _parse_rule_data(path: Path, data: object) -> list[VulnIntelRule]:
+    if not isinstance(data, dict):
+        raise RuleFileError(f"{path}: rule file must contain a mapping at the top level")
+    return load_rule_from_dict(data)
+
+
+def load_rules_from_json(path: Path) -> list[VulnIntelRule]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuleFileError(f"{path}: cannot read rule file: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuleFileError(f"{path}: invalid JSON rule file: {exc}") from exc
+    return _parse_rule_data(path, data)
+
+
+def load_rules_from_file(path: Path) -> list[VulnIntelRule]:
+    """Load a rule file, raising RuleFileError instead of returning no rules."""
+    if path.suffix.lower() == ".json":
+        return load_rules_from_json(path)
+
     try:
         import yaml
     except ImportError:
-        return []
+        raise RuleFileError(
+            f"{path}: YAML rule files require PyYAML (pip install pyyaml), "
+            "or convert the file to JSON"
+        ) from None
 
     try:
-        data = yaml.safe_load(path.read_text())
-    except Exception:
-        return []
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuleFileError(f"{path}: cannot read rule file: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise RuleFileError(f"{path}: invalid YAML rule file: {exc}") from exc
+    return _parse_rule_data(path, data)
 
-    if not isinstance(data, dict):
-        return []
 
-    return load_rule_from_dict(data)
+def load_rules_from_yaml(path: Path) -> list[VulnIntelRule]:
+    """Load a user-supplied YAML rule file; failures warn rather than vanish."""
+    try:
+        return load_rules_from_file(path)
+    except RuleFileError as exc:
+        warnings.warn(f"ca9: ignoring rule file: {exc}", RuntimeWarning, stacklevel=2)
+        return []
 
 
 _BUILTIN_RULES: list[VulnIntelRule] = []
@@ -153,18 +189,23 @@ def _ensure_rules_loaded() -> None:
 
 
 def _load_builtin_rules() -> None:
+    # Built-in rules are JSON so they load with the stdlib alone; PyYAML is
+    # not a runtime dependency.
     rules_dir = Path(__file__).parent / "rules"
-    if not rules_dir.is_dir():
-        return
+    paths = sorted(rules_dir.glob("*.json")) if rules_dir.is_dir() else []
+    if not paths:
+        warnings.warn(
+            f"ca9: built-in vulnerable-API rules are missing from {rules_dir}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
-    for path in sorted(rules_dir.glob("*.yml")):
-        rules = load_rules_from_yaml(path)
-        _BUILTIN_RULES.extend(rules)
-        for rule in rules:
-            _RULES_BY_PACKAGE.setdefault(rule.package, []).append(rule)
-
-    for path in sorted(rules_dir.glob("*.yaml")):
-        rules = load_rules_from_yaml(path)
+    for path in paths:
+        try:
+            rules = load_rules_from_json(path)
+        except RuleFileError as exc:
+            warnings.warn(f"ca9: built-in rule file skipped: {exc}", RuntimeWarning, stacklevel=2)
+            continue
         _BUILTIN_RULES.extend(rules)
         for rule in rules:
             _RULES_BY_PACKAGE.setdefault(rule.package, []).append(rule)

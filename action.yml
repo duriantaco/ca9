@@ -27,6 +27,13 @@ inputs:
     description: Scan local GitHub Actions workflows when command is protect.
     required: false
     default: "true"
+  update-feed:
+    description: >-
+      Install the hosted ca9 malware feed before command protect. The bundle is
+      checked with `gh attestation verify` against the ca9 feed workflow, and the
+      step fails if it cannot be verified.
+    required: false
+    default: "true"
   coverage:
     description: coverage.py JSON path for dynamic evidence.
     required: false
@@ -59,8 +66,12 @@ inputs:
     description: OTLP JSON export for production runtime evidence.
     required: false
     default: ""
+  auto-coverage:
+    description: Discover coverage.json in the repo, or run the repo's pytest suite to generate it. This executes repository code.
+    required: false
+    default: "false"
   no-auto-coverage:
-    description: Disable automatic coverage discovery and generation.
+    description: Deprecated; automatic coverage is already off by default. Kept for compatibility, and overrides auto-coverage when true.
     required: false
     default: "false"
   accepted-risks:
@@ -103,6 +114,13 @@ runs:
       shell: bash
       run: python -m pip install "${{ github.action_path }}[cli]"
 
+    - name: Update ca9 feed (attested)
+      if: inputs.command == 'protect' && inputs.update-feed == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: ca9 feed update --require-attestation
+
     - name: Run ca9
       id: ca9
       shell: bash
@@ -120,6 +138,7 @@ runs:
         CA9_TRACE_PATHS: ${{ inputs.trace-paths }}
         CA9_THREAT_INTEL: ${{ inputs.threat-intel }}
         CA9_OTEL_TRACES: ${{ inputs.otel-traces }}
+        CA9_AUTO_COVERAGE: ${{ inputs.auto-coverage }}
         CA9_NO_AUTO_COVERAGE: ${{ inputs.no-auto-coverage }}
         CA9_ACCEPTED_RISKS: ${{ inputs.accepted-risks }}
         CA9_BASELINE: ${{ inputs.baseline }}
@@ -160,6 +179,8 @@ runs:
           fi
           if [[ "$CA9_NO_AUTO_COVERAGE" == "true" ]]; then
             cmd+=(--no-auto-coverage)
+          elif [[ "$CA9_AUTO_COVERAGE" == "true" ]]; then
+            cmd+=(--auto-coverage)
           fi
           if [[ -n "$CA9_ACCEPTED_RISKS" ]]; then
             cmd+=(--accepted-risks "$CA9_ACCEPTED_RISKS")
@@ -217,7 +238,7 @@ runs:
 
     - name: Upload SARIF
       if: inputs.upload-sarif == 'true' && inputs.format == 'sarif'
-      uses: github/codeql-action/upload-sarif@v3
+      uses: github/codeql-action/upload-sarif@1190a975f95ce23525efb6a3fc21ea29567c1b52 # v3.38.2
       with:
         sarif_file: ${{ inputs.output }}
 

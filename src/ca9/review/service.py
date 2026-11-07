@@ -101,6 +101,10 @@ def review_lockfiles(
     config = ArtifactScanConfig(
         url_validator=lambda url: _permitted_url(url, origins),
         allowed_local_roots=(),
+        # Registries the operator names explicitly may be internal hosts.
+        private_indexes=tuple(
+            value for value in trusted_registries if value not in DEFAULT_TRUSTED_REGISTRIES
+        ),
         **({"cache_dir": cache_dir} if cache_dir is not None else {}),
     )
     base_state = load_lock(Path(base))

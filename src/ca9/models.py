@@ -106,6 +106,18 @@ class Evidence:
     coverage_scope: str = "unavailable"
     coverage_measured_files: tuple[str, ...] = ()
     coverage_unmeasured_targets: tuple[str, ...] = ()
+    # "metadata" or "curated" mappings can prove an import is absent; "guessed" cannot.
+    import_names: tuple[str, ...] = ()
+    import_name_source: str = ""
+    package_installed: bool | None = None  # none = not checked
+    # Ways the package may run without an import: CLI, plugin, config string.
+    indirect_use_signals: tuple[str, ...] = ()
+    # Packages whose absence of imports rests on a guessed import name.
+    unproven_import_mappings: tuple[str, ...] = ()
+    submodule_evidence: str = ""
+    # Imported modules no installed distribution provides; they leave the
+    # environment dependency graph incomplete.
+    dependency_graph_unresolved: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

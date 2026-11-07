@@ -88,10 +88,13 @@ def test_pypi_gateway_preserves_upstream_bytes_when_no_rewrite(tmp_path):
     assert gateway.state.rewrite_count == 0
 
 
-def test_pypi_gateway_rejects_unparseable_distribution_link(tmp_path):
+def test_pypi_gateway_checks_legacy_sdist_link_by_filename_version(tmp_path):
+    # pip installs legacy .tar.bz2 sdists, so the link is evaluated by the version
+    # in its filename instead of denying the whole project page.
     html = b"""
 <html><body>
 <a href="badlib-1.0.0.tar.bz2?credential=do-not-log">badlib-1.0.0.tar.bz2</a>
+<a href="badlib-0.9.0.tar.bz2">badlib-0.9.0.tar.bz2</a>
 </body></html>
 """
     upstream = _FakePyPIRegistry(html)
@@ -105,25 +108,15 @@ def test_pypi_gateway_rejects_unparseable_distribution_link(tmp_path):
             policy=PackagePolicy(),
             feed_cache_dir=cache_root / "feed",
         ) as gateway,
-        pytest.raises(urllib.error.HTTPError) as caught,
     ):
-        urllib.request.urlopen(gateway.index_url + "/badlib/")
+        body = urllib.request.urlopen(gateway.index_url + "/badlib/").read().decode()
 
-    assert caught.value.code == 403
+    assert "badlib-1.0.0.tar.bz2" not in body
+    assert "badlib-0.9.0.tar.bz2" in body
     payload = gateway.to_dict()
-    assert payload["evaluation_failures"] == [
-        {
-            "package": "badlib",
-            "policy_id": "ca9.pypi_gateway_evaluation_failed",
-            "reason": (
-                "PyPI project page contains a distribution link with an unparseable "
-                "filename or version"
-            ),
-            "evidence": {
-                "ecosystem": "pypi",
-                "failure_kind": "unparseable_distribution_link",
-            },
-        }
+    assert payload["evaluation_failures"] == []
+    assert [(item["version"], item["policy_id"]) for item in payload["removed_links"]] == [
+        ("1.0.0", "ca9.malware")
     ]
     assert "do-not-log" not in json.dumps(payload)
 
@@ -188,12 +181,13 @@ def test_pypi_gateway_evaluates_non_200_success_response(tmp_path):
             policy=PackagePolicy(),
             feed_cache_dir=cache_root / "feed",
         ) as gateway,
-        pytest.raises(urllib.error.HTTPError) as caught,
     ):
-        urllib.request.urlopen(gateway.index_url + "/badlib/")
+        response = urllib.request.urlopen(gateway.index_url + "/badlib/")
+        body = response.read()
 
-    assert caught.value.code == 403
-    assert gateway.state.evaluation_failures[0].failure_kind == "unparseable_distribution_link"
+    assert response.status == 203
+    assert b"badlib-1.0.0.tar.bz2" not in body
+    assert gateway.state.removed_links[0].policy_id == "ca9.malware"
 
 
 def test_pypi_gateway_evaluates_300_project_response(tmp_path):
@@ -215,8 +209,9 @@ def test_pypi_gateway_evaluates_300_project_response(tmp_path):
     ):
         urllib.request.urlopen(gateway.index_url + "/badlib/")
 
-    assert caught.value.code == 403
-    assert gateway.state.evaluation_failures[0].failure_kind == "unparseable_distribution_link"
+    assert caught.value.code == 300
+    assert b"badlib-1.0.0.tar.bz2" not in caught.value.read()
+    assert gateway.state.removed_links[0].policy_id == "ca9.malware"
 
 
 def test_pypi_gateway_does_not_treat_relative_artifact_as_project_page(tmp_path):
@@ -757,7 +752,9 @@ def _write_feed_bundle(
     expires = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=1)).isoformat()
     bundle = {
         "schema": "ca9.feed.v1",
-        "created_at": "2026-06-26T00:00:00Z",
+        "created_at": (
+            datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=1)
+        ).isoformat(),
         "expires_at": expires,
         "datasets": {
             "pypi-malware": {

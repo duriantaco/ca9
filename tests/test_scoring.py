@@ -395,3 +395,19 @@ class TestConfidenceBucket:
     def test_weak(self):
         assert confidence_bucket(0) == "weak"
         assert confidence_bucket(39) == "weak"
+
+
+class TestImportMappingScoring:
+    def _static(self, source: str) -> int:
+        ev = Evidence(
+            package_imported=False,
+            declared_direct_dependency=True,
+            import_name_source=source,
+        )
+        return compute_confidence(ev, Verdict.UNREACHABLE_STATIC)
+
+    def test_metadata_mapping_scores_highest(self):
+        assert self._static("metadata") > self._static("curated") > self._static("guessed")
+
+    def test_legacy_evidence_without_source_is_unchanged(self):
+        assert self._static("") == self._static("metadata")

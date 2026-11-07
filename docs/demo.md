@@ -104,6 +104,7 @@ PYTHONPATH=../../src CA9_ARTIFACT_CACHE_DIR=.ca9-artifact-cache \
   python3 -m ca9.cli vet \
   --repo repo \
   --scan-artifacts \
+  --local-artifact-root artifacts \
   --internal-package 'acme-*' \
   --private-index https://packages.acme.internal/simple \
   --deny-license AGPL-3.0

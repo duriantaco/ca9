@@ -9,6 +9,7 @@ import tarfile
 import pytest
 
 from ca9.artifacts import fetch
+from ca9.review import locks
 from ca9.review.behavior import BehaviorFact
 from ca9.review.service import (
     Inspection,
@@ -395,17 +396,22 @@ def test_removing_a_dependency_does_not_trigger_new_risk(registry):
 
 
 def test_mutated_cached_archive_is_reverified(registry):
+    entry = registry.release("1.0.0")
     base = registry.lock("base.json")
-    head = registry.lock("head.json", registry.release("1.0.0"))
-    assert registry.review(base, head).complete
+    head = registry.lock("head.json", entry)
+    first = registry.review(base, head)
+    assert first.complete
     cached = next((registry.root / "cache" / "downloads").iterdir())
     cached.write_bytes(b"unexpected cached bytes")
 
     report = registry.review(base, head)
 
-    assert report.decision == "block"
-    assert report.exit_code == 1
-    assert len(registry.downloads) == 1
+    # A corrupt cache entry is discarded and fetched again instead of being reported
+    # as a tampered artifact on every later run.
+    assert report.complete
+    assert report.decision == first.decision
+    assert len(registry.downloads) == 2
+    assert cached.read_bytes() == registry.archives[entry["resolved"]]
 
 
 def test_failed_fetch_does_not_copy_redirect_credentials_to_report(registry, monkeypatch):
@@ -461,3 +467,87 @@ def test_invalid_registry_configuration_is_an_input_error(origin):
 def test_default_https_port_is_equivalent():
     assert _registry_origin("https://REGISTRY.NPMJS.ORG:443/") == "https://registry.npmjs.org"
     assert _permitted_url("https://registry.npmjs.org:443/pkg.tgz", ("https://registry.npmjs.org",))
+
+
+def _shared_graph(registry, shared_version):
+    dependency = {"dependencies": {"shared": "^1"}}
+    return {
+        "node_modules/a": {
+            **registry.release("1.0.0", name="a", manifest=dependency),
+            **dependency,
+        },
+        "node_modules/b": {
+            **registry.release("1.0.0", name="b", manifest=dependency),
+            **dependency,
+        },
+        "node_modules/shared": registry.release(shared_version, name="shared"),
+    }
+
+
+def test_identical_lockfiles_pass_despite_truncated_chains(registry, monkeypatch):
+    monkeypatch.setattr(locks, "MAX_CHAINS_PER_OCCURRENCE", 1)
+    lock = registry.lock("lock.json", entries=_shared_graph(registry, "1.0.0"))
+
+    report = registry.review(lock, lock)
+
+    assert any("count limit" in issue for issue in locks.load_lock(lock).issues)
+    assert (report.decision, report.complete, report.exit_code) == ("pass", True, 0)
+    assert report.issues == ()
+
+
+def test_root_only_version_bump_passes(registry, monkeypatch):
+    monkeypatch.setattr(locks, "MAX_CHAINS_PER_OCCURRENCE", 1)
+    entries = _shared_graph(registry, "1.0.0")
+    old = registry.lock("base.json", entries=entries)
+    data = json.loads(old.read_text())
+    data["packages"][""]["version"] = "1.1.0"
+    new = registry.root / "head.json"
+    new.write_text(json.dumps(data))
+
+    report = registry.review(old, new)
+
+    assert (report.decision, report.exit_code) == ("pass", 0)
+    assert report.summary["packages_reviewed"] == 0
+    assert not registry.downloads
+
+
+def test_chain_limits_are_reported_only_for_changed_occurrences(registry, monkeypatch):
+    monkeypatch.setattr(locks, "MAX_CHAINS_PER_OCCURRENCE", 1)
+    old = registry.lock("base.json", entries=_shared_graph(registry, "1.0.0"))
+    new = registry.lock("head.json", entries=_shared_graph(registry, "1.0.1"))
+
+    report = registry.review(old, new)
+
+    assert report.decision == "incomplete"
+    assert report.issues == (
+        "base: node_modules/shared: dependency chain count limit reached",
+        "head: node_modules/shared: dependency chain count limit reached",
+    )
+    assert [package["path"] for package in report.packages] == ["node_modules/shared"]
+
+
+def test_review_lets_explicit_trusted_registries_resolve_to_internal_hosts(tmp_path, monkeypatch):
+    import ca9.review.service as service
+
+    captured = {}
+    real_config = service.ArtifactScanConfig
+
+    def recording_config(**kwargs):
+        captured.update(kwargs)
+        return real_config(**kwargs)
+
+    monkeypatch.setattr(service, "ArtifactScanConfig", recording_config)
+    lock = tmp_path / "package-lock.json"
+    lock.write_text(
+        '{"name": "app", "version": "1.0.0", "lockfileVersion": 3,'
+        ' "packages": {"": {"name": "app", "version": "1.0.0"}}}'
+    )
+
+    service.review_lockfiles(
+        lock,
+        lock,
+        trusted_registries=("https://registry.npmjs.org", "https://npm.corp.example"),
+        scan_artifacts=False,
+    )
+
+    assert captured["private_indexes"] == ("https://npm.corp.example",)

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
+import ca9.intel_rules as intel_rules
 from ca9.intel_rules import (
+    RuleFileError,
     VulnIntelResolution,
     _ensure_rules_loaded,
     load_rule_from_dict,
+    load_rules_from_file,
+    load_rules_from_json,
     load_rules_from_yaml,
     resolve_vuln_intel,
 )
@@ -240,21 +245,92 @@ class TestResolveVulnIntel:
         assert result.confidence_prior > 0
 
 
+RULES_DIR = Path(__file__).parent.parent / "src" / "ca9" / "rules"
+
+
 class TestLoadRulesFromYaml:
-    def test_load_requests_yml(self):
-        path = Path(__file__).parent.parent / "src" / "ca9" / "rules" / "requests.yml"
-        if not path.exists():
-            pytest.skip("requests.yml not found")
+    def test_load_user_yaml_rules(self, tmp_path):
+        pytest.importorskip("yaml")
+        path = tmp_path / "custom.yml"
+        path.write_text("package: requests\nrules:\n  - id: CUSTOM-1\n")
         rules = load_rules_from_yaml(path)
+        assert [r.id for r in rules] == ["CUSTOM-1"]
+
+    def test_load_nonexistent_warns_and_returns_empty(self, tmp_path):
+        with pytest.warns(RuntimeWarning, match="cannot read rule file"):
+            rules = load_rules_from_yaml(tmp_path / "does_not_exist.yml")
+        assert rules == []
+
+    def test_load_invalid_yaml_warns_and_returns_empty(self, tmp_path):
+        pytest.importorskip("yaml")
+        bad = tmp_path / "bad.yml"
+        bad.write_text("{{{{invalid yaml")
+        with pytest.warns(RuntimeWarning, match="invalid YAML rule file"):
+            rules = load_rules_from_yaml(bad)
+        assert rules == []
+
+    def test_load_rules_from_file_raises_on_invalid_yaml(self, tmp_path):
+        pytest.importorskip("yaml")
+        bad = tmp_path / "bad.yml"
+        bad.write_text("{{{{invalid yaml")
+        with pytest.raises(RuleFileError):
+            load_rules_from_file(bad)
+
+    def test_yaml_rule_file_without_pyyaml_is_a_visible_error(self, tmp_path, monkeypatch):
+        monkeypatch.setitem(sys.modules, "yaml", None)
+        path = tmp_path / "custom.yml"
+        path.write_text("package: requests\nrules:\n  - id: CUSTOM-1\n")
+        with pytest.raises(RuleFileError, match="require PyYAML"):
+            load_rules_from_file(path)
+        with pytest.warns(RuntimeWarning, match="require PyYAML"):
+            assert load_rules_from_yaml(path) == []
+
+
+class TestBuiltinRulesWithoutPyYAML:
+    def test_builtin_rules_are_json(self):
+        assert sorted(p.name for p in RULES_DIR.glob("*.json")) == [
+            "django.json",
+            "jinja2.json",
+            "pyyaml.json",
+            "requests.json",
+            "urllib3.json",
+            "werkzeug.json",
+        ]
+        assert not list(RULES_DIR.glob("*.yml")) and not list(RULES_DIR.glob("*.yaml"))
+
+    def test_load_requests_json(self):
+        rules = load_rules_from_json(RULES_DIR / "requests.json")
         assert len(rules) >= 2
         assert all(r.package == "requests" for r in rules)
 
-    def test_load_nonexistent_returns_empty(self, tmp_path):
-        rules = load_rules_from_yaml(tmp_path / "does_not_exist.yml")
-        assert rules == []
+    def test_builtin_rules_load_when_yaml_import_is_blocked(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "yaml", None)
+        monkeypatch.setattr(intel_rules, "_BUILTIN_RULES", [])
+        monkeypatch.setattr(intel_rules, "_RULES_BY_PACKAGE", {})
+        monkeypatch.setattr(intel_rules, "_RULES_LOADED", False)
 
-    def test_load_invalid_yaml_returns_empty(self, tmp_path):
-        bad = tmp_path / "bad.yml"
-        bad.write_text("{{{{invalid yaml")
-        rules = load_rules_from_yaml(bad)
-        assert rules == []
+        vuln = Vulnerability(
+            id="CVE-2020-14343",
+            package_name="PyYAML",
+            package_version="5.3.1",
+            severity="critical",
+            title="Arbitrary code execution",
+        )
+        result = resolve_vuln_intel(vuln)
+
+        assert len(intel_rules._BUILTIN_RULES) >= 10
+        assert {"django", "jinja2", "pyyaml", "requests", "urllib3", "werkzeug"} <= set(
+            intel_rules._RULES_BY_PACKAGE
+        )
+        assert "yaml.load" in {t.fqname for t in result.api_targets}
+
+    def test_corrupt_builtin_rule_file_warns(self, tmp_path, monkeypatch):
+        rules_dir = tmp_path / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "broken.json").write_text("{not json")
+        monkeypatch.setattr(intel_rules, "__file__", str(tmp_path / "intel_rules.py"))
+        monkeypatch.setattr(intel_rules, "_BUILTIN_RULES", [])
+        monkeypatch.setattr(intel_rules, "_RULES_BY_PACKAGE", {})
+        with pytest.warns(RuntimeWarning, match="invalid JSON rule file"):
+            intel_rules._load_builtin_rules()
+        assert intel_rules._BUILTIN_RULES == []

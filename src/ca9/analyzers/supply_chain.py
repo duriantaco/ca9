@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from urllib.parse import urlparse
@@ -19,17 +18,16 @@ from ca9.core.models import (
 )
 from ca9.models import Vulnerability
 from ca9.package_policy import PolicyException, action_for_mode, find_policy_exception
+from ca9.readers.requirements import vcs_reference
+
+_COMMIT_REF_LENGTHS = (40, 64)
+_NON_INDEX_SOURCE_KINDS = frozenset(
+    {"git", "vcs", "url", "direct_url", "path", "file", "remote", "workspace"}
+)
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 DEFAULT_TRUSTED_INDEXES = ("https://pypi.org/simple", "https://registry.npmjs.org")
 BLOCKING_SIGNALS = {"malware", "untrusted_registry"}
-_MALWARE_TEXT_RE = re.compile(
-    r"\bmalware\b|"
-    r"\bmalicious\s+(?:package|code|payload|release|version|dependency|dropper|artifact)\b|"
-    r"\bcontains\s+malicious\b|"
-    r"\bcredential\s+exfiltration\b|"
-    r"\bexfiltrat(?:e|es|ed|ing|ion)\b",
-    re.I,
-)
 
 
 @dataclass(frozen=True)
@@ -195,21 +193,44 @@ def _policy_exception_evidence(
     )
 
 
+def package_registries(package: Package) -> tuple[str, ...]:
+    """Every index the package may be installed from.
+
+    A merged setup (pip --extra-index-url, --find-links) lets the installer take
+    the best match from any of its indexes, so each one is a possible source.
+    """
+    candidates = package.metadata.get("candidate_registries")
+    if package.metadata.get("registry_mode") == "merged" and isinstance(candidates, list):
+        registries = tuple(item for item in candidates if isinstance(item, str) and item)
+        if registries:
+            return registries
+    if package.source_registry:
+        return (package.source_registry,)
+    return ()
+
+
 def _artifact_source_findings(package: Package, policy: SupplyChainPolicy) -> list[Finding]:
     findings: list[Finding] = []
     source = _package_evidence(package, "package inventory")
+    registries = package_registries(package)
+    merged = package.metadata.get("registry_mode") == "merged"
 
-    if package.source_registry and _is_denied_index(package.source_registry, policy):
+    denied = [registry for registry in registries if _is_denied_index(registry, policy)]
+    if denied:
         direct = package.dependency_kind in {"direct", "project"}
+        metadata = {
+            "registry": denied[0],
+            "denied_indexes": list(policy.denied_indexes),
+            "dependency_kind": package.dependency_kind,
+        }
+        if merged:
+            metadata["registry_mode"] = "merged"
+            metadata["candidate_registries"] = list(registries)
         evidence = Evidence(
             kind="artifact_source",
-            description=f"{package.name} resolves from denied registry {package.source_registry}",
+            description=f"{package.name} resolves from denied registry {denied[0]}",
             source=source,
-            metadata={
-                "registry": package.source_registry,
-                "denied_indexes": list(policy.denied_indexes),
-                "dependency_kind": package.dependency_kind,
-            },
+            metadata=metadata,
         )
         findings.append(
             _finding(
@@ -224,19 +245,25 @@ def _artifact_source_findings(package: Package, policy: SupplyChainPolicy) -> li
         )
         return findings
 
-    if package.source_registry and not _is_trusted_index(package.source_registry, policy):
+    untrusted = [registry for registry in registries if not _is_trusted_index(registry, policy)]
+    if untrusted:
         direct = package.dependency_kind in {"direct", "project"}
         severity = "high" if direct else "medium"
         action = "block" if direct and policy.block_untrusted_direct else "warn"
+        metadata = {
+            "registry": untrusted[0],
+            "trusted_indexes": list(policy.trusted_indexes),
+            "dependency_kind": package.dependency_kind,
+        }
+        if merged:
+            metadata["registry_mode"] = "merged"
+            metadata["candidate_registries"] = list(registries)
+            metadata["untrusted_registries"] = untrusted
         evidence = Evidence(
             kind="artifact_source",
-            description=f"{package.name} resolves from untrusted registry {package.source_registry}",
+            description=f"{package.name} resolves from untrusted registry {untrusted[0]}",
             source=source,
-            metadata={
-                "registry": package.source_registry,
-                "trusted_indexes": list(policy.trusted_indexes),
-                "dependency_kind": package.dependency_kind,
-            },
+            metadata=metadata,
         )
         findings.append(
             _finding(
@@ -278,6 +305,8 @@ def _artifact_source_findings(package: Package, policy: SupplyChainPolicy) -> li
     if policy.warn_on_missing_artifact_hash:
         for artifact in package.artifacts:
             if not artifact.url or artifact.hash:
+                continue
+            if artifact.kind == "git-source" and git_source_evidence(package)["pinned_commit"]:
                 continue
             evidence = Evidence(
                 kind="artifact_integrity",
@@ -351,29 +380,44 @@ def _install_risk_findings(package: Package, policy: SupplyChainPolicy) -> list[
 
     source_kind = str(package.metadata.get("source_kind") or "")
     source_url = str(package.metadata.get("source_url") or "")
-    if source_kind == "git":
+    if source_kind in {"git", "vcs"}:
+        git_evidence = git_source_evidence(package)
         evidence = Evidence(
             kind="artifact_source",
             description=f"{package.name} resolves from a Git dependency",
             source=source,
             metadata={
                 "source_kind": source_kind,
-                "source_url": source_url or None,
+                "source_url": source_url or git_evidence["source_url"],
                 "dependency_kind": package.dependency_kind,
+                **git_evidence,
             },
         )
+        if git_evidence["pinned_commit"]:
+            severity = "low"
+            reason = (
+                "Git dependency pinned to a full commit; it still bypasses registry "
+                "release and artifact controls"
+            )
+        else:
+            severity = _kind_weighted_severity(package, direct="medium", transitive="low")
+            reason = (
+                "Git dependency on a mutable ref; whoever controls the branch or tag "
+                "changes the installed code"
+            )
         findings.append(
             _finding(
                 package,
                 title=f"Git dependency for {package.name}",
                 signal_type="git_dependency",
-                severity=_kind_weighted_severity(package, direct="medium", transitive="low"),
+                severity=severity,
                 action="warn",
                 evidence=evidence,
-                reason="Git dependencies bypass normal registry release and artifact controls",
+                reason=reason,
             )
         )
     elif source_kind in {"url", "direct_url"}:
+        has_hash = url_source_has_hash(package)
         evidence = Evidence(
             kind="artifact_source",
             description=f"{package.name} resolves from a direct URL dependency",
@@ -382,17 +426,31 @@ def _install_risk_findings(package: Package, policy: SupplyChainPolicy) -> list[
                 "source_kind": source_kind,
                 "source_url": source_url or None,
                 "dependency_kind": package.dependency_kind,
+                "has_hash": has_hash,
+                "mutable": not has_hash,
             },
         )
+        if has_hash:
+            severity = "low"
+            reason = (
+                "direct URL dependency pinned by hash; it still bypasses registry release "
+                "and provenance controls"
+            )
+        else:
+            severity = _kind_weighted_severity(package, direct="medium", transitive="low")
+            reason = (
+                "direct URL dependency without a hash; the server can change the installed "
+                "file at any time"
+            )
         findings.append(
             _finding(
                 package,
                 title=f"Direct URL dependency for {package.name}",
                 signal_type="direct_url_dependency",
-                severity=_kind_weighted_severity(package, direct="medium", transitive="low"),
+                severity=severity,
                 action="warn",
                 evidence=evidence,
-                reason="direct URL dependencies bypass normal registry release and provenance controls",
+                reason=reason,
             )
         )
 
@@ -428,30 +486,52 @@ def _dependency_confusion_findings(
     matched_pattern = _matched_internal_pattern(package.name, policy.internal_package_patterns)
     if matched_pattern is None:
         return []
-
-    source = _package_evidence(package, "package inventory")
-    registry = package.source_registry or ""
-    if registry and _is_private_index(registry, policy):
+    registries = package_registries(package)
+    source_kind = str(package.metadata.get("source_kind") or "")
+    if not registries and source_kind in _NON_INDEX_SOURCE_KINDS:
+        return []
+    if not registries and package.metadata.get("registry_mode") == "local":
         return []
 
+    source = _package_evidence(package, "package inventory")
+    public = [registry for registry in registries if not _is_private_index(registry, policy)]
+    if registries and not public:
+        return []
+
+    merged = package.metadata.get("registry_mode") == "merged"
+    registry = ""
+    if not merged:
+        registry = package.source_registry or ""
     direct = package.dependency_kind in {"direct", "project"}
     action = "block" if direct else "investigate"
     severity = "critical" if direct else "high"
-    reason = (
-        f"internal package pattern {matched_pattern!r} resolved from "
-        f"{registry or 'an unknown index'} instead of a configured private index"
-    )
+    if merged:
+        reason = (
+            f"internal package pattern {matched_pattern!r} installs from merged indexes "
+            f"({', '.join(registries)}); the installer takes the best version from any of "
+            f"them, so a public upload to {public[0]} wins over the private index"
+        )
+    else:
+        reason = (
+            f"internal package pattern {matched_pattern!r} resolved from "
+            f"{registry or 'an unknown index'} instead of a configured private index"
+        )
+    metadata = {
+        "internal_pattern": matched_pattern,
+        "actual_registry": registry or None,
+        "private_indexes": list(policy.private_indexes),
+        "trusted_indexes": list(policy.trusted_indexes),
+        "dependency_kind": package.dependency_kind,
+    }
+    if merged:
+        metadata["registry_mode"] = "merged"
+        metadata["candidate_registries"] = list(registries)
+        metadata["public_registries"] = public
     evidence = Evidence(
         kind="dependency_confusion",
         description=reason,
         source=source,
-        metadata={
-            "internal_pattern": matched_pattern,
-            "actual_registry": registry or None,
-            "private_indexes": list(policy.private_indexes),
-            "trusted_indexes": list(policy.trusted_indexes),
-            "dependency_kind": package.dependency_kind,
-        },
+        metadata=metadata,
     )
     return [
         _finding(
@@ -464,6 +544,49 @@ def _dependency_confusion_findings(
             reason=reason,
         )
     ]
+
+
+def git_source_evidence(package: Package) -> dict[str, object]:
+    """Describe whether a Git dependency is pinned to a full commit.
+
+    A full 40 (or 64) hex digit commit id is immutable; a branch, tag, short id or
+    missing ref lets whoever controls the repository change the installed code.
+    """
+    source_url = package.metadata.get("source_url")
+    url = None
+    if isinstance(source_url, str) and source_url:
+        url = source_url
+    if url is None:
+        for artifact in package.artifacts:
+            if artifact.url:
+                url = artifact.url
+                break
+    ref = package.metadata.get("vcs_ref")
+    if (not isinstance(ref, str) or not ref) and url:
+        ref = vcs_reference(url)
+    pinned = _is_full_commit(ref)
+    if "pinned_commit" in package.metadata and package.metadata.get("pinned_commit") is not True:
+        pinned = False
+    return {
+        "source_url": url,
+        "ref": ref,
+        "pinned_commit": pinned,
+        "mutable": not pinned,
+    }
+
+
+def url_source_has_hash(package: Package) -> bool:
+    """True when a URL dependency carries a hash that pins its file."""
+    recorded = package.metadata.get("has_hash")
+    if isinstance(recorded, bool):
+        return recorded
+    return any(artifact.url and artifact.hash for artifact in package.artifacts)
+
+
+def _is_full_commit(ref: object) -> bool:
+    if not isinstance(ref, str):
+        return False
+    return len(ref) in _COMMIT_REF_LENGTHS and all(char in _HEX_DIGITS for char in ref)
 
 
 def _finding(
@@ -513,7 +636,11 @@ def _package_evidence(package: Package, default_source: str) -> SourceEvidence:
 
 
 def _is_trusted_index(registry: str, policy: SupplyChainPolicy) -> bool:
-    return _registry_matches(registry, policy.trusted_indexes)
+    # A configured private index is an explicit trust decision for the
+    # internal packages it serves.
+    return _registry_matches(registry, policy.trusted_indexes) or _registry_matches(
+        registry, policy.private_indexes
+    )
 
 
 def _is_denied_index(registry: str, policy: SupplyChainPolicy) -> bool:
@@ -522,6 +649,16 @@ def _is_denied_index(registry: str, policy: SupplyChainPolicy) -> bool:
 
 def _is_private_index(registry: str, policy: SupplyChainPolicy) -> bool:
     return _registry_matches(registry, policy.private_indexes)
+
+
+def internal_pattern_for(name: str, patterns: tuple[str, ...]) -> str | None:
+    """The internal package pattern a name matches, ignoring case, '_' and '.'."""
+    return _matched_internal_pattern(name, patterns)
+
+
+def registry_matches(registry: str, candidates: tuple[str, ...]) -> bool:
+    """True when the registry is one of the candidates or beneath one of them."""
+    return _registry_matches(registry, candidates)
 
 
 def _matched_internal_pattern(name: str, patterns: tuple[str, ...]) -> str | None:
@@ -549,7 +686,15 @@ def _registry_matches(registry: str, candidates: tuple[str, ...]) -> bool:
     normalized_registry = _normalize_index_url(registry)
     registry_host = _index_host(registry)
     for candidate in candidates:
-        if normalized_registry == _normalize_index_url(candidate):
+        normalized_candidate = _normalize_index_url(candidate)
+        if normalized_registry == normalized_candidate:
+            return True
+        # A configured index with a path covers registries beneath it, matched
+        # on whole path segments so ".../npm-internal" never covers
+        # ".../npm-internal-evil".
+        if "://" in normalized_candidate and normalized_registry.startswith(
+            normalized_candidate + "/"
+        ):
             return True
         candidate_host = _index_host(candidate)
         parsed_candidate = urlparse(candidate.strip())
@@ -584,24 +729,13 @@ def _is_malware_advisory_id(value: str) -> bool:
 
 
 def _is_malware_advisory(vuln: Vulnerability) -> bool:
+    # Structured evidence only (an explicit flag or a MAL- id/alias): advisory text
+    # such as "malicious URL" or "exfiltrate" also describes ordinary CVEs.
     if vuln.malicious:
         return True
 
     advisory_ids = {vuln.id, *vuln.aliases}
-    if any(_is_malware_advisory_id(advisory_id) for advisory_id in advisory_ids):
-        return True
-
-    haystack = "\n".join(
-        item
-        for item in (
-            vuln.title,
-            vuln.description,
-            " ".join(vuln.references),
-            vuln.advisory_url,
-        )
-        if item
-    )
-    return bool(_MALWARE_TEXT_RE.search(haystack))
+    return any(_is_malware_advisory_id(advisory_id) for advisory_id in advisory_ids)
 
 
 def _default_reason(finding: Finding) -> str:

@@ -128,3 +128,46 @@ class TestVEXDiff:
 
         assert diff.new_vulns[0].package == "requests"
         assert diff.new_vulns[0].version == "1.0.0"
+
+
+class TestVEXDiffWithEvidenceBasedJustifications:
+    def test_justification_remap_is_a_status_change_not_a_regression(self):
+        base = _make_vex(
+            _make_statement("CVE-1", "gitpython", "not_affected", "component_not_present")
+        )
+        head = _make_vex(
+            _make_statement(
+                "CVE-1", "gitpython", "not_affected", "vulnerable_code_not_in_execute_path"
+            )
+        )
+
+        diff = compute_vex_diff(base, head)
+
+        assert diff.status_changed[0].old_justification == "component_not_present"
+        assert diff.status_changed[0].new_justification == "vulnerable_code_not_in_execute_path"
+        assert not diff.has_regressions
+
+    def test_generated_documents_diff_by_verdict(self):
+        import json
+
+        from ca9.models import Evidence, Report, Verdict, VerdictResult, Vulnerability
+        from ca9.vex import write_openvex
+
+        vuln = Vulnerability("CVE-1", "gunicorn", "20.1.0", "high", "smuggling")
+        static = VerdictResult(
+            vuln,
+            Verdict.UNREACHABLE_STATIC,
+            "declared but never imported",
+            evidence=Evidence(package_imported=False, declared_direct_dependency=True),
+        )
+        inconclusive = VerdictResult(vuln, Verdict.INCONCLUSIVE, "may be used via CLI")
+
+        base = json.loads(write_openvex(Report([static], ".")))
+        head = json.loads(write_openvex(Report([inconclusive], ".")))
+        diff = compute_vex_diff(base, head)
+
+        change = diff.status_changed[0]
+        assert change.old_status == "not_affected"
+        assert change.old_justification == "vulnerable_code_not_in_execute_path"
+        assert change.new_status == "under_investigation"
+        assert change.new_justification is None

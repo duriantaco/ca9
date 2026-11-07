@@ -100,7 +100,9 @@ versions, and starts npm only if policy allows the install.
 
 ```yaml
 - run: pip install ca9[cli]
-- run: ca9 feed update
+- run: ca9 feed update --require-attestation
+  env:
+    GH_TOKEN: ${{ github.token }}
 - run: ca9 setup ci install
 - run: ca9 doctor ci
 - run: npm ci
