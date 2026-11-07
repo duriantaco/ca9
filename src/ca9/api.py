@@ -1055,10 +1055,13 @@ def ci_inventory(repo_root: str | PurePath, *, max_jobs: int = 500) -> dict[str,
     """What each CI job can install, run, reach and publish (``ca9.ci_inventory.v1``).
 
     Covers GitHub Actions workflows (with local composite actions and local
-    reusable workflows) and ``.gitlab-ci.yml`` with local includes. Records names
-    only: secret names, never values; download hosts, never URLs or credentials.
-    ``status`` is complete, partial (some files unreadable, listed in ``skipped``)
-    or yaml_unavailable (PyYAML missing). ``truncated`` is true when ``max_jobs``
+    reusable workflows) and ``.gitlab-ci.yml`` with its local includes (exact paths,
+    ``*``/``**`` patterns and nested includes), top-level ``before_script``/``after_script``
+    and ``default:`` inheritance. Records names only: secret names, never values; download
+    hosts, never URLs or credentials. ``status`` is complete, partial (some files
+    unreadable, or GitLab includes that cannot be resolved in the repository: remote,
+    project, template, component, variable paths or over the include cap, all listed in
+    ``skipped``) or yaml_unavailable (PyYAML missing). ``truncated`` is true when ``max_jobs``
     or a per-list cap cut the output. Never raises.
     """
     try:

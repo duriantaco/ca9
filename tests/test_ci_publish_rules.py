@@ -583,3 +583,123 @@ def test_remote_call_without_credentials_is_still_unknown_but_local_calls_are_no
     )
     assert local_result["receipt"]["complete"] is True
     assert {job["remote_reusable"] for job in local_jobs} == {False}
+
+
+GITLAB_RELEASE = """release:
+  id_tokens:
+    PYPI_ID_TOKEN:
+      aud: pypi
+  script:
+    - pip install twine
+    - twine upload dist/*
+"""
+GITLAB_TOKEN_RELEASE = """release:
+  script:
+    - echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
+    - npm publish
+"""
+CURL_INSTALL = "curl -sSL https://tools.example.com/install.sh | sh"
+
+
+def _gitlab(tmp_path: Path, files: dict[str, str]) -> dict:
+    for rel, text in files.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    return api.audit_workflows(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {".gitlab-ci.yml": "include:\n  - local: 'ci/*.yml'\n", "ci/release.yml": GITLAB_RELEASE},
+        {".gitlab-ci.yml": "include: '/ci/**/*.yml'\n", "ci/deep/release.yml": GITLAB_RELEASE},
+        {
+            ".gitlab-ci.yml": "include:\n  - local: ci/all.yml\n",
+            "ci/all.yml": "include:\n  - local: 'ci/jobs/*.yml'\n",
+            "ci/jobs/release.yml": GITLAB_RELEASE,
+        },
+        {
+            ".gitlab-ci.yml": "include:\n  - local: a.yml\n",
+            "a.yml": "include:\n  - local: b.yml\n",
+            "b.yml": "include:\n  - local: a.yml\n" + GITLAB_RELEASE,
+        },
+    ],
+    ids=["wildcard", "globstar", "nested", "loop"],
+)
+def test_gitlab_jobs_from_wildcard_and_nested_local_includes_are_audited(tmp_path, files):
+    result = _gitlab(tmp_path, files)
+
+    assert {(item["signal_type"], item["name"]) for item in result["findings"]} == {
+        (C, "release"),
+        (A, "release"),
+    }
+    assert result["receipt"]["complete"] is True
+
+
+@pytest.mark.parametrize("key", ["before_script", "after_script"])
+def test_gitlab_top_level_scripts_are_inherited_unless_the_job_opts_out(tmp_path, key):
+    inherited = _gitlab(
+        tmp_path / "a", {".gitlab-ci.yml": f"{key}:\n  - {CURL_INSTALL}\n" + GITLAB_TOKEN_RELEASE}
+    )
+    own = _gitlab(
+        tmp_path / "b",
+        {
+            ".gitlab-ci.yml": f"{key}:\n  - {CURL_INSTALL}\n"
+            + GITLAB_TOKEN_RELEASE
+            + f"  {key}:\n    - echo hi\n"
+        },
+    )
+    opted_out = _gitlab(
+        tmp_path / "c",
+        {
+            ".gitlab-ci.yml": f"{key}:\n  - {CURL_INSTALL}\n"
+            + GITLAB_TOKEN_RELEASE
+            + "  inherit:\n    default: false\n"
+        },
+    )
+
+    assert {item["signal_type"] for item in inherited["findings"]} == {A}
+    assert own["findings"] == [] and opted_out["findings"] == []
+
+
+def test_gitlab_partial_job_override_keeps_the_included_script(tmp_path):
+    result = _gitlab(
+        tmp_path,
+        {
+            ".gitlab-ci.yml": "include:\n  - local: ci/release.yml\nrelease:\n  tags: [linux]\n",
+            "ci/release.yml": GITLAB_RELEASE,
+        },
+    )
+
+    assert (C, "release") in {(item["signal_type"], item["name"]) for item in result["findings"]}
+
+
+@pytest.mark.parametrize(
+    ("include", "reason"),
+    [
+        ("  - remote: https://ci.example.com/x.yml\n", "include_remote"),
+        ("  - project: org/ci\n    file: x.yml\n", "include_project"),
+        ("  - template: Security/SAST.gitlab-ci.yml\n", "include_template"),
+        ("  - local: '$CI_DIR/x.yml'\n", "include_variable"),
+        ("  - local: ci/missing.yml\n", "include_unreadable"),
+    ],
+)
+def test_gitlab_includes_that_cannot_be_resolved_are_never_complete(tmp_path, include, reason):
+    result = _gitlab(tmp_path, {".gitlab-ci.yml": "include:\n" + include + GITLAB_TOKEN_RELEASE})
+    inventory = api.ci_inventory(tmp_path)
+
+    assert result["receipt"]["complete"] is False
+    assert inventory["status"] == "partial"
+    assert [item["reason"] for item in inventory["skipped"]] == [reason]
+
+
+def test_gitlab_include_cap_is_incomplete(tmp_path):
+    files = {".gitlab-ci.yml": "include:\n  - local: 'ci/*.yml'\n"}
+    for index in range(160):
+        files[f"ci/j{index:03}.yml"] = f"job{index}:\n  script:\n    - echo {index}\n"
+
+    result = _gitlab(tmp_path, files)
+
+    assert result["receipt"]["complete"] is False
+    assert result["receipt"]["jobs"] == 150
