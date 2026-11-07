@@ -1,0 +1,43 @@
+{
+  "built_at": "2026-11-07T12:57:56Z",
+  "expires_at": "2026-11-14T12:57:53Z",
+  "malware_counts": {
+    "npm-malware": 235408,
+    "pypi-malware": 17409
+  },
+  "malware_range_counts": {
+    "npm-malware-ranges": 1403,
+    "pypi-malware-ranges": 14
+  },
+  "malware_stats": {
+    "npm-malware": {
+      "bounded_skipped": 806,
+      "cwe506_records": 391,
+      "malicious_records": 223275,
+      "versioned": 14967,
+      "whole_package": 207622,
+      "withdrawn_skipped": 337
+    },
+    "npm-malware-ranges": {
+      "range_unusable": 0,
+      "ranged": 1403
+    },
+    "pypi-malware": {
+      "bounded_skipped": 4,
+      "cwe506_records": 8,
+      "malicious_records": 12025,
+      "versioned": 5620,
+      "whole_package": 6404,
+      "withdrawn_skipped": 25
+    },
+    "pypi-malware-ranges": {
+      "range_unusable": 0,
+      "ranged": 14
+    }
+  },
+  "schema": "ca9.feed.v1",
+  "sources": {
+    "PyPI": "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip",
+    "npm": "https://osv-vulnerabilities.storage.googleapis.com/npm/all.zip"
+  }
+}
