@@ -56,7 +56,9 @@ SDIST_LIMITATION = "sdist not compared: a payload present only in the sdist woul
 MAX_EXTRACTED_FILES = 20000
 REGISTRY_METADATA_PATH = "(registry metadata)"
 _ECOSYSTEMS = {"npm": "npm", "pypi": "pypi"}
-_NON_BLOCKING_SKIPS = frozenset({"same_version"})
+_NON_BLOCKING_SKIPS = frozenset({"same_version", "internal_package", "private_registry"})
+_REGISTRY_MODES = frozenset({"exclusive", "merged"})
+_CREDENTIALS_RE = re.compile(r"HTTP 40[13]\b")
 _NAMES = {
     "npm": re.compile(r"(?:@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*"),
     "pypi": re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"),
@@ -131,6 +133,7 @@ class _Pair:
     registry: str | None
     integrity: str | None = None
     resolved: str | None = None
+    registry_mode: str | None = None
 
 
 class _Skip(Exception):
@@ -300,7 +303,10 @@ def _parse_pair(raw: object) -> _Pair:
             raise _Skip("invalid_pair", f"{key} must be a string when given")
         if isinstance(value, str) and value.strip():
             lock[key] = value.strip()
-    return _Pair(normalized, name, old, new, registry, **lock)
+    mode = raw.get("registry_mode")
+    if mode is not None and mode not in _REGISTRY_MODES:
+        raise _Skip("invalid_pair", "registry_mode must be exclusive or merged when given")
+    return _Pair(normalized, name, old, new, registry, registry_mode=mode, **lock)
 
 
 def _check_policy(pair: _Pair, options: _Options) -> None:
@@ -319,6 +325,17 @@ def _check_policy(pair: _Pair, options: _Options) -> None:
         raise _Skip(
             "internal_package",
             "internal package names are never looked up on a public registry",
+        )
+    if (
+        public
+        and pair.resolved
+        and pair.registry_mode != "merged"
+        and registry_matches(pair.resolved, options.private_registries)
+    ):
+        raise _Skip(
+            "private_registry",
+            "the lockfile resolves this entry from a private registry; it is never looked up "
+            "on a public registry",
         )
 
 
@@ -640,6 +657,15 @@ def _side(function: Any, pair: _Pair, version: str, config: fetch.ArtifactScanCo
     except (fetch._UntrustedArtifactURL, fetch.TransferTimeout):
         raise
     except (OSError, ValueError, http.client.HTTPException) as exc:
+        if (
+            pair.registry
+            and _CREDENTIALS_RE.match(str(exc))
+            and registry_matches(pair.registry, config.private_indexes)
+        ):
+            raise _Skip(
+                "private_registry",
+                f"{side}: the private registry needs credentials ({exc})"[:300],
+            ) from None
         raise _Skip("registry_unreachable", f"{side}: {exc}"[:300]) from None
 
 

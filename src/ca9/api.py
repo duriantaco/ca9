@@ -1116,7 +1116,8 @@ def review_upgrades(
 ) -> dict[str, Any]:
     """Diff the old and new published artifacts of each dependency upgrade.
 
-    ``pairs``: ``[{"ecosystem": "npm"|"pypi", "name", "old", "new", "registry"?}]``.
+    ``pairs``: ``[{"ecosystem": "npm"|"pypi", "name", "old", "new", "registry"?,
+    "integrity"?, "resolved"?, "registry_mode"?}]``.
     Both releases are fetched from a trusted registry (digest-verified, size-capped),
     unpacked safely and compared with deterministic static rules; package code is
     never installed, imported or executed. Only behaviours the new release adds are
@@ -1134,9 +1135,15 @@ def review_upgrades(
 
     Options: ``network`` (default true), ``max_pairs`` (50), ``max_artifact_mb`` (50),
     ``cache_dir`` (keeps verified downloads; a temporary directory otherwise),
-    ``trusted_registries``, ``private_registries``, ``internal_packages`` (never looked
-    up on a public registry). Never raises: bad input is skipped with a reason and
-    counted in the receipt, whose ``complete`` is false when anything was not reviewed.
+    ``trusted_registries``, ``private_registries``, ``internal_packages``. Names matching
+    ``internal_packages`` are skipped as internal_package, and entries whose lockfile
+    ``resolved`` URL is on a listed private registry as private_registry (unless the
+    pair's ``registry_mode`` is "merged", a private registry that proxies the public
+    one): neither is ever looked up on a public registry. A pair whose ``registry`` is a
+    listed private or trusted HTTPS registry is reviewed from that registry. Never
+    raises: bad input is skipped with a reason and counted in the receipt, whose
+    ``complete`` is false when anything was not reviewed; same_version, internal_package
+    and private_registry skips are policy, not gaps, and keep it true.
     """
     from ca9.review.upgrades import review_upgrades as _review_upgrade_pairs
 

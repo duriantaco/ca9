@@ -617,3 +617,69 @@ def test_new_pypi_package_blocks_only_high_signal_startup_code(registry):
     assert [delta["kind"] for delta in benign["info"]] == ["new_native_binary"]
     assert "sdist not compared" in " ".join(benign["limitations"])
     assert _kinds(loader, "block") == ["new_decode_exec", "new_pth_code", "new_sitecustomize"]
+
+
+def test_entries_resolved_from_a_private_registry_are_never_looked_up_publicly(registry):
+    corp = "https://art.corp.example/api/npm/npm-internal"
+    registry.npm("lodash", "1.0.0", {"index.js": "module.exports = 1;\n"})
+    registry.npm("lodash", "1.1.0", {"index.js": "module.exports = 2;\n"})
+    swapped = "sha512-" + base64.b64encode(b"\x00" * 64).decode()
+    base = {"ecosystem": "npm", "old": "1.0.0", "new": "1.1.0", "integrity": swapped}
+    private = [
+        {**base, "name": "@acme/core", "resolved": f"{corp}/@acme/core/-/core-1.1.0.tgz"},
+        {**base, "name": "acme-util", "resolved": f"{corp}/acme-util/-/acme-util-1.1.0.tgz"},
+    ]
+    report = api.review_upgrades(private, options={"private_registries": [corp]})
+
+    assert [item["reason"] for item in report["results"]] == ["private_registry"] * 2
+    assert registry.requests == []
+    assert report["receipt"]["skipped"] == [{"reason": "private_registry", "count": 2}]
+    assert report["receipt"]["complete"] is True
+
+    lookalike = {**base, "name": "lodash", "resolved": f"{corp}-evil/lodash/-/lodash-1.1.0.tgz"}
+    unlisted = {**base, "name": "lodash", "resolved": "https://evil.example/lodash-1.1.0.tgz"}
+    for pair in (lookalike, unlisted):
+        result = api.review_upgrades([pair], options={"private_registries": [corp]})["results"][0]
+        assert _kinds(result, "block") == ["lockfile_artifact_mismatch"]
+
+    proxy = {
+        **lookalike,
+        "resolved": f"{corp}/lodash/-/lodash-1.1.0.tgz",
+        "registry_mode": "merged",
+    }
+    result = api.review_upgrades([proxy], options={"private_registries": [corp]})["results"][0]
+    assert result["status"] == "reviewed"
+    bad_mode = {**proxy, "registry_mode": "public"}
+    result = api.review_upgrades([bad_mode], options={"private_registries": [corp]})["results"][0]
+    assert result["reason"] == "invalid_pair"
+
+
+def test_internal_names_and_private_registries_needing_credentials_are_policy_skips(
+    registry, monkeypatch
+):
+    index = "https://pypi.corp.example/simple"
+
+    def refuse(url, config, accept="application/json"):
+        registry.requests.append(url)
+        raise ValueError(f"HTTP 401 from {url}")
+
+    report = api.review_upgrades(
+        [{"ecosystem": "pypi", "name": "acme-core", "old": "1.0", "new": "1.1"}],
+        options={"internal_packages": ["acme-*"]},
+    )
+    monkeypatch.setattr(fetch, "_fetch_registry_json", refuse)
+    private = api.review_upgrades(
+        [{"ecosystem": "pypi", "name": "tool", "old": "1.0", "new": "1.1", "registry": index}],
+        options={"private_registries": [index]},
+    )
+    public = api.review_upgrades(
+        [{"ecosystem": "pypi", "name": "tool", "old": "1.0", "new": "1.1"}],
+        options={"private_registries": [index]},
+    )
+
+    assert report["results"][0]["reason"] == "internal_package"
+    assert report["receipt"]["complete"] is True
+    assert private["results"][0]["reason"] == "private_registry"
+    assert private["receipt"]["complete"] is True
+    assert public["results"][0]["reason"] == "registry_unreachable"
+    assert public["receipt"]["complete"] is False
