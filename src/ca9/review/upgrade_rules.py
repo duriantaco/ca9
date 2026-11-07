@@ -177,6 +177,39 @@ _JS_EXEC_CALL_RE = re.compile(
     r"\s*\((?P<args>[^;\n]{0,400})"
 )
 _DECODE_TEXT_RE = re.compile(r"\batob\s*\(|Buffer\.from|fromCharCode|b64decode")
+_JS_FILE_READ_RE = re.compile(r"\breadFile(?:Sync)?\s*\(")
+_JS_CODE_SINK_RE = re.compile(
+    r"(?:(?P<receiver>[\w$]+)\s*\.\s*)?(?<![\w$])(?P<sink>eval|Function)\s*\(|"
+    r"\bnew\s+(?P<new_sink>Function)\s*\(|"
+    r"(?<![\w$])(?P<vm_sink>runInThisContext|runInNewContext|runInContext|compileFunction)"
+    r"\s*\(|"
+    r"\bnew\s+(?:[\w$]+\s*\.\s*)?(?P<script_sink>Script)\s*\(|"
+    r"\.\s*(?P<compile_sink>_compile)\s*(?:\.\s*(?:call|apply)\s*)?\("
+)
+_JS_GLOBAL_RECEIVERS = frozenset({"global", "globalThis", "window", "self"})
+_JS_VM_REQUIRE_RE = re.compile(
+    r"""require\s*\(\s*['"](?:node:)?vm['"]|from\s+['"](?:node:)?vm['"]"""
+)
+_JS_STRING_RE = re.compile(r"'([^'\\\n]*)'|\"([^\"\\\n]*)\"|`([^`\\]*)`")
+_JS_NOT_NAMES = frozenset(
+    {
+        "toString",
+        "String",
+        "Buffer",
+        "from",
+        "utf8",
+        "await",
+        "new",
+        "this",
+        "null",
+        "undefined",
+        "require",
+        "module",
+        "exports",
+        "__filename",
+        "__dirname",
+    }
+)
 _GYP_COMMAND_RE = re.compile(r"<!@?\(([^)]*)\)|['\"]action['\"]\s*:\s*\[([^\]]*)\]")
 _HOOK_RUNNERS = {
     "node": "js",
@@ -194,6 +227,36 @@ _GYP_TOOLS = frozenset(
 _LITERAL_RE = re.compile(r"(['\"`])(?:\\.|(?!\1).)*\1|\b\d+(?:\.\d+)*\b", re.S)
 _BLOB_RE = re.compile(r"[A-Za-z0-9+/=_-]{10000,}")
 _PY_EXEC_NAMES = frozenset({"exec", "eval", "execfile"})
+_FILE_READ_CALLS = frozenset(
+    {
+        "open",
+        "io.open",
+        "codecs.open",
+        "io.open_code",
+        "pkgutil.get_data",
+        "importlib.resources.read_text",
+        "importlib.resources.read_binary",
+        "importlib_resources.read_text",
+        "importlib_resources.read_binary",
+    }
+)
+_FILE_READ_ATTRS = frozenset({"read_text", "read_bytes"})
+_FILE_RUN_CALLS = frozenset(
+    {
+        "runpy.run_path",
+        "runpy.run_module",
+        "imp.load_source",
+        "imp.load_compiled",
+        "imp.load_module",
+        "imp.load_package",
+    }
+)
+_LOADER_RUN_ATTRS = frozenset({"load_module", "exec_module"})
+_MAX_BINDINGS = 8
+_MAX_BINDING_DEPTH = 4
+_MAX_EXPANDED_NODES = 4000
+_MAX_SOURCES = 40
+_MAX_JS_SINKS = 50
 _DECODE_EXEC_HINT = re.compile(
     r"exec|eval|compile|decode|loads|unhexlify|fromhex|Popen|system|spawn|subprocess|"
     r"getattr|__import__|import_module|globals|builtins|sys\.modules|urlopen"
@@ -519,7 +582,12 @@ def _collect(
         )
     else:
         collectors.extend(
-            [_npm_manifest_behaviours, _npm_import_time_behaviours, _install_time_behaviours]
+            [
+                _npm_manifest_behaviours,
+                _npm_import_time_behaviours,
+                _install_time_behaviours,
+                _js_file_exec_behaviours,
+            ]
         )
     for collect in collectors:
         after.cache.check()
@@ -1120,11 +1188,16 @@ class _PyCall:
     line: int
     snippet: str
     markers: tuple[str, ...] = ()
+    sources: tuple[str, ...] = ()
+    fallback: str | None = None
 
 
 def _python_calls(text: str, tree: ast.Module, *, import_time_only: bool) -> list[_PyCall] | None:
+    """Risky calls; ``file_exec`` calls run code read from a file and keep the strings
+    that name it in ``sources`` and their category without the file in ``fallback``."""
     try:
         ctx = pc._PyContext(tree)
+        bindings = _bindings(tree)
         import_time = None
         if import_time_only:
             import_time = _import_time_with_local_calls(tree)
@@ -1136,15 +1209,114 @@ def _python_calls(text: str, tree: ast.Module, *, import_time_only: bool) -> lis
                 continue
             name, _obfuscated = ctx.resolve(node.func)
             category = _call_category(node, name, ctx)
+            markers = _call_markers(node, category or "")
+            sources = _file_exec_sources(node, name, ctx, bindings)
+            fallback = None
+            if sources is not None:
+                fallback = category
+                category = "file_exec"
             if category is None:
                 continue
             _line, snippet = pc._line_snippet(text, pc._offset_for_line(text, node.lineno))
+            callee = name or _attribute_name(node.func) or "?"
             calls.append(
-                _PyCall(category, name or "?", node.lineno, snippet, _call_markers(node, category))
+                _PyCall(category, callee, node.lineno, snippet, markers, sources or (), fallback)
             )
         return calls
     except RecursionError:
         return None
+
+
+def _attribute_name(func: ast.AST) -> str | None:
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _bindings(tree: ast.Module) -> dict[str, list[ast.AST]]:
+    """Values assigned to each plain name anywhere in the module, a few per name."""
+    bindings: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(tree):
+        pairs: list[tuple[ast.AST, ast.AST]] = []
+        if isinstance(node, ast.Assign):
+            pairs = [(target, node.value) for target in node.targets]
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+            pairs = [(node.target, node.value)]
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            pairs = [
+                (item.optional_vars, item.context_expr)
+                for item in node.items
+                if item.optional_vars is not None
+            ]
+        for target, value in pairs:
+            if isinstance(target, ast.Name):
+                values = bindings.setdefault(target.id, [])
+                if len(values) < _MAX_BINDINGS:
+                    values.append(value)
+    return bindings
+
+
+def _expanded(node: ast.AST, bindings: dict[str, list[ast.AST]]) -> list[ast.AST]:
+    """``node`` and its children, with plain names replaced by what was assigned to them."""
+    found: list[ast.AST] = []
+    pending = [(node, 0)]
+    names: set[str] = set()
+    while pending and len(found) < _MAX_EXPANDED_NODES:
+        current, depth = pending.pop(0)
+        for child in ast.walk(current):
+            found.append(child)
+            if (
+                isinstance(child, ast.Name)
+                and depth < _MAX_BINDING_DEPTH
+                and child.id not in names
+                and child.id in bindings
+            ):
+                names.add(child.id)
+                pending.extend((value, depth + 1) for value in bindings[child.id])
+    return found
+
+
+def _strings_in(nodes: list[ast.AST], bindings: dict[str, list[ast.AST]]) -> tuple[str, ...]:
+    strings: list[str] = []
+    for node in nodes:
+        for child in _expanded(node, bindings):
+            if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                if child.value not in strings:
+                    strings.append(child.value)
+            if len(strings) >= _MAX_SOURCES:
+                return tuple(strings)
+    return tuple(strings)
+
+
+def _file_exec_sources(
+    node: ast.Call, name: str | None, ctx: Any, bindings: dict[str, list[ast.AST]]
+) -> tuple[str, ...] | None:
+    """Strings naming the file whose content this call executes; None when it runs no file.
+
+    Covers exec/eval of a file's text (also through compile, marshal or a decoder),
+    execfile, runpy, imp loaders and ``load_module``/``exec_module`` of a loader or spec.
+    """
+    func = node.func
+    if name in _PY_EXEC_NAMES and node.args:
+        if name == "execfile":
+            return _strings_in([node.args[0]], bindings)
+        for child in _expanded(node.args[0], bindings):
+            if not isinstance(child, ast.Call):
+                continue
+            read, _obfuscated = ctx.resolve(child.func)
+            if read in _FILE_READ_CALLS:
+                return _strings_in(
+                    [*child.args, *(item.value for item in child.keywords)], bindings
+                )
+            if isinstance(child.func, ast.Attribute) and child.func.attr in _FILE_READ_ATTRS:
+                return _strings_in([child.func.value, *child.args], bindings)
+        return None
+    arguments = [*node.args, *(item.value for item in node.keywords)]
+    if name in _FILE_RUN_CALLS:
+        return _strings_in(arguments, bindings)
+    if isinstance(func, ast.Attribute) and func.attr in _LOADER_RUN_ATTRS:
+        return _strings_in([func.value, *arguments], bindings)
+    return None
 
 
 def _call_markers(node: ast.Call, category: str) -> tuple[str, ...]:
@@ -1313,13 +1485,18 @@ def _build_hook_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]:
             else:
                 calls = []
         for call in calls:
+            category = call.category
+            if category == "file_exec":
+                category = call.fallback
+            if category is None:
+                continue
             detail = f"{path} runs {call.callee} during build or install"
             if call.markers:
                 detail += f" with {', '.join(call.markers)}"
             behaviours.append(
                 Behaviour(
                     "new_install_hook",
-                    ("build-call", call.category, call.callee, call.markers),
+                    ("build-call", category, call.callee, call.markers),
                     path,
                     call.line,
                     call.snippet,
@@ -1332,7 +1509,8 @@ def _build_hook_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]:
 
 
 def _with_local_imports(side: _Side, hook_files: set[str]) -> set[str]:
-    """Build hook files plus the sdist's own modules they import (they run at build too)."""
+    """Build hook files plus the sdist's own modules they import and the shipped files they
+    exec (both run at build too)."""
     modules = _python_modules(side)
     found = set(hook_files)
     queue = sorted(hook_files)
@@ -1341,13 +1519,71 @@ def _with_local_imports(side: _Side, hook_files: set[str]) -> set[str]:
         tree = side.tree(path)
         if tree is None:
             continue
+        targets = []
         for target in _module_imports(tree, ""):
-            for prefix in _prefixes(target):
-                module_path = modules.get(prefix)
-                if module_path is not None and module_path not in found:
-                    found.add(module_path)
-                    queue.append(module_path)
+            targets.extend(modules.get(prefix) for prefix in _prefixes(target))
+        targets.extend(_exec_targets(side, path, False))
+        for module_path in targets:
+            if module_path is not None and module_path not in found:
+                found.add(module_path)
+                queue.append(module_path)
     return found
+
+
+def _exec_targets(side: _Side, path: str, import_time_only: bool) -> list[str]:
+    """Shipped files whose code ``path`` executes with exec, runpy or a file loader."""
+    targets = []
+    for call in side.calls(path, import_time_only) or []:
+        if call.category == "file_exec":
+            target = _exec_target(side, path, call)
+            if target is not None and target not in targets:
+                targets.append(target)
+    return targets
+
+
+def _exec_target(side: _Side, path: str, call: _PyCall) -> str | None:
+    if call.callee == "runpy.run_module":
+        modules = _python_modules(side)
+        for value in call.sources:
+            if value in modules:
+                return modules[value]
+    return _shipped_file(side, path, call.sources)
+
+
+def _shipped_file(side: _Side, caller: str, values: tuple[str, ...]) -> str | None:
+    """The artifact file that path fragments in ``caller`` name, as installed next to it."""
+    by_install = side.memo(
+        "install-paths", lambda: {entry.install_path: key for key, entry in side.entries.items()}
+    )
+    directory = posixpath.dirname(side.entries[caller].install_path)
+    cleaned = []
+    for value in values:
+        text = value.replace("\\", "/").strip()
+        if text and len(text) <= 300 and "\n" not in text:
+            cleaned.append(text)
+    parts = [text.strip("/") for text in cleaned if text.strip("/") not in {"", "."}]
+    candidates = []
+    for text in [*cleaned, "/".join(parts)]:
+        relative = text.lstrip("/")
+        if relative:
+            candidates.append(posixpath.normpath(posixpath.join(directory, relative)))
+            candidates.append(posixpath.normpath(relative))
+    for candidate in candidates:
+        found = by_install.get(candidate)
+        if found is not None and found != caller:
+            return found
+    for text in cleaned:
+        tail = posixpath.normpath(text.lstrip("/"))
+        if tail in {".", ".."} or tail.startswith("../") or "." not in posixpath.basename(tail):
+            continue
+        matches = [
+            key
+            for install, key in by_install.items()
+            if (install == tail or install.endswith("/" + tail)) and key != caller
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    return None
 
 
 def _python_modules(side: _Side) -> dict[str, str]:
@@ -1378,6 +1614,7 @@ def _python_modules(side: _Side) -> dict[str, str]:
 def _import_graph(side: _Side, roots: list[str]) -> tuple[list[tuple[str, str]], set[str], bool]:
     """Modules executed when ``roots`` are imported, every name they import, and truncation."""
     modules = _python_modules(side)
+    names = {path: name for name, path in modules.items()}
     seen: list[tuple[str, str]] = []
     visited: set[str] = set()
     imported: set[str] = set()
@@ -1401,6 +1638,10 @@ def _import_graph(side: _Side, roots: list[str]) -> tuple[list[tuple[str, str]],
                 imported.add(prefix)
                 if prefix in modules and prefix not in visited:
                     queue.append(prefix)
+        for target in _exec_targets(side, path, True):
+            name = names.get(target)
+            if name is not None and name not in visited:
+                queue.append(name)
     return seen, imported, bool(queue)
 
 
@@ -1414,6 +1655,9 @@ def _python_import_time_behaviours(side: _Side, result: DiffResult) -> list[Beha
     behaviours: list[Behaviour] = []
     for module, path in seen:
         for call in side.calls(path, True) or []:
+            if call.category == "file_exec":
+                behaviours.append(_file_exec_behaviour(side, path, module, call))
+                continue
             if call.category == "decode_exec":
                 continue
             kind = "new_import_time_network"
@@ -1435,6 +1679,36 @@ def _python_import_time_behaviours(side: _Side, result: DiffResult) -> list[Beha
             f"import-time analysis stopped after {MAX_IMPORT_MODULES} modules"
         )
     return behaviours
+
+
+def _file_exec_behaviour(side: _Side, path: str, module: str, call: _PyCall) -> Behaviour:
+    """Import-time code run from a shipped file blocks; the file's code shape is part of the
+    identity unless it is a module, whose own calls the import graph already follows."""
+    target = _exec_target(side, path, call)
+    if target is None:
+        return Behaviour(
+            "new_decode_exec",
+            ("file-exec", side.entries[path].install_path, call.callee),
+            path,
+            call.line,
+            call.snippet,
+            f"{call.callee} runs code read from a file when {module} is imported; "
+            "the file could not be resolved in the package",
+            "block",
+        )
+    install = side.entries[target].install_path
+    identity: tuple = ("file-exec", install)
+    if not install.endswith(".py"):
+        identity = ("file-exec", install, _install_fingerprint(side, target, "py"))
+    return Behaviour(
+        "new_decode_exec",
+        identity,
+        path,
+        call.line,
+        call.snippet,
+        f"{call.callee} runs code read from {install} when {module} is imported",
+        "block",
+    )
 
 
 def _runs_risky_code(side: _Side, module: str) -> str | None:
@@ -1810,7 +2084,7 @@ def _python_decode_exec(side: _Side, path: str, text: str) -> list[Behaviour]:
     if not _DECODE_EXEC_HINT.search(text):
         return []
     calls = side.calls(path, False) or []
-    first = next((call for call in calls if call.category == "decode_exec"), None)
+    first = next((call for call in calls if "decode_exec" in {call.category, call.fallback}), None)
     encoded_lines = side.encoded_lines(path)
     if first is None and encoded_lines:
         line = encoded_lines[0]
@@ -2042,6 +2316,151 @@ def _decoded_sink_behaviours(side: _Side, path: str, text: str) -> list[Behaviou
                 )
             ]
     return []
+
+
+def _js_file_exec_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]:
+    """eval, Function, vm or Module._compile fed by a file read, in code Node loads from
+    the entry points or runs at install time. The evaluated file's code shape is part of
+    the identity, so a payload swapped into an unchanged loader is new."""
+    install = _npm_install_targets(side)
+    behaviours: list[Behaviour] = []
+    for path in sorted(_js_reachable(side)):
+        if path not in side.entries or install.get(path, "js") != "js":
+            continue
+        if path.lower().endswith((".json", ".node", ".gyp")):
+            continue
+        text = side.text(path)
+        if text is None or not _JS_FILE_READ_RE.search(text):
+            continue
+        context = "load"
+        when = "when the package is loaded"
+        if path in install:
+            context = "install"
+            when = "at install time"
+        sinks = 0
+        for chunk in _chunks(text):
+            for match in _JS_CODE_SINK_RE.finditer(chunk):
+                sink = _js_sink(match, text)
+                if sink is None:
+                    continue
+                sinks += 1
+                if sinks > _MAX_JS_SINKS:
+                    break
+                region = _js_file_read(chunk, _call_argument(chunk, match.end()))
+                if region is None:
+                    continue
+                side.cache.check()
+                target = _shipped_file(side, path, _js_strings(region))
+                line, snippet = pc._line_snippet(chunk, match.start())
+                if len(chunk) != len(text):
+                    line = None
+                if target is None:
+                    identity: tuple = ("js-file-exec", context, path, sink)
+                    detail = (
+                        f"{sink} runs code read from a file {when}; the file could not be "
+                        "resolved in the package"
+                    )
+                else:
+                    identity = (
+                        "js-file-exec",
+                        context,
+                        target,
+                        _install_fingerprint(side, target, "js"),
+                    )
+                    detail = f"{sink} runs code read from {target} {when}"
+                behaviours.append(
+                    Behaviour("new_decode_exec", identity, path, line, snippet, detail, "block")
+                )
+    return behaviours
+
+
+def _js_sink(match: re.Match[str], text: str) -> str | None:
+    if match.group("sink"):
+        receiver = match.group("receiver")
+        if receiver is not None and receiver not in _JS_GLOBAL_RECEIVERS:
+            return None
+        return match.group("sink")
+    if match.group("new_sink"):
+        return "new Function"
+    if match.group("vm_sink"):
+        return match.group("vm_sink")
+    if match.group("script_sink"):
+        if _JS_VM_REQUIRE_RE.search(text) is None:
+            return None
+        return "vm.Script"
+    return "Module._compile"
+
+
+def _call_argument(text: str, start: int, limit: int = 2000) -> str:
+    """The text between the parenthesis before ``start`` and its matching close."""
+    depth = 1
+    quote = None
+    end = min(len(text), start + limit)
+    index = start
+    while index < end:
+        char = text[index]
+        if quote is not None:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in "'\"`":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:index]
+        index += 1
+    return text[start:end]
+
+
+def _js_file_read(text: str, argument: str) -> str | None:
+    """The path expression of a file read that feeds ``argument``, directly or through one
+    variable, a readFile callback parameter or a promise result."""
+    direct = _JS_FILE_READ_RE.search(argument)
+    if direct is not None:
+        return _call_argument(argument, direct.end())
+    names = []
+    for name in re.findall(r"[A-Za-z_$][\w$]*", argument):
+        if name not in _JS_NOT_NAMES and name not in names:
+            names.append(name)
+    for name in names[:5]:
+        escaped = re.escape(name)
+        for binding in re.finditer(
+            rf"(?<![\w$.]){escaped}\s*=(?![=>])\s*(?P<rhs>[^;\n]{{0,400}})", text
+        ):
+            rhs = binding.group("rhs")
+            read = _JS_FILE_READ_RE.search(rhs)
+            if read is not None:
+                return _call_argument(rhs, read.end())
+        callback = re.search(
+            rf"\breadFile\s*\((?P<args>[^;]{{0,400}}?)(?:function\s*[\w$]*\s*)?"
+            rf"\(\s*[\w$]+\s*,\s*{escaped}\s*\)",
+            text,
+        )
+        if callback is not None:
+            return callback.group("args")
+        then = re.search(
+            rf"\breadFile\s*\((?P<args>[^;]{{0,400}}?)\)\s*\.\s*then\s*\(\s*(?:async\s*)?"
+            rf"(?:function\s*[\w$]*\s*)?\(?\s*{escaped}\b",
+            text,
+        )
+        if then is not None:
+            return then.group("args")
+    return None
+
+
+def _js_strings(text: str) -> tuple[str, ...]:
+    strings = []
+    for match in _JS_STRING_RE.finditer(text):
+        value = next((group for group in match.groups() if group is not None), "")
+        value = re.sub(r"\$\{[^}]*\}", "/", value)
+        if value and value not in strings:
+            strings.append(value)
+    return tuple(strings[:_MAX_SOURCES])
 
 
 def _decoder_source(side: _Side, path: str, text: str, name: str) -> str | None:
