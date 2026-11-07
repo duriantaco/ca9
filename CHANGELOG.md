@@ -5,6 +5,18 @@ All notable changes to ca9 will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0](https://github.com/duriantaco/ca9/compare/v0.6.0...v0.7.0) (2026-11-07)
+
+
+### Features
+
+* **supply-chain:** detect range-only malware, review upgrades and audit agent and CI configs ([be1eb6a](https://github.com/duriantaco/ca9/commit/be1eb6a3aa6d347541b81e13c8407cc16acaedac))
+
+
+### Bug Fixes
+
+* **release:** support core metadata 2.5 uploads ([#38](https://github.com/duriantaco/ca9/issues/38)) ([e9cd206](https://github.com/duriantaco/ca9/commit/e9cd206c4d0000c4b213ef976f8c138e55748f25))
+
 ## [0.6.0](https://github.com/duriantaco/ca9/compare/v0.5.0...v0.6.0) (2026-09-26)
 
 
