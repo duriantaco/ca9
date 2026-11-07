@@ -897,9 +897,13 @@ def agent_config(repo_root: str | Path) -> dict[str, Any]:
     ``.cursor/{hooks,mcp}.json``, ``.codex/{hooks.json,config.toml}``,
     ``.vscode/{tasks,mcp,settings}.json``, ``*.code-workspace``, ``.mcp.json``,
     ``.kiro/settings/mcp.json`` (and Roo / Amazon Q / Windsurf ``mcp.json``) at any
-    depth, skipping ``node_modules``, ``.git`` and virtualenvs. JSON with comments and
-    trailing commas parses; an unparseable hook file still reports the command strings
-    found in its text. Never raises.
+    depth, skipping ``node_modules``, ``.git`` and virtualenvs. Symlinks that stay inside
+    the repository are followed and reported under the in-repo path an agent opens (a
+    committed ``.claude`` link to ``tools/cfg`` reports ``.claude/settings.json``); a config
+    folder or file link that leaves the repository, dangles or cannot be read is an
+    ``errors`` entry and makes the result partial. JSON with comments and trailing commas
+    parses; an unparseable hook file still reports the command strings found in its text.
+    Never raises.
 
     Returns ``{"findings": [finding dict], "inventory": {...}}``. ``signal_type`` is one
     of agent_hook_command (HIGH; CRITICAL when the command downloads remote code,
@@ -918,7 +922,8 @@ def agent_config(repo_root: str | Path) -> dict[str, Any]:
     handler_type), ``mcp_servers`` [{file, name, command, ecosystem, package,
     version, pinned, line}] (optional argv, transport, fetches, launcher, url), plus
     optional ``env_overrides``, ``files``, ``errors``, ``status``
-    ("complete"|"partial") and ``truncated``.
+    ("complete"|"partial"), ``truncated`` and ``links`` ([{path, target}] for followed
+    symlinks, both repository-relative).
     """
     from ca9.agent_config import scan_repository
 

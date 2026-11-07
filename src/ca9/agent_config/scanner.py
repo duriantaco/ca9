@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +44,9 @@ _SKIP_DIRS = frozenset(
         ".yarn",
         ".pnpm-store",
     }
+)
+_CONFIG_DIRECTORIES = frozenset(
+    {".claude", ".gemini", ".cursor", ".codex", ".vscode", ".roo", ".amazonq", ".windsurf", ".kiro"}
 )
 _HOOK_ROLES = frozenset(
     {
@@ -272,14 +276,16 @@ def scan_repository(repo_root: str | Path) -> dict[str, Any]:
         inventory["errors"].append({"file": ".", "reason": f"cannot read repository root: {exc}"})
         inventory["status"] = "partial"
         return {"findings": findings, "inventory": inventory}
-    paths, walk_complete = _config_paths(resolved_root)
-    if not walk_complete:
+    walk = _config_paths(resolved_root)
+    if not walk.complete:
         inventory["truncated"] = True
         inventory["errors"].append(
             {"file": ".", "reason": f"stopped after {MAX_WALK_ENTRIES} directory entries"}
         )
-    for path in paths:
-        rel = path.relative_to(resolved_root).as_posix()
+    inventory["errors"].extend(walk.errors)
+    if walk.links:
+        inventory["links"] = walk.links[:MAX_ITEMS]
+    for rel, path in walk.files:
         text, error, truncated = _read(path, resolved_root)
         if error:
             inventory["errors"].append({"file": rel, "reason": error})
@@ -304,20 +310,131 @@ def scan_repository(repo_root: str | Path) -> dict[str, Any]:
     return {"findings": findings, "inventory": inventory}
 
 
-def _config_paths(root: Path) -> tuple[list[Path], bool]:
-    found: list[Path] = []
+@dataclass
+class _Walk:
+    """Config files as ``(path the agent opens, real file)``, plus link problems."""
+
+    files: list[tuple[str, Path]] = field(default_factory=list)
+    complete: bool = True
+    errors: list[dict[str, str]] = field(default_factory=list)
+    links: list[dict[str, str]] = field(default_factory=list)
+
+
+def _config_paths(root: Path) -> _Walk:
+    """Walk the repository, following symlinks that stay inside it.
+
+    Agents open ``.claude/settings.json`` through a committed ``.claude`` link, so linked
+    directories are walked under the in-repo path that reaches them. The real tree is
+    walked first and links after it, a directory is entered once per (real path, name,
+    parent name) so loops end, and a file reached by several paths is reported once,
+    under its own path when that path has the same role. A config link that leaves the
+    repository, dangles or cannot be read is an error, never a silent pass.
+    """
+    walk = _Walk()
+    real_root = str(root)
+    visited: set[tuple[str, str, str]] = set()
+    candidates: list[tuple[str, Path, str, bool]] = []
+    reported: set[tuple[str, str]] = set()
     seen = 0
-    for directory, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = sorted(name for name in dirnames if name not in _SKIP_DIRS)
-        seen += len(dirnames) + len(filenames)
-        base = Path(directory)
-        for filename in sorted(filenames):
-            candidate = base / filename
-            if role_for(candidate.relative_to(root)) is not None:
-                found.append(candidate)
+    pending = [(real_root, "", "", False)]
+    deferred: list[tuple[str, str, str, bool]] = []
+    while pending or deferred:
+        if not pending:
+            pending.append(deferred.pop(0))
+        directory, rel, name, linked = pending.pop()
+        parent = posixpath.basename(posixpath.dirname(rel)).lower()
+        key = (directory, name.lower(), parent)
+        if key in visited:
+            continue
+        visited.add(key)
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError as exc:
+            if linked or _config_directory(name, parent):
+                _walk_error(walk, rel, f"cannot list the directory: {exc.strerror or exc}")
+            continue
+        seen += len(entries)
+        subdirectories = []
+        for entry in entries:
+            child = entry.name
+            if rel:
+                child = f"{rel}/{entry.name}"
+            if entry.is_symlink():
+                _follow_link(walk, real_root, entry, child, name, linked, candidates, deferred)
+            elif entry.is_dir(follow_symlinks=False):
+                if entry.name not in _SKIP_DIRS:
+                    subdirectories.append((entry.path, child, entry.name, linked))
+            elif role_for(child) is not None:
+                candidates.append((child, Path(entry.path), entry.path, linked))
+        pending.extend(reversed(subdirectories))
         if seen > MAX_WALK_ENTRIES:
-            return found, False
-    return found, True
+            walk.complete = False
+            break
+    preferred: dict[tuple[str, str], tuple[str, bool]] = {}
+    for child, _path, real, linked in candidates:
+        group = (real, role_for(child) or "")
+        current = preferred.get(group)
+        if current is None or (current[1] and not linked):
+            preferred[group] = (child, linked)
+    for child, path, real, _linked in candidates:
+        group = (real, role_for(child) or "")
+        if preferred[group][0] == child and group not in reported:
+            reported.add(group)
+            walk.files.append((child, path))
+    return walk
+
+
+def _follow_link(
+    walk: _Walk,
+    real_root: str,
+    entry: os.DirEntry[str],
+    child: str,
+    parent_name: str,
+    linked: bool,
+    candidates: list[tuple[str, Path, str, bool]],
+    deferred: list[tuple[str, str, str, bool]],
+) -> None:
+    config = role_for(child) is not None or _config_directory(entry.name, parent_name.lower())
+    try:
+        target = os.path.realpath(entry.path)
+        exists = os.path.exists(target)
+        directory = os.path.isdir(target)
+    except (OSError, ValueError) as exc:
+        if config:
+            _walk_error(walk, child, f"symlink cannot be resolved: {exc}")
+        return
+    inside = target == real_root or target.startswith(real_root + os.sep)
+    if not exists:
+        if config:
+            _walk_error(walk, child, "symlink target is missing; not read")
+        return
+    if not inside:
+        if config:
+            _walk_error(walk, child, "symlink points outside the repository; not read")
+        return
+    relative = Path(target).relative_to(real_root).as_posix()
+    if directory:
+        if entry.name in _SKIP_DIRS:
+            return
+        deferred.append((target, child, entry.name, True))
+    elif role_for(child) is not None:
+        candidates.append((child, Path(target), target, True))
+    else:
+        return
+    if not linked and len(walk.links) < MAX_ITEMS:
+        walk.links.append({"path": child, "target": relative})
+
+
+def _config_directory(name: str, parent: str) -> bool:
+    lowered = name.lower()
+    return lowered in _CONFIG_DIRECTORIES or (lowered == "settings" and parent == ".kiro")
+
+
+def _walk_error(walk: _Walk, rel: str, reason: str) -> None:
+    error = {"file": rel or ".", "reason": reason}
+    if error not in walk.errors:
+        walk.errors.append(error)
 
 
 def _read(path: Path, root: Path) -> tuple[str | None, str | None, bool]:
