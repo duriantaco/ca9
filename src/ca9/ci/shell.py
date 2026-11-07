@@ -13,7 +13,7 @@ import shlex
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from ca9.ci.model import MAX_NAME_LENGTH, Download, Install, Publish, Tool
+from ca9.ci.model import MAX_NAME_LENGTH, Download, Indirect, Install, Publish, Tool
 
 MAX_SCRIPT_CHARS = 200_000
 MAX_DEPTH = 3
@@ -61,6 +61,31 @@ _OUT_REDIRECTS = frozenset({">", ">>", ">|", "&>", "&>>"})
 _SKIP_NEXT_REDIRECTS = frozenset({"<", "<<", "<<-", "<<<", ">&", "<&", "&>&"})
 _KEYWORDS = frozenset({"if", "then", "else", "elif", "do", "while", "until", "!", "fi", "done"})
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
+_INDIRECT_TOOLS = {
+    "make": "make",
+    "gmake": "gmake",
+    "just": "just",
+    "task": "task",
+    "go-task": "task",
+    "tox": "tox",
+    "nox": "nox",
+}
+_CONTAINER_SUBCOMMANDS = frozenset({"build", "buildx", "compose", "run"})
+_DOCKER_VALUE_FLAGS = frozenset(
+    {
+        "--config",
+        "--context",
+        "-c",
+        "--host",
+        "-H",
+        "--log-level",
+        "-l",
+        "--tlscacert",
+        "--tlscert",
+        "--tlskey",
+    }
+)
+_NOT_REPO_DIRS = frozenset({"node_modules", ".venv", "venv", "site-packages", ".tox", ".nox"})
 _INTERPRETERS = frozenset({"python", "python3", "node", "perl", "ruby", "pwsh", "powershell"})
 _ARCHIVE_SUFFIXES = (".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tar", ".zip")
 _BIN_DIR_RE = re.compile(r"(?:^|/)(?:s?bin|\.local/bin)(?:/|$)")
@@ -315,6 +340,7 @@ class ScriptFacts:
     other_tools: list[Tool] = field(default_factory=list)
     downloads: list[Download] = field(default_factory=list)
     publishes: list[Publish] = field(default_factory=list)
+    indirect: list[Indirect] = field(default_factory=list)
     extracts: list[Extract] = field(default_factory=list)
     moves: list[Move] = field(default_factory=list)
     removals: list[Removal] = field(default_factory=list)
@@ -331,6 +357,7 @@ class ScriptFacts:
             "other_tools",
             "downloads",
             "publishes",
+            "indirect",
             "extracts",
             "moves",
             "removals",
@@ -461,6 +488,9 @@ class _Scanner:
     ) -> None:
         program, args = _program(argv)
         line = command.line
+        indirect = _indirect_command(program, argv, args)
+        if indirect is not None:
+            self.facts.indirect.append(Indirect(indirect, line, order=self.order()))
         if program in _SHELLS and "-c" in args:
             index = args.index("-c")
             if index + 1 < len(args):
@@ -565,6 +595,9 @@ class _Scanner:
                 publish.line = command.line
                 self.facts.publishes.append(publish)
                 found = True
+            for item in nested.facts.indirect:
+                item.line = command.line
+                self.facts.indirect.append(item)
             self.facts.credentials.extend(nested.facts.credentials)
         if not found and "publish" in name.lower() and "--dry-run" not in command.raw:
             self.add_publish("npm", f"run {name}", command.line, via=f"script_name:{name}")
@@ -572,6 +605,65 @@ class _Scanner:
     def local_binary(self, name: str) -> bool:
         package = _KNOWN_BINS.get(name, name)
         return package in self.context.local_packages or name in self.context.local_packages
+
+
+def _indirect_command(program: str, argv: list[str], args: list[str]) -> str | None:
+    """The tool name of a command that may install packages out of sight: build runners,
+    container builds and runs, test-environment managers and repository scripts."""
+    if program in _INDIRECT_TOOLS:
+        return _INDIRECT_TOOLS[program]
+    if program in {"docker", "podman"}:
+        if _container_subcommand(args) in _CONTAINER_SUBCOMMANDS:
+            return program
+        return None
+    if program in {"docker-compose", "podman-compose"}:
+        return program
+    if program in _SHELLS:
+        if any(arg in {"-c", "-s"} for arg in args):
+            return None
+        positionals = [arg for arg in args if not arg.startswith("-")]
+        if positionals and _repo_path(positionals[0]):
+            return _script_name(positionals[0])
+        return None
+    if program not in _HANDLERS and _repo_path(argv[0]) and "/" in argv[0]:
+        return _script_name(argv[0])
+    return None
+
+
+def _container_subcommand(args: list[str]) -> str | None:
+    words: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        if arg.startswith("-"):
+            skip = "=" not in arg and arg in _DOCKER_VALUE_FLAGS
+            continue
+        words.append(arg)
+        if len(words) == 2:
+            break
+    if not words:
+        return None
+    if words[0] in {"image", "container"} and len(words) > 1:
+        return words[1]
+    return words[0]
+
+
+def _repo_path(path: str) -> bool:
+    text = path.replace("\\", "/")
+    if not text or text.startswith(("/", "~", "$", "%", PLACEHOLDER)) or "://" in text:
+        return False
+    if re.match(r"^[A-Za-z]:/", text):
+        return False
+    return not any(part in _NOT_REPO_DIRS for part in text.split("/")[:-1])
+
+
+def _script_name(path: str) -> str:
+    text = path.replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return _safe_name(text or path)
 
 
 def scan_script(

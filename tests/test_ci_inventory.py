@@ -237,3 +237,75 @@ def test_symlinked_workflow_outside_the_repository_is_not_read(tmp_path):
     assert inventory["skipped"] == [
         {"file": ".github/workflows/linked.yml", "reason": "invalid_yaml"}
     ]
+
+
+INDIRECT_WORKFLOW = """on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - run: make ci
+      - run: sudo docker --context ci build -t x .
+      - run: docker image build .
+      - run: podman compose up -d
+      - run: tox -e py && python -m nox -s tests
+      - run: just ci; task build; gmake all
+      - run: ./scripts/bootstrap.sh
+      - run: bash scripts/x.sh
+      - run: npm run setup
+      - uses: docker/build-push-action@v6
+      - run: |
+          docker ps
+          docker login -u x
+          docker push img
+          echo make tox
+          bash -c "echo hi"
+          /usr/bin/env true
+          node_modules/.bin/eslint .
+          $HOME/bin/tool
+"""
+
+
+def test_jobs_list_commands_that_may_install_out_of_sight(tmp_path):
+    repo = _repo(
+        tmp_path,
+        {
+            ".github/workflows/ci.yml": INDIRECT_WORKFLOW,
+            "package.json": '{"scripts": {"setup": "make install"}}',
+            ".gitlab-ci.yml": "release:\n  script:\n    - make ci\n    - sh build.sh\n",
+        },
+    )
+
+    jobs = _jobs(api.ci_inventory(repo))
+
+    assert [(item["command"], item["line"]) for item in jobs["build"]["indirect"]] == [
+        ("make", 8),
+        ("docker", 9),
+        ("docker", 10),
+        ("podman", 11),
+        ("tox", 12),
+        ("nox", 12),
+        ("just", 13),
+        ("task", 13),
+        ("gmake", 13),
+        ("scripts/bootstrap.sh", 14),
+        ("scripts/x.sh", 15),
+        ("make", 16),
+        ("docker", 17),
+    ]
+    assert jobs["release"]["indirect"] == [
+        {"command": "make", "line": 3},
+        {"command": "build.sh", "line": 4},
+    ]
+
+
+def test_indirect_list_is_capped_and_marks_truncation(tmp_path):
+    steps = "".join(f"      - run: make step{index}\n" for index in range(150))
+    workflow = f"on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n{steps}"
+
+    inventory = api.ci_inventory(_repo(tmp_path, {".github/workflows/ci.yml": workflow}))
+
+    assert len(_jobs(inventory)["build"]["indirect"]) == 100
+    assert inventory["truncated"] is True

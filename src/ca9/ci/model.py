@@ -78,6 +78,20 @@ class Tool:
 
 
 @dataclass
+class Indirect:
+    """A command whose installs are hidden in another file or image: make, docker build,
+    tox, a repository script. It may install packages; the inventory cannot tell."""
+
+    command: str
+    line: int
+    origin: Origin | None = None
+    order: tuple[int, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"command": self.command, "line": self.line}
+
+
+@dataclass
 class Download:
     host: str
     line: int
@@ -181,6 +195,7 @@ class Job:
     other_tools: list[Tool] = field(default_factory=list)
     downloads: list[Download] = field(default_factory=list)
     publishes: list[Publish] = field(default_factory=list)
+    indirect: list[Indirect] = field(default_factory=list)
     uses_cache: bool = False
     calls: str | None = None
     local_actions: list[str] = field(default_factory=list)
@@ -208,6 +223,7 @@ class Job:
             "downloads": [item.to_dict() for item in self.downloads],
             "publishes": [item.to_dict() for item in self.publishes],
             "other_tools": [item.other_dict() for item in self.other_tools],
+            "indirect": [item.to_dict() for item in self.indirect],
         }
         for key, items in lists.items():
             if len(items) > MAX_ITEMS_PER_LIST:
@@ -241,6 +257,7 @@ class Job:
             "other_tools": lists["other_tools"],
             "publish_credentials": sorted(self.publish_credentials),
             "remote_reusable": self.remote_reusable,
+            "indirect": lists["indirect"],
         }
         if self.environment_dynamic:
             data["environment_dynamic"] = True

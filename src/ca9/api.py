@@ -1062,7 +1062,10 @@ def ci_inventory(repo_root: str | PurePath, *, max_jobs: int = 500) -> dict[str,
     unreadable, or GitLab includes that cannot be resolved in the repository: remote,
     project, template, component, variable paths or over the include cap, all listed in
     ``skipped``) or yaml_unavailable (PyYAML missing). ``truncated`` is true when ``max_jobs``
-    or a per-list cap cut the output. Never raises.
+    or a per-list cap cut the output. Each job's ``indirect`` lists commands that may
+    install packages out of sight (make, gmake, just, task, tox, nox, docker/podman
+    build, buildx, compose or run, Docker build actions, repository scripts) as
+    ``[{"command": tool or script path, "line": int}]``. Never raises.
     """
     try:
         from ca9.ci.inventory import build_inventory

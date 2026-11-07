@@ -9,7 +9,7 @@ from typing import Any
 
 from ca9.ci import jobs as jobtools
 from ca9.ci.conditions import NOTHING, condition_facts
-from ca9.ci.model import ActionRef, Job, Origin, Publish, Tool, Workflow
+from ca9.ci.model import ActionRef, Indirect, Job, Origin, Publish, Tool, Workflow
 from ca9.ci.shell import ScriptFacts, ShellContext, scan_script
 from ca9.ci.yamlload import (
     LineList,
@@ -34,6 +34,7 @@ _FLOATING_VERSIONS = frozenset(
     {"", "latest", "*", "x", "stable", "current", "head", "nightly", "node"}
 )
 _GITHUB_OWNERS = frozenset({"actions", "github"})
+_CONTAINER_BUILD_ACTIONS = frozenset({"docker/build-push-action", "docker/bake-action"})
 _RUNTIME_SETUP = frozenset(
     {"setup-node", "setup-python", "setup-java", "setup-go", "setup-dotnet", "setup-ruby"}
 )
@@ -526,6 +527,8 @@ class _JobBuilder:
         if lowered == "actions/setup-go" and str(with_map.get("cache", "true")).lower() != "false":
             self.job.uses_cache = True
         self.setup_tool(owner, repo, with_map, line, origin)
+        if lowered in _CONTAINER_BUILD_ACTIONS:
+            self.facts.indirect.append(Indirect("docker", line, origin=origin, order=order))
         if lowered == "pypa/gh-action-pypi-publish":
             password = with_map.get("password")
             method = "unknown"
@@ -697,6 +700,7 @@ def _relocate(facts: ScriptFacts, origin_file: str, line: int) -> None:
         facts.other_tools,
         facts.downloads,
         facts.publishes,
+        facts.indirect,
     ):
         for item in group:
             if item.origin is None:

@@ -87,6 +87,7 @@ def finalize(job: Job, facts: ScriptFacts, contexts: dict[tuple[int, ...], str])
     for credential in facts.credentials:
         add_credential(job, credential.name, credential.registry, credential.line)
     job.installs.extend(facts.installs)
+    job.indirect.extend(facts.indirect)
     job.tools.extend(facts.tools)
     job.other_tools.extend(facts.other_tools)
     for publish in facts.publishes:
