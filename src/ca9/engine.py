@@ -585,6 +585,30 @@ def derive_verdict(
             evidence=evidence,
         )
 
+    if evidence.api_usage_seen is True:
+        api_detail = f"{len(evidence.api_usage_hits)} vulnerable API call(s) found"
+
+        if has_coverage and evidence.api_call_sites_covered is False:
+            return VerdictResult(
+                vulnerability=vuln,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=f"{trace}, {api_detail}, but call sites not executed in tests",
+                imported_as=import_name,
+                dependency_of=dep_of,
+                affected_component=component,
+                evidence=evidence,
+            )
+
+        return VerdictResult(
+            vulnerability=vuln,
+            verdict=Verdict.REACHABLE,
+            reason=f"{trace} and {api_detail}",
+            imported_as=import_name,
+            dependency_of=dep_of,
+            affected_component=component,
+            evidence=evidence,
+        )
+
     if has_submodule_info:
         if evidence.submodule_imported is False:
             submod_list = ", ".join(component.submodule_paths)
@@ -631,30 +655,6 @@ def derive_verdict(
                 evidence=evidence,
             )
         return _inconclusive_coverage(vuln, evidence, import_name, component, dep_of, trace)
-
-    if evidence.api_usage_seen is True:
-        api_detail = f"{len(evidence.api_usage_hits)} vulnerable API call(s) found"
-
-        if has_coverage and evidence.api_call_sites_covered is False:
-            return VerdictResult(
-                vulnerability=vuln,
-                verdict=Verdict.INCONCLUSIVE,
-                reason=f"{trace}, {api_detail}, but call sites not executed in tests",
-                imported_as=import_name,
-                dependency_of=dep_of,
-                affected_component=component,
-                evidence=evidence,
-            )
-
-        return VerdictResult(
-            vulnerability=vuln,
-            verdict=Verdict.REACHABLE,
-            reason=f"{trace} and {api_detail}",
-            imported_as=import_name,
-            dependency_of=dep_of,
-            affected_component=component,
-            evidence=evidence,
-        )
 
     if not has_coverage:
         return VerdictResult(
