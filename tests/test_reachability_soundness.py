@@ -511,3 +511,90 @@ class TestSubmoduleSoundness:
             assert r.verdict == Verdict.INCONCLUSIVE
             assert r.evidence.submodule_imported is True
             assert "mysite/settings.py" in r.reason
+
+
+def _narrowed_component():
+    return AffectedComponent(
+        "acme",
+        submodule_paths=("acme.constructor",),
+        confidence="high",
+        extraction_source="commit_analysis",
+    )
+
+
+def _api_call_evidence(**overrides):
+    from ca9.models import ApiUsageHit, Evidence
+
+    fields = {
+        "package_imported": True,
+        "dependency_kind": "direct",
+        "api_usage_seen": True,
+        "api_usage_hits": (ApiUsageHit("app.py", 3, matched_target="acme.load"),),
+    }
+    fields.update(overrides)
+    return Evidence(**fields)
+
+
+class TestLocatedCallOutweighsSubmoduleGuess:
+    """A fix commit narrows the affected file; a located call is direct evidence.
+    Whether GitHub answered must not decide the verdict for the same code."""
+
+    @pytest.mark.parametrize("submodule_imported", [None, False, True])
+    def test_call_is_reachable_whatever_the_submodule_check_says(self, submodule_imported):
+        from ca9.engine import derive_verdict
+
+        evidence = _api_call_evidence(submodule_imported=submodule_imported)
+        result = derive_verdict(vuln("acme"), evidence, "acme", _narrowed_component(), None, False)
+        assert result.verdict == Verdict.REACHABLE
+        assert "vulnerable API call" in result.reason
+
+    def test_verdict_is_the_same_with_and_without_commit_analysis(self):
+        from ca9.engine import derive_verdict
+
+        narrowed = derive_verdict(
+            vuln("acme"),
+            _api_call_evidence(submodule_imported=False),
+            "acme",
+            _narrowed_component(),
+            None,
+            False,
+        )
+        unnarrowed = derive_verdict(
+            vuln("acme"), _api_call_evidence(), "acme", AffectedComponent("acme"), None, False
+        )
+        assert narrowed.verdict == unnarrowed.verdict == Verdict.REACHABLE
+
+    def test_unexecuted_call_site_stays_inconclusive_not_unreachable(self):
+        from ca9.engine import derive_verdict
+
+        evidence = _api_call_evidence(
+            submodule_imported=False, coverage_seen=False, api_call_sites_covered=False
+        )
+        result = derive_verdict(vuln("acme"), evidence, "acme", _narrowed_component(), None, True)
+        assert result.verdict == Verdict.INCONCLUSIVE
+        assert "call sites not executed" in result.reason
+
+    def test_version_outside_the_range_still_beats_a_call(self):
+        from ca9.engine import derive_verdict
+
+        evidence = _api_call_evidence(version_in_range=False)
+        result = derive_verdict(vuln("acme"), evidence, "acme", _narrowed_component(), None, False)
+        assert result.verdict == Verdict.UNREACHABLE_STATIC
+
+    def test_unloaded_submodule_without_a_call_is_still_unreachable(self):
+        from ca9.engine import derive_verdict
+
+        evidence = _api_call_evidence(
+            submodule_imported=False, api_usage_seen=False, api_usage_hits=()
+        )
+        result = derive_verdict(vuln("acme"), evidence, "acme", _narrowed_component(), None, False)
+        assert result.verdict == Verdict.UNREACHABLE_STATIC
+
+    def test_import_without_a_call_or_coverage_is_still_inconclusive(self):
+        from ca9.engine import derive_verdict
+
+        evidence = _api_call_evidence(
+            submodule_imported=None, api_usage_seen=False, api_usage_hits=()
+        )
+        result = derive_verdict(vuln("acme"), evidence, "acme", _narrowed_component(), None, False)
+        assert result.verdict == Verdict.INCONCLUSIVE
