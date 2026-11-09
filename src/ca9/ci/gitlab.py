@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from ca9.ci import jobs as jobtools
-from ca9.ci.model import ActionRef, Job, Workflow
+from ca9.ci.images import image_pinned, image_reference
+from ca9.ci.model import ActionRef, Job, Tool, Workflow
 from ca9.ci.shell import ScriptFacts, ShellContext, scan_script
 from ca9.ci.yamlload import LineList, LineMap, YamlError, as_strings, load_file
 
@@ -37,8 +38,8 @@ _RESERVED = frozenset(
         "spec",
     }
 )
-_INHERITED_DEFAULTS = ("before_script", "after_script", "tags", "cache", "id_tokens")
-_GLOBAL_DEFAULTS = ("before_script", "after_script", "cache")
+_INHERITED_DEFAULTS = ("before_script", "after_script", "tags", "cache", "id_tokens", "image")
+_GLOBAL_DEFAULTS = ("before_script", "after_script", "cache", "image")
 _SKIP_GLOB_DIRS = frozenset({".git", "node_modules"})
 _VAR_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 _PREDEFINED_RE = re.compile(
@@ -434,6 +435,11 @@ def _job(
         yarn_berry=project.get("yarn_berry", False),
     )
     facts = ScriptFacts()
+    image = image_reference(node.get("image"))
+    if image is not None:
+        facts.other_tools.append(
+            Tool(image, "container", image_pinned(image), line, manager="container")
+        )
     contexts: dict[tuple[int, ...], str] = {}
     for index, (text, script_line) in enumerate(scripts):
         start = script_line or line

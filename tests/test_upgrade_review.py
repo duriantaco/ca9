@@ -25,8 +25,11 @@ class Registry:
         self.documents: dict[str, bytes] = {}
         self.archives: dict[str, bytes] = {}
         self.requests: list[str] = []
+        self.ranges: list[str] = []
         monkeypatch.setattr(fetch, "_fetch_registry_json", self.document)
         monkeypatch.setattr(fetch, "_download_artifact", self.download)
+        monkeypatch.setattr(fetch, "_read_artifact_range", self.read_range)
+        monkeypatch.setattr(fetch, "_read_artifact_ranges", self.read_ranges)
 
     def document(self, url, config, accept="application/json"):
         self.requests.append(url)
@@ -38,6 +41,16 @@ class Registry:
         assert url_validator(url)
         self.requests.append(url)
         destination.write_bytes(self.archives[url])
+
+    def read_range(self, url, start, length, size, config):
+        self.ranges.append(url)
+        raw = self.archives[url]
+        if len(raw) != size:
+            raise fetch.RangeNotServed(f"{url} is not {size} bytes")
+        return raw[start : start + length]
+
+    def read_ranges(self, url, spans, size, config):
+        return [self.read_range(url, start, end - start, size, config) for start, end in spans]
 
     def npm(self, name, version, files, *, manifest=None, user=None, maintainers=("alice",)):
         package = {"name": name, "version": version, "main": "index.js"}
@@ -162,9 +175,19 @@ def test_new_startup_hooks_block_but_path_only_pth_does_not(registry):
     result, receipt = _one("pypi", "demo", "1.0", "1.1")
 
     assert result["status"] == "reviewed"
-    assert _kinds(result, "block") == ["new_pth_code", "new_pth_code", "new_sitecustomize"]
+    assert _kinds(result, "block") == [
+        "new_import_time_exec",
+        "new_pth_code",
+        "new_pth_code",
+        "new_sitecustomize",
+    ]
     paths = {delta["path"] for delta in result["block"]}
-    assert paths == {"demo_init.pth", "demo_boot.pth", "demo-1.1.data/purelib/sitecustomize.py"}
+    assert paths == {
+        "_demo_boot.py",
+        "demo_init.pth",
+        "demo_boot.pth",
+        "demo-1.1.data/purelib/sitecustomize.py",
+    }
     pth = next(delta for delta in result["block"] if delta["path"] == "demo_init.pth")
     assert pth["line"] == 1 and "subprocess.Popen" in pth["snippet"]
     shipped = [delta for delta in result["warn"] if delta["path"] == "demo_cov.pth"]
@@ -208,7 +231,7 @@ def test_decode_and_exec_split_across_variables_blocks(registry):
     assert result["block"][0]["path"] == "demo/util.py"
 
 
-def test_import_time_process_warns_only_for_module_level_code(registry):
+def test_import_time_process_blocks_only_for_module_level_code(registry):
     registry.pypi("demo", "1.0", wheel={**BASE, "demo/cli.py": "def main():\n    pass\n"})
     init = "import subprocess, sys\nfrom . import cli\nsubprocess.Popen([sys.executable, 'x.py'])\n"
     cli = (
@@ -219,11 +242,11 @@ def test_import_time_process_warns_only_for_module_level_code(registry):
 
     result, _receipt = _one("pypi", "demo", "1.0", "1.1")
 
-    assert result["block"] == []
-    assert _kinds(result, "warn") == ["new_import_time_exec", "new_import_time_network"]
-    exec_warn, network_warn = result["warn"]
-    assert exec_warn["path"] == "demo/__init__.py" and exec_warn["line"] == 3
-    assert network_warn["path"] == "demo/cli.py" and network_warn["line"] == 7
+    assert result["warn"] == []
+    assert _kinds(result, "block") == ["new_import_time_exec", "new_import_time_network"]
+    exec_block, network_block = result["block"]
+    assert exec_block["path"] == "demo/__init__.py" and exec_block["line"] == 3
+    assert network_block["path"] == "demo/cli.py" and network_block["line"] == 7
 
 
 def test_url_requirement_blocks_and_registry_requirement_is_info(registry):
@@ -328,7 +351,7 @@ def test_npm_install_hook_git_dependency_and_agent_files(registry):
     ]
 
 
-def test_npm_publisher_capability_and_obfuscation_warnings(registry):
+def test_npm_publisher_and_capability_warnings_and_obfuscation_block(registry):
     trusted = {"name": "GitHub Actions", "trustedPublisher": {"id": "github"}}
     registry.npm("sample", "1.0.0", {"index.js": "module.exports = 1;\n"}, user=trusted)
     obfuscated = "".join(f"var _0x{index:04x}=_0x{index + 1:04x};" for index in range(1500))
@@ -346,12 +369,8 @@ def test_npm_publisher_capability_and_obfuscation_warnings(registry):
     result, _receipt = _one("npm", "sample", "1.0.0", "1.0.1")
     upgrade_back, _receipt = _one("npm", "sample", "1.0.1", "1.0.2")
 
-    assert result["block"] == []
-    assert _kinds(result, "warn") == [
-        "new_import_time_exec",
-        "obfuscation_growth",
-        "publisher_change",
-    ]
+    assert _kinds(result, "block") == ["obfuscation_growth"]
+    assert _kinds(result, "warn") == ["new_import_time_exec", "publisher_change"]
     assert upgrade_back["warn"] == [] and upgrade_back["block"] == []
 
 
@@ -524,7 +543,7 @@ def _new(ecosystem, name, version):
     return report["results"][0]
 
 
-def test_new_npm_package_install_hook_warns_but_obfuscated_dropper_blocks(registry):
+def test_new_npm_package_install_hooks_block_and_dropper_names_its_file(registry):
     registry.npm(
         "fastbuild",
         "1.0.0",
@@ -574,16 +593,16 @@ def test_new_npm_package_install_hook_warns_but_obfuscated_dropper_blocks(regist
     helper = _new("npm", "plain-helper", "4.2.1")
 
     assert benign["basis"] == "new_package" and benign["old"] is None
-    assert benign["block"] == []
-    assert {"new_install_hook", "new_import_time_exec"} <= set(_kinds(benign, "warn"))
+    assert _kinds(benign, "block") == ["new_install_hook"]
+    assert "new_import_time_exec" in _kinds(benign, "warn")
     assert dropper["basis"] == "new_package"
-    assert _kinds(dropper, "block") == ["new_decode_exec"]
-    assert "new_install_hook" in _kinds(dropper, "warn")
-    assert _kinds(helper, "block") == ["new_decode_exec"]
-    assert [delta["path"] for delta in helper["block"]] == ["setup.js"]
+    assert _kinds(dropper, "block") == ["new_decode_exec", "new_install_hook"]
+    assert sorted(set(_kinds(helper, "block"))) == ["new_decode_exec", "new_install_hook"]
+    decoded = [delta["path"] for delta in helper["block"] if delta["kind"] == "new_decode_exec"]
+    assert decoded == ["setup.js"]
 
 
-def test_new_pypi_package_blocks_only_high_signal_startup_code(registry):
+def test_new_pypi_package_startup_code_blocks_at_upgrade_levels(registry):
     registry.pypi(
         "toolkit",
         "2.0",
@@ -612,11 +631,16 @@ def test_new_pypi_package_blocks_only_high_signal_startup_code(registry):
     benign = _new("pypi", "toolkit", "2.0")
     loader = _new("pypi", "cookjar", "1.0")
 
-    assert benign["block"] == []
-    assert sorted(_kinds(benign, "warn")) == ["new_import_time_exec", "new_sitecustomize"]
-    assert [delta["kind"] for delta in benign["info"]] == ["new_native_binary"]
+    assert _kinds(benign, "block") == ["new_pth_code", "new_sitecustomize"]
+    assert _kinds(benign, "warn") == ["new_native_binary"]
+    assert all(delta["kind"] != "new_native_binary" for delta in benign["info"])
     assert "sdist not compared" in " ".join(benign["limitations"])
-    assert _kinds(loader, "block") == ["new_decode_exec", "new_pth_code", "new_sitecustomize"]
+    assert _kinds(loader, "block") == [
+        "new_decode_exec",
+        "new_import_time_network",
+        "new_pth_code",
+        "new_sitecustomize",
+    ]
 
 
 def test_entries_resolved_from_a_private_registry_are_never_looked_up_publicly(registry):

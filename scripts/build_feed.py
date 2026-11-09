@@ -14,8 +14,18 @@ entry. The ``*-releases`` datasets are still emitted empty so older clients keep
 loading the bundle; release age now comes from registry metadata (see
 ``ca9.release_age``).
 
+The bundle records ``osv_built_at``, when its OSV-derived datasets (malware,
+malware ranges, releases) were built, and expires ``--ttl-days`` after that.
+With ``--previous`` (the last published bundle) those datasets are carried over
+unchanged while they are younger than ``--osv-rebuild-hours`` (default 6, or the
+``CA9_OSV_REBUILD_HOURS`` environment variable; 0 rebuilds every run), so an
+hourly job downloads the OSV exports only every few hours. A previous bundle that
+cannot be read, records no ``osv_built_at``, or lacks a valid OSV dataset forces a
+full rebuild.
+
 Usage:
     python scripts/build_feed.py -o feed_build/latest.json
+    python scripts/build_feed.py -o feed_build/latest.json --previous prev-latest.json
 """
 
 from __future__ import annotations
@@ -23,6 +33,8 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import math
+import os
 import sys
 import urllib.request
 import zipfile
@@ -55,6 +67,14 @@ STAT_KEYS = (
     "bounded_skipped",
 )
 RANGE_STAT_KEYS = ("ranged", "range_unusable")
+OSV_DATASETS = tuple(
+    f"{ecosystem}-{kind}"
+    for ecosystem in OSV_ECOSYSTEMS.values()
+    for kind in ("malware", "malware-ranges", "releases")
+)
+OSV_REBUILD_ENV = "CA9_OSV_REBUILD_HOURS"
+DEFAULT_OSV_REBUILD_HOURS = "6"
+OSV_CLOCK_SKEW = timedelta(hours=1)
 
 
 def fetch_osv_export(osv_ecosystem: str, *, source_url: str | None = None) -> list[dict[str, Any]]:
@@ -365,6 +385,7 @@ def build_bundle_from_records(
         "schema": FEED_SCHEMA,
         "created_at": _iso(moment),
         "expires_at": _iso(moment + timedelta(days=ttl_days)),
+        "osv_built_at": _iso(moment),
         "datasets": build_datasets(
             records_by_osv_ecosystem,
             releases_by_ecosystem=releases_by_ecosystem,
@@ -389,6 +410,109 @@ def build_bundle(
     return build_bundle_from_records(
         records_by_osv_ecosystem, now=now, ttl_days=ttl_days, stats=stats
     )
+
+
+def reusable_osv_datasets(
+    previous: Any,
+    *,
+    now: datetime,
+    rebuild_hours: float,
+    ttl_days: int = DEFAULT_TTL_DAYS,
+) -> tuple[dict[str, Any] | None, str]:
+    """The previous bundle's OSV datasets when they may be carried over, and why.
+
+    Returns ``(None, reason)`` when a rebuild is needed: ``rebuild_hours`` is 0, the
+    previous bundle is unreadable or records no valid ``osv_built_at``, its OSV data
+    is at least ``rebuild_hours`` (or ``ttl_days``) old, or an OSV dataset is missing
+    or malformed.
+    """
+    if rebuild_hours <= 0:
+        return None, "the OSV datasets are rebuilt every run (rebuild interval 0)"
+    if not isinstance(previous, dict) or previous.get("schema") != FEED_SCHEMA:
+        return None, "the previous bundle could not be read"
+    built_at = _parse_iso(previous.get("osv_built_at"))
+    if built_at is None:
+        return None, "the previous bundle records no OSV build time"
+    if built_at > now + OSV_CLOCK_SKEW:
+        return None, "the previous OSV build time is in the future"
+    age_hours = (now - built_at).total_seconds() / 3600
+    if age_hours >= min(rebuild_hours, ttl_days * 24):
+        return (
+            None,
+            f"the previous OSV data is {age_hours:.1f}h old (rebuild every {rebuild_hours:g}h)",
+        )
+    datasets = previous.get("datasets")
+    if not isinstance(datasets, dict):
+        return None, "the previous bundle has no datasets"
+    carried: dict[str, Any] = {}
+    for name in OSV_DATASETS:
+        payload = datasets.get(name)
+        packages = None
+        if isinstance(payload, dict):
+            packages = payload.get("packages")
+        expected: type = list
+        if name.endswith("-releases"):
+            expected = dict
+        if not isinstance(packages, expected):
+            return None, f"the previous bundle has no valid {name} dataset"
+        carried[name] = payload
+    return carried, (
+        f"the previous OSV data is {age_hours:.1f}h old, under the {rebuild_hours:g}h rebuild "
+        "interval"
+    )
+
+
+def carried_forward_bundle(
+    previous: dict[str, Any],
+    datasets: dict[str, Any],
+    *,
+    now: datetime,
+    ttl_days: int = DEFAULT_TTL_DAYS,
+) -> dict[str, Any]:
+    """A new bundle that reuses ``datasets`` unchanged and keeps their ``osv_built_at``.
+
+    It expires ``ttl_days`` after the OSV data was built, not after this bundle, so
+    carrying data forward never extends how long stale OSV data stays current.
+    """
+    built_at = _parse_iso(previous.get("osv_built_at"))
+    if built_at is None:
+        raise ValueError("the previous bundle records no OSV build time")
+    return {
+        "schema": FEED_SCHEMA,
+        "created_at": _iso(now),
+        "expires_at": _iso(built_at + timedelta(days=ttl_days)),
+        "osv_built_at": previous["osv_built_at"],
+        "datasets": {name: datasets[name] for name in OSV_DATASETS},
+    }
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _read_bundle(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _rebuild_hours(value: str) -> float:
+    try:
+        hours = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of hours: {value!r}") from None
+    if math.isnan(hours) or hours < 0:
+        raise argparse.ArgumentTypeError(f"rebuild hours must be 0 or more: {value!r}")
+    return hours
 
 
 def _summary(record: dict[str, Any]) -> str:
@@ -441,6 +565,7 @@ def build_manifest(
         "schema": bundle.get("schema"),
         "built_at": _iso(now or datetime.now(timezone.utc)),
         "expires_at": bundle.get("expires_at"),
+        "osv_built_at": bundle.get("osv_built_at"),
         "malware_counts": malware_counts(bundle),
         "malware_range_counts": malware_range_counts(bundle),
         "sources": dict(source_urls or {}),
@@ -511,6 +636,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--pypi-source", default=None, help="Override URL for the PyPI OSV export zip."
     )
+    parser.add_argument(
+        "--previous",
+        type=Path,
+        default=None,
+        help="Previously published bundle; its OSV datasets are reused while young enough.",
+    )
+    parser.add_argument(
+        "--osv-rebuild-hours",
+        type=_rebuild_hours,
+        default=os.environ.get(OSV_REBUILD_ENV) or DEFAULT_OSV_REBUILD_HOURS,
+        help=f"Rebuild OSV datasets older than this (default 6, or ${OSV_REBUILD_ENV}; 0 = always).",
+    )
     args = parser.parse_args(argv)
 
     source_overrides: dict[str, str] = {}
@@ -519,11 +656,39 @@ def main(argv: list[str] | None = None) -> int:
     if args.pypi_source:
         source_overrides["PyPI"] = args.pypi_source
 
+    now = datetime.now(timezone.utc)
     stats: dict[str, dict[str, int]] = {}
-    bundle = build_bundle(ttl_days=args.ttl_days, source_urls=source_overrides, stats=stats)
-    manifest = build_manifest(
-        bundle, source_urls=resolved_source_urls(source_overrides), stats=stats
-    )
+    previous = None
+    reused = None
+    reason = "no previous bundle was given"
+    if args.previous is not None:
+        previous = _read_bundle(args.previous)
+        reused, reason = reusable_osv_datasets(
+            previous, now=now, rebuild_hours=args.osv_rebuild_hours, ttl_days=args.ttl_days
+        )
+    if reused is not None and isinstance(previous, dict):
+        bundle = carried_forward_bundle(previous, reused, now=now, ttl_days=args.ttl_days)
+        previous_info = previous.get("build_info")
+        if not isinstance(previous_info, dict):
+            previous_info = {}
+        sources = previous_info.get("sources")
+        if not isinstance(sources, dict):
+            sources = resolved_source_urls(source_overrides)
+        previous_stats = previous_info.get("malware_stats")
+        if isinstance(previous_stats, dict):
+            stats = previous_stats
+        manifest = build_manifest(bundle, source_urls=sources, now=now, stats=stats or None)
+        print(f"feed OSV datasets reused: {reason}; built at {bundle['osv_built_at']}")
+    else:
+        bundle = build_bundle(
+            now=now, ttl_days=args.ttl_days, source_urls=source_overrides, stats=stats
+        )
+        manifest = build_manifest(
+            bundle, source_urls=resolved_source_urls(source_overrides), now=now, stats=stats
+        )
+        print(f"feed OSV datasets rebuilt: {reason}")
+    manifest["osv_rebuilt"] = reused is None
+    manifest["osv_reason"] = reason
     bundle["build_info"] = manifest
     counts = manifest["malware_counts"]
 

@@ -179,7 +179,8 @@ update behaves as before.
 
 Feed bundles use schema `ca9.feed.v1` and always contain `npm-malware`, `pypi-malware`,
 `npm-releases`, and `pypi-releases`. Newer bundles add the optional
-`npm-malware-ranges` and `pypi-malware-ranges` datasets. Feed snapshots are stored under
+`npm-malware-ranges` and `pypi-malware-ranges` datasets, and the optional
+`npm-suspicious` and `pypi-suspicious` datasets described below. Feed snapshots are stored under
 `~/.cache/ca9/feed/` and verified with SHA-256 content hashes before use. Tampered feeds
 always block.
 
@@ -242,6 +243,90 @@ This covers a registry or network outage, a version the registry does not list, 
 publish time that does not parse, an npm packument larger than 64 MiB (ca9 stops
 reading registry metadata at that size), and a private registry that needs
 credentials ca9 does not send.
+
+### How often the hosted feed changes
+
+`.github/workflows/feed.yml` publishes a new `latest.json` to the `feed` branch every
+hour.
+
+- The OSV malware data (`*-malware`, `*-malware-ranges`, `*-releases`) is rebuilt from
+  OSV every 6 hours. In the hours between, those datasets are copied unchanged from the
+  previously published bundle. If that bundle cannot be read, they are rebuilt that hour.
+- The bundle records `osv_built_at`, the time the OSV data was built. `ca9 feed status`
+  prints it as `OSV data built`, and `api.feed_status()` returns it. The bundle expires
+  7 days after `osv_built_at`, so copying the data forward never makes old OSV data look
+  current for longer.
+- The suspicious-release datasets below are refreshed every hour.
+- Maintainers can change the rebuild interval with the workflow input `osv_rebuild_hours`
+  (manual runs) or the repository variable `CA9_OSV_REBUILD_HOURS`; `0` rebuilds every
+  hour.
+- Nothing changes on your machine until you update: run `ca9 feed update`, or call
+  `api.refresh_feed()`, which downloads only when the installed feed is older than
+  `max_age_hours` (6 by default).
+
+### Suspicious new releases (sentinel)
+
+Every hour, `scripts/sentinel.py` checks new releases of the most downloaded npm and PyPI
+packages (the first 5,000 names of `sentinel/watch-npm.json` and
+`sentinel/watch-pypi.json`). It compares each new version with the release before it,
+using ca9's upgrade review: a static diff of the two published files. Package code is
+downloaded and read, never installed or run. Versions that look malicious go into two
+optional datasets, `npm-suspicious` and `pypi-suspicious`, often before anyone has
+reported them to OSV.
+
+What makes an entry:
+
+- `block`: the new version adds code that runs at install, import or interpreter start: a
+  `.pth` file with code, `sitecustomize`, an install script or build hook, code that
+  decodes and runs data, a git or URL dependency, an agent or editor hook file, or a
+  command named like a system tool (`node`, `npm`, `git`, `python`).
+- `warn`: other review findings that are more often packaging accidents (ambiguous
+  archive contents, imported bytecode without source), and two combinations: a publisher
+  change together with new import-time network, process or obfuscated code; or obfuscated
+  code together with new import-time network or process code.
+- A single warning on its own never makes an entry, and prereleases are not reviewed.
+
+Each entry lists `name`, `version`, `previous` (the version it was compared with),
+`kinds`, `verdict`, a few short `evidence` lines, `reviewed_at` and `published_at`.
+Entries are kept for 30 days. They are the sentinel's own judgment from a static review,
+not confirmed malware reports, so they can be wrong.
+
+`api.suspicious_matches(packages)` matches exact versions against these datasets
+offline and returns findings with signal type `suspicious_release` and action `block` or
+`warn`. Skylos can call it. ca9's own `vet`, `protect` and `run` commands do not act on these
+datasets yet, and older ca9 versions ignore them.
+
+Each dataset also carries the sentinel's state and a `coverage` record of the last run:
+packages watched and checked, new versions seen, reviewed, incomplete, flagged and
+deferred. The build log prints the same numbers, so a partial run is visible.
+
+#### Reporting a false positive
+
+Reviewed false positives are listed in `sentinel/allow.json`. An allowlisted version is
+never published, and one that is already published drops out at the next hourly run.
+
+1. Open an issue or pull request naming the package, the version and the `kinds` it was
+   flagged for.
+2. A maintainer reads the flagged change (the `evidence` lines name the files and lines)
+   and decides whether it is benign.
+3. If it is, the pull request adds an entry to `entries`:
+
+```json
+{
+  "ecosystem": "npm",
+  "name": "example-pkg",
+  "version": "2.3.1",
+  "kinds": ["new_install_hook"],
+  "reason": "postinstall downloads the package's own prebuilt binary from its GitHub releases",
+  "reviewed_by": "maintainer-github-handle"
+}
+```
+
+Every entry needs `ecosystem` (`npm` or `pypi`), `name`, an exact `version` or `"*"`, a
+`reason`, and `reviewed_by`; an entry without them fails the feed build, so nothing is
+published until it is fixed. `kinds` is optional and limits the entry to those kinds. Use
+`"*"` only when every future version will legitimately do the same thing, and always give
+`kinds` with it, so a later release that adds something different is still flagged.
 
 ## Malicious Advisory Query
 

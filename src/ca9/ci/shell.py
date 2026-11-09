@@ -13,6 +13,8 @@ import shlex
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from ca9.agent_config.mcp_launch import DOCKER_RUN_VALUE_FLAGS
+from ca9.ci.images import image_pinned, image_reference
 from ca9.ci.model import MAX_NAME_LENGTH, Download, Indirect, Install, Publish, Tool
 
 MAX_SCRIPT_CHARS = 200_000
@@ -1839,9 +1841,51 @@ def _dotnet(
             scanner.add_other_tool(spec, "dotnet", bool(version), command.line)
 
 
+def _container_run(
+    scanner: _Scanner, args: list[str], command: _Command, assigns: dict[str, str], depth: int
+) -> None:
+    """``docker run IMAGE`` / ``podman container run IMAGE``: the image runs with the job's
+    environment and workspace, so it is a tool of the job."""
+    index = 0
+    while index < len(args) and args[index].startswith("-"):
+        skip = "=" not in args[index] and args[index] in _DOCKER_VALUE_FLAGS
+        index += 1 + int(skip)
+    if args[index : index + 2] == ["container", "run"]:
+        index += 2
+    elif args[index : index + 1] == ["run"]:
+        index += 1
+    else:
+        return
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            index += 1
+            break
+        if not arg.startswith("-"):
+            break
+        skip = "=" not in arg and arg in DOCKER_RUN_VALUE_FLAGS
+        index += 1 + int(skip)
+    if index >= len(args) or PLACEHOLDER in args[index]:
+        return
+    image = image_reference(args[index])
+    if image is not None:
+        scanner.facts.other_tools.append(
+            Tool(
+                image,
+                "docker_run",
+                image_pinned(image),
+                command.line,
+                manager="docker_run",
+                order=scanner.order(),
+            )
+        )
+
+
 _HANDLERS["gem"] = _gem
 _HANDLERS["cargo"] = _cargo
 _HANDLERS["dotnet"] = _dotnet
+_HANDLERS["docker"] = _container_run
+_HANDLERS["podman"] = _container_run
 
 
 def is_archive(path: str | None) -> bool:

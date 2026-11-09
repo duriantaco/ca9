@@ -300,7 +300,11 @@ built-in default feed URL on the project's published `feed` branch. Use `--from`
 Feed bundles use schema `ca9.feed.v1` with `npm-malware`, `pypi-malware`,
 `npm-releases`, and `pypi-releases`, plus the optional `npm-malware-ranges` and
 `pypi-malware-ranges` datasets (bounded OSV malware ranges, matched with npm semver or
-PEP 440 ordering; older clients ignore them). ca9 stores snapshots under `~/.cache/ca9/feed/` and
+PEP 440 ordering; older clients ignore them) and the optional `npm-suspicious` and
+`pypi-suspicious` datasets (new releases of popular packages flagged by the hourly
+sentinel; see the supply-chain guide). The hosted feed is published every hour; its OSV
+malware data is rebuilt every 6 hours, and `ca9 feed status` shows when as
+`OSV data built`. ca9 stores snapshots under `~/.cache/ca9/feed/` and
 verifies per-dataset SHA-256 hashes before use. `http://` sources are refused, downloads
 are capped at 256 MiB, snapshots dated more than a day in the future are rejected, and a
 snapshot is treated as stale no later than 30 days after it was built. A missing or stale

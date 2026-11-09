@@ -1,11 +1,12 @@
 name: Publish package feed
 
-# Builds the default ca9 malware feed daily and publishes it to the `feed`
-# branch as latest.json. `ca9 feed update` (zero-arg) points at:
+# Builds the default ca9 feed hourly and publishes it to the `feed` branch as
+# latest.json; the OSV malware datasets are rebuilt every 6 hours by default.
+# `ca9 feed update` (zero-arg) points at:
 #   https://raw.githubusercontent.com/duriantaco/ca9/feed/latest.json
 #
-# The build job runs third-party code (pip, the feed builder) with a read-only
-# token. Only the publish job can write, and it runs no project code. Each
+# The build job runs third-party code (pip, the feed builder, the sentinel) with a
+# read-only token. Only the publish job can write, and it runs no project code. Each
 # published bundle carries a GitHub artifact attestation signed by this
 # workflow. `ca9 feed update --require-attestation` checks it with:
 #   gh attestation verify latest.json --repo duriantaco/ca9 \
@@ -14,8 +15,14 @@ name: Publish package feed
 
 on:
   schedule:
-    - cron: "17 6 * * *" # daily, 06:17 UTC
-  workflow_dispatch: {}
+    - cron: "17 * * * *" # hourly, at minute 17
+  workflow_dispatch:
+    inputs:
+      osv_rebuild_hours:
+        description: "Rebuild the OSV datasets when the published ones are this many hours old (0 = now)"
+        required: false
+        default: "6"
+        type: string
 
 permissions:
   contents: read
@@ -27,6 +34,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     permissions:
       contents: read
     steps:
@@ -40,22 +48,37 @@ jobs:
       - name: Install ca9 (provides the `packaging` dependency)
         run: pip install -e .
 
-      - name: Fetch previous manifest (collapse-guard input)
+      - name: Fetch previous manifest and bundle (collapse guard, sentinel watermark)
         run: |
           set -eu
           mkdir -p feed_build
           git fetch origin feed || true
           git show origin/feed:manifest.json > feed_build/prev-manifest.json 2>/dev/null \
             || echo '{}' > feed_build/prev-manifest.json
+          git show origin/feed:latest.json > feed_build/prev-latest.json 2>/dev/null \
+            || rm -f feed_build/prev-latest.json
 
-      - name: Build feed bundle
+      - name: Build feed bundle (OSV datasets reused from the previous bundle until due)
+        env:
+          CA9_OSV_REBUILD_HOURS: ${{ inputs.osv_rebuild_hours || vars.CA9_OSV_REBUILD_HOURS || '6' }}
         run: |
           set -euo pipefail
           python scripts/build_feed.py \
             -o feed_build/latest.json \
             --manifest feed_build/manifest.json \
             --min-malware 100 \
-            --compare-manifest feed_build/prev-manifest.json | tee -a "$GITHUB_STEP_SUMMARY"
+            --compare-manifest feed_build/prev-manifest.json \
+            --previous feed_build/prev-latest.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Review new releases of popular packages (sentinel, static and read-only)
+        run: |
+          set -euo pipefail
+          python scripts/sentinel.py run \
+            --previous feed_build/prev-latest.json \
+            --bundle feed_build/latest.json \
+            --manifest feed_build/manifest.json \
+            --time-budget-minutes 30 | tee -a "$GITHUB_STEP_SUMMARY"
+          rm -f feed_build/prev-latest.json
 
       - name: Upload feed bundle
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -65,7 +88,7 @@ jobs:
             feed_build/latest.json
             feed_build/manifest.json
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
   publish:
     needs: build

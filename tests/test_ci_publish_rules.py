@@ -703,3 +703,160 @@ def test_gitlab_include_cap_is_incomplete(tmp_path):
 
     assert result["receipt"]["complete"] is False
     assert result["receipt"]["jobs"] == 150
+
+
+WORKFLOW_RUN = """
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+{job_extra}    steps:
+      - uses: actions/checkout@{sha}
+        with:
+          ref: ${{{{ github.event.workflow_run.head_sha }}}}
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{{{ secrets.NPM_TOKEN }}}}
+"""
+
+
+@pytest.mark.parametrize(
+    ("job_extra", "severity"),
+    [
+        ("    environment: release\n", "LOW"),
+        ("", "HIGH"),
+        ("    if: github.event.workflow_run.conclusion == 'success'\n", "HIGH"),
+        ("    if: github.event_name != 'workflow_run'\n", None),
+    ],
+)
+def test_publish_after_workflow_run_is_an_outside_route(tmp_path, job_extra, severity):
+    workflow = WORKFLOW_RUN.format(job_extra=job_extra, sha=SHA)
+
+    findings = _by_signal(_repo(tmp_path, {"release.yml": workflow}), D)
+
+    assert [item["severity"] for item in findings] == [severity] * int(severity is not None)
+    if findings:
+        assert findings[0]["evidence"]["events"] == ["workflow_run"]
+
+
+IMAGE_JOB = """
+on:
+  push:
+    branches: [main]
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+{job_extra}    steps:
+      - uses: actions/checkout@{sha}
+{steps}      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{{{ secrets.NPM_TOKEN }}}}
+"""
+DIGEST = "sha256:" + "ab" * 32
+
+
+@pytest.mark.parametrize(
+    ("job_extra", "steps", "tool"),
+    [
+        (
+            "    container:\n      image: ghcr.io/someone/builder:latest\n",
+            "",
+            ("ghcr.io/someone/builder:latest", "container"),
+        ),
+        ("    container: someone/builder:1.2\n", "", ("someone/builder:1.2", "container")),
+        ("    container: node\n", "", ("node", "container")),
+        (
+            "",
+            "      - uses: docker://someone/tool:latest\n",
+            ("someone/tool:latest", "docker_action"),
+        ),
+        (
+            "",
+            "      - run: docker run --rm -v $PWD:/w -e CI=1 tool/x:latest build\n",
+            ("tool/x:latest", "docker_run"),
+        ),
+        (
+            "",
+            "      - run: podman container run --pull=always node:lts-alpine npm test\n",
+            ("node:lts-alpine", "docker_run"),
+        ),
+    ],
+)
+def test_unpinned_container_images_in_publish_jobs_are_unpinned_tools(
+    tmp_path, job_extra, steps, tool
+):
+    workflow = IMAGE_JOB.format(job_extra=job_extra, steps=steps, sha=SHA)
+
+    findings = _by_signal(_repo(tmp_path, {"release.yml": workflow}), A)
+
+    assert [item["severity"] for item in findings] == ["HIGH"]
+    tools = [(item["name"], item["route"]) for item in findings[0]["evidence"]["tools"]]
+    assert tools == [tool]
+
+
+@pytest.mark.parametrize(
+    ("job_extra", "steps"),
+    [
+        (f"    container:\n      image: ghcr.io/someone/builder@{DIGEST}\n", ""),
+        ("    container: node:22-bookworm\n", ""),
+        ("    container:\n      image: python:3.12-slim\n", ""),
+        ("", f"      - uses: docker://someone/tool@{DIGEST}\n"),
+        ("", "      - run: docker run --rm node:22-alpine npm test\n"),
+        ("", "      - run: docker build -t app . && docker images\n"),
+    ],
+)
+def test_digest_pinned_or_versioned_official_images_stay_quiet(tmp_path, job_extra, steps):
+    workflow = IMAGE_JOB.format(job_extra=job_extra, steps=steps, sha=SHA)
+
+    assert _by_signal(_repo(tmp_path, {"release.yml": workflow}), A) == []
+
+
+def test_container_images_in_jobs_without_credentials_stay_quiet(tmp_path):
+    workflow = f"""
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: someone/builder:latest
+    steps:
+      - uses: actions/checkout@{SHA}
+      - run: docker run --rm tool/x:latest test
+"""
+
+    assert _fired(_repo(tmp_path, {"ci.yml": workflow})) == set()
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "tool"),
+    [
+        ("publish:\n  image: someone/builder:latest\n", "someone/builder:latest"),
+        ("image: node\npublish:\n", "node"),
+        (
+            "default:\n  image: registry.example.com/team/ci:main\npublish:\n",
+            "registry.example.com/team/ci:main",
+        ),
+    ],
+)
+def test_gitlab_job_images_in_publish_jobs_are_unpinned_tools(tmp_path, pipeline, tool):
+    body = "  script:\n    - npm publish\n  variables:\n    NPM_TOKEN: $NPM_TOKEN\n"
+    result = _gitlab(tmp_path, {".gitlab-ci.yml": pipeline + body})
+
+    findings = [item for item in result["findings"] if item["signal_type"] == A]
+
+    assert [entry["name"] for entry in findings[0]["evidence"]["tools"]] == [tool]
+
+
+def test_gitlab_versioned_or_opted_out_images_stay_quiet(tmp_path):
+    pipeline = (
+        "image: someone/builder:latest\n"
+        "publish:\n  image: node:22\n  script:\n    - npm publish\n"
+        "release:\n  inherit:\n    default: false\n  script:\n    - npm publish\n"
+    )
+
+    result = _gitlab(tmp_path, {".gitlab-ci.yml": pipeline})
+
+    assert [item for item in result["findings"] if item["signal_type"] == A] == []

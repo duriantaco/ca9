@@ -24,17 +24,26 @@ line that never had it, after newer lines did; can be a hand-published backport)
 
 ``feed_status(feed_dir=None)`` reports the malware feed state (ready, stale,
 missing, tampered); a stale feed is still matched but leaves the receipt
-incomplete.
+incomplete. ``refresh_feed`` updates an installed feed older than a given age,
+within a time limit, and never raises.
+
+``suspicious_matches(packages, feed_dir=None)`` matches exact versions against
+the feed's ``*-suspicious`` datasets: new releases of popular packages that
+ca9's hourly sentinel flagged from a static review before any public malware
+report. Its findings use signal type ``suspicious_release``.
 """
 
 from __future__ import annotations
 
 import contextlib
 import importlib
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import Any
+
+from packaging.version import InvalidVersion, Version
 
 from ca9.analyzers.supply_chain import (
     DEFAULT_TRUSTED_INDEXES,
@@ -89,6 +98,8 @@ _SEVERITIES = {"critical": "CRITICAL", "high": "HIGH", "medium": "MEDIUM", "low"
 _SEVERITY_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 _ACTIONS = frozenset({"block", "warn", "investigate"})
 _AGE_STATUSES = frozenset({"old_enough", "too_new", "unknown"})
+_NPM_EXACT_VERSION = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?")
+_RANGE_CHARACTERS = re.compile(r"[\s,<>=~*^|:@]")
 _REMEDIATION = {
     "dependency_confusion": (
         "Install internal packages only from the private index: make it the only index "
@@ -121,6 +132,10 @@ _REMEDIATION = {
     "provenance_regression": (
         "Do not install this version until the maintainers confirm it; pin the previous "
         "version that was published with provenance."
+    ),
+    "suspicious_release": (
+        "Do not install this version until it is confirmed safe; pin the previous release "
+        "and check the package's advisories."
     ),
 }
 
@@ -190,7 +205,11 @@ def evaluate_packages(
     counted in the receipt, whose ``complete`` is false whenever anything that was
     asked for was not checked. Malware uses the installed ca9 feed (``feed_dir``
     option, else the default feed); release age and provenance run only with
-    ``network`` and stop after ``max_lookups`` registry requests.
+    ``network`` and stop after ``max_lookups`` registry requests. A version that is not
+    exact (a range, tag, alias or alternative) is undecided: whole-package malware records
+    still match it, but the receipt counts it as malware_version_not_exact (and
+    release_age_version_not_exact / provenance_version_not_exact, with no lookup) and is
+    not complete.
     """
     receipt = _Receipt()
     active = _parse_options(options, receipt)
@@ -268,8 +287,11 @@ def malware_matches(
 def feed_status(*, feed_dir: str | Path | None = None) -> dict[str, Any]:
     """State of the installed malware feed: ready, stale, missing, or tampered.
 
-    Returns ``state``, ``action`` (pass|warn|block), ``reason``, ``created_at`` and
-    ``expires_at`` (the effective expiry, ISO 8601). Never raises.
+    Returns ``state``, ``action`` (pass|warn|block), ``reason``, ``created_at``,
+    ``expires_at`` (the effective expiry, ISO 8601) and ``osv_built_at`` (when the
+    OSV-derived malware and release datasets were built; the hosted bundle is
+    published hourly but rebuilds them every few hours; None for feeds that do not
+    record it). Never raises.
     """
     status_function = _optional_function("ca9.package_feed", "feed_status")
     if status_function is None:
@@ -293,6 +315,7 @@ def feed_status(*, feed_dir: str | Path | None = None) -> dict[str, Any]:
             with contextlib.suppress(TypeError, ValueError, AttributeError):
                 result["expires_at"] = effective().isoformat()
         result["snapshot_id"] = getattr(snapshot, "snapshot_id", None)
+        result["osv_built_at"] = getattr(snapshot, "osv_built_at", None)
     return result
 
 
@@ -303,7 +326,85 @@ def _feed_status_dict(state: str, action: str, reason: str) -> dict[str, Any]:
         "reason": reason,
         "created_at": None,
         "expires_at": None,
+        "osv_built_at": None,
     }
+
+
+def suspicious_matches(
+    packages: Iterable[Mapping[str, Any]],
+    *,
+    feed_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Match exact package versions against the sentinel's suspicious releases, offline.
+
+    Same input and finding shape as ``malware_matches``. ``signal_type`` is
+    ``suspicious_release``; ``action`` is block (HIGH) or warn (MEDIUM), from the
+    sentinel's verdict. ``evidence`` carries ``kinds`` (upgrade-review kinds the
+    release added), ``verdict``, ``previous`` (the release it was compared with, or
+    None), ``evidence`` (short strings), ``reviewed_at``, ``published_at`` and
+    ``snapshot_id``. Entries without a version and malformed entries are ignored.
+    Raises FeedUnavailable when the feed or its matcher is missing, or when the
+    installed feed has no suspicious dataset for an ecosystem asked about, so an
+    empty list always means "checked, no match".
+    """
+    receipt = _Receipt()
+    entries = _parse_entries(packages, receipt)
+    finder = _optional_function("ca9.package_feed", "find_suspicious_matches")
+    if finder is None:
+        raise FeedUnavailable("ca9.package_feed.find_suspicious_matches is not available")
+    try:
+        matches = finder(
+            [entry.package for entry in entries],
+            cache_dir=_optional_path(feed_dir),
+        )
+    except Exception as exc:
+        raise FeedUnavailable(str(exc)) from exc
+    return _malware_dicts(matches, entries)
+
+
+def refresh_feed(
+    *,
+    max_age_hours: float = 6,
+    timeout_seconds: float = 60,
+    feed_dir: str | Path | None = None,
+    source: str | None = None,
+    require_attestation: bool = False,
+) -> dict[str, Any]:
+    """Update the installed feed only when it is older than ``max_age_hours``.
+
+    Uses the same source and checks as ``ca9 feed update`` (``source``, else
+    ``CA9_FEED_URL``, else the hosted feed; https only, size cap, hashes, rollback
+    refusal, and ``gh attestation verify`` with ``require_attestation``) and gives up
+    after ``timeout_seconds`` without a partial install. After an attempt it waits an
+    hour (or ``max_age_hours`` if shorter) before trying again. Returns ``status``
+    (fresh|recently_checked|updated|current|failed|timeout), ``reason``, ``source``,
+    ``created_at`` and ``snapshot_id`` of the installed snapshot afterwards, and
+    ``previous_created_at``. Never raises and never runs or reads project code.
+    """
+    result = {
+        "status": "failed",
+        "reason": "",
+        "source": source,
+        "created_at": None,
+        "snapshot_id": None,
+        "previous_created_at": None,
+    }
+    numbers = (max_age_hours, timeout_seconds)
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in numbers):
+        return {**result, "reason": "max_age_hours and timeout_seconds must be numbers"}
+    refresher = _optional_function("ca9.package_feed", "refresh_feed")
+    if refresher is None:
+        return {**result, "reason": "ca9.package_feed.refresh_feed is not available"}
+    try:
+        return refresher(
+            max_age_hours=max_age_hours,
+            timeout_seconds=timeout_seconds,
+            cache_dir=_optional_path(feed_dir),
+            source=source,
+            require_attestation=require_attestation is True,
+        )
+    except Exception as exc:
+        return {**result, "reason": f"feed refresh failed: {exc}"[:300]}
 
 
 def check_provenance(
@@ -313,16 +414,29 @@ def check_provenance(
     *,
     cache_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Compare an npm release's provenance with the stable releases before it.
+    """Compare a release's provenance with the stable releases uploaded before it.
 
-    Returns ``status`` ok|regressed|unknown|not_applicable and ``evidence``.
-    Network and registry errors return unknown.
+    npm: registry attestations (``dist.attestations``) or a trusted publisher. PyPI: PEP
+    740 attestations from the Integrity API; ``regressed`` when earlier stable releases on
+    the release line were attested by a Trusted Publisher and this one has no
+    attestation, a publisher identity (repository, workflow...) none of them had, or
+    unattested files where every earlier file was attested. Evidence lists the releases
+    checked, ``previous_publishers`` and ``this_version``. Returns ``status``
+    ok|regressed|unknown|not_applicable; network errors, a version the registry does not
+    list and a project with no earlier stable release return unknown.
     """
-    if not isinstance(ecosystem, str) or ecosystem.strip().lower() != "npm":
+    normalized = ""
+    if isinstance(ecosystem, str):
+        normalized = ecosystem.strip().lower()
+    if normalized == "pypi":
+        from ca9.pypi_provenance import check_pypi_provenance
+
+        return check_pypi_provenance(name, version, cache_dir=_optional_path(cache_dir))
+    if normalized != "npm":
         return {
             "status": "not_applicable",
             "evidence": {},
-            "reason": "provenance is checked for npm packages only",
+            "reason": "provenance is checked for npm and PyPI packages only",
         }
     return check_npm_provenance(name, version, cache_dir=_optional_path(cache_dir))
 
@@ -587,7 +701,26 @@ def _malware_findings(
         return []
     if feed_status(feed_dir=options.feed_dir)["state"] == "stale":
         receipt.skip("malware_feed_stale", len(entries))
+    receipt.skip("malware_version_not_exact", sum(not _exact_version(entry) for entry in entries))
     return _malware_dicts(matches, entries)
+
+
+def _exact_version(entry: _Entry) -> bool:
+    """False for ranges, tags, aliases and alternatives (``^5.6.1``, ``latest``,
+    ``npm:x@1.0.0``, ``1 || 2``, ``>=2``): only whole-package records can be matched for
+    them, so the check is undecided rather than clean. No version at all is unpinned."""
+    version = entry.version
+    if version is None:
+        return True
+    if entry.ecosystem == "npm":
+        return bool(_NPM_EXACT_VERSION.fullmatch(version))
+    if _RANGE_CHARACTERS.search(version):
+        return False
+    try:
+        Version(version)
+    except InvalidVersion:
+        return False
+    return True
 
 
 def _malware_dicts(matches: object, entries: list[_Entry]) -> list[dict[str, Any]]:
@@ -599,9 +732,11 @@ def _malware_dicts(matches: object, entries: list[_Entry]) -> list[dict[str, Any
     results: list[dict[str, Any]] = []
     if not isinstance(matches, Iterable):
         return results
+    seen: set[str] = set()
     for finding in matches:
-        if not isinstance(finding, Finding):
+        if not isinstance(finding, Finding) or finding.fingerprint in seen:
             continue
+        seen.add(finding.fingerprint)
         targets = by_key.get(finding.package_key) or by_name.get(finding.package_key) or ()
         for entry in targets:
             converted = _finding_dict(finding, entry)
@@ -621,6 +756,9 @@ def _release_age_findings(
     unpinned = [entry for entry in eligible if not entry.version]
     receipt.skip("release_age_no_version", len(unpinned))
     eligible = [entry for entry in eligible if entry.version]
+    loose = [entry for entry in eligible if not _exact_version(entry)]
+    receipt.skip("release_age_version_not_exact", len(loose))
+    eligible = [entry for entry in eligible if _exact_version(entry)]
     private = [entry for entry in eligible if _private_name(entry, options)]
     receipt.skip("release_age_private_registry", len(private))
     eligible = [entry for entry in eligible if not _private_name(entry, options)]
@@ -729,6 +867,8 @@ def _provenance_findings(
             receipt.skip("provenance_private_registry")
         elif not entry.version:
             receipt.skip("provenance_no_version")
+        elif not _exact_version(entry):
+            receipt.skip("provenance_version_not_exact")
         else:
             public.append(entry)
     if not public:
@@ -896,8 +1036,9 @@ def agent_config(repo_root: str | Path) -> dict[str, Any]:
     Reads ``.claude/settings(.local).json``, ``.gemini/settings.json``,
     ``.cursor/{hooks,mcp}.json``, ``.codex/{hooks.json,config.toml}``,
     ``.vscode/{tasks,mcp,settings}.json``, ``*.code-workspace``, ``.mcp.json``,
-    ``.kiro/settings/mcp.json`` (and Roo / Amazon Q / Windsurf ``mcp.json``) at any
-    depth, skipping ``node_modules``, ``.git`` and virtualenvs. Symlinks that stay inside
+    ``.kiro/settings/mcp.json``, Kiro agent hooks ``.kiro/hooks/*.kiro.hook``,
+    ``opencode.json(c)`` (``mcp``), Zed ``.zed/settings.json`` (``context_servers``) and
+    Roo / Amazon Q / Windsurf ``mcp.json``, at any depth, skipping ``node_modules``, ``.git`` and virtualenvs. Symlinks that stay inside
     the repository are followed and reported under the in-repo path an agent opens (a
     committed ``.claude`` link to ``tools/cfg`` reports ``.claude/settings.json``); a config
     folder or file link that leaves the repository, dangles or cannot be read is an
@@ -910,7 +1051,12 @@ def agent_config(repo_root: str | Path) -> dict[str, Any]:
     decodes and runs a payload, or runs a script disguised as a font/image),
     editor_folder_open_task (same severities), mcp_server_unpinned (MEDIUM),
     mcp_server_hidden_path (HIGH), mcp_server_impersonation (MEDIUM),
-    agent_base_url_override (HIGH). ``name`` is the hook event, task label, server
+    agent_base_url_override (HIGH). mcp_server_unpinned also covers launches that fetch
+    unpinned extra packages or use another registry or index (evidence ``extra_packages``,
+    ``indexes``; registry variables in the server ``env`` count) and remote servers reached
+    over cleartext http or at a bare non-loopback IP (evidence ``url``, ``cleartext``,
+    ``bare_ip``). Claude ``enabledPlugins`` entries are agent_hook_command findings with
+    ``plugin`` and ``marketplace`` (from ``extraKnownMarketplaces``) in the evidence. ``name`` is the hook event, task label, server
     name or variable; ``ecosystem``/``version`` are set for MCP findings. Hook
     evidence carries the exact ``command`` plus ``display_command``, ``executable``,
     ``script``, ``fetches_remote``, ``decodes_and_executes``, ``disguised_script`` and
@@ -918,7 +1064,7 @@ def agent_config(repo_root: str | Path) -> dict[str, Any]:
 
     ``inventory``: ``schema`` "ca9.agent_hooks.v1", ``hooks`` [{file, kind, event,
     command, line}] (kind: claude_hook, claude_setting, gemini_hook, gemini_setting,
-    cursor_hook, codex_hook, vscode_task; optional matcher, label, via,
+    cursor_hook, codex_hook, kiro_hook, vscode_task; optional matcher, label, via,
     handler_type), ``mcp_servers`` [{file, name, command, ecosystem, package,
     version, pinned, line}] (optional argv, transport, fetches, launcher, url), plus
     optional ``env_overrides``, ``files``, ``errors``, ``status``
@@ -959,7 +1105,15 @@ def parse_mcp_server(
     passes an exact ``version=`` (an image digest ``sha256:...`` for docker), else
     None. Optional keys: ``launcher``, ``fetches`` (False for local files and
     ``python -m``, which run what is already installed), ``spec``, ``source``
-    (registry|git|url|local|installed|image). None for unusable input; never raises.
+    (registry|git|url|local|installed|image), ``extra_packages`` ([{package, version,
+    pinned, source}] from further ``-p``/``--package``, ``--with``,
+    ``--with-requirements``/``--with-editable`` or ``--preinstall``) and ``indexes``
+    (registries or indexes other than the public npm registry and PyPI, from
+    ``--registry``, ``--index``, ``--index-url``, ``--extra-index-url``, ``--find-links``
+    or pipx ``--pip-args``). An unpinned extra package or another index makes ``pinned``
+    false and ``pinned_command`` None. Launcher options count only before the package
+    (npx, dlx, bunx, uvx and pipx hand later arguments to the server), except for npm exec,
+    which reads them anywhere before ``--``. None for unusable input; never raises.
     """
     from ca9.agent_config import parse_launch
 
@@ -997,8 +1151,13 @@ def hardening_settings(repo_root: str | Path) -> dict[str, Any]:
     removed onlyBuiltDependencies / neverBuiltDependencies), ``scripts`` keys
     ``pnpm_never_built_dependencies`` and ``workflow_overrides`` [{file, line, setting,
     value}] (workflow or composite-action lines that turn install scripts back on, such as
-    ``npm_config_ignore_scripts: false`` or ``YARN_ENABLE_SCRIPTS=true``), ``errors``,
-    ``status``. Actions are read with the YAML parser when available (flow style and
+    ``npm_config_ignore_scripts: false``, ``YARN_ENABLE_SCRIPTS=true``,
+    ``--no-ignore-scripts``, ``--ignore-scripts false``, ``--config.ignore-scripts=false``,
+    ``config set ignore-scripts false`` or ``ignore-scripts=false`` echoed into .npmrc),
+    ``cooldown_overrides`` [{file, line, setting (cooldown key), option, value}] (CI lines
+    that set npm ``min-release-age``, pnpm ``minimum-release-age`` or Yarn
+    ``npmMinimalAgeGate`` through environment variables, flags or config writes),
+    ``errors``, ``status``. Actions are read with the YAML parser when available (flow style and
     anchors included) and local composite actions referenced by ``uses: ./...`` are
     followed. Never raises.
     """
@@ -1033,7 +1192,9 @@ def hardening_regressions(base: object, head: object) -> list[dict[str, Any]]:
     dangerouslyAllowAllBuilds, entries removed from neverBuiltDependencies, Bun
     trustedDependencies), allow_scripts_added (npm allowScripts),
     strict_dep_builds_disabled, action_unpinned (an action pinned to a SHA in base, owner
-    and repo compared case-insensitively, used at a tag or branch in head), and
+    and repo compared case-insensitively, used at a tag or branch in head, or any new
+    tag or branch ref when every action in base was pinned), cooldown_lowered also for a
+    CI override shorter than base's cooldown (with ``line``), and
     check_failed (with ``side``) for a side that is missing, not a snapshot, or was only
     partly read; a missing or unreadable side returns only check_failed items, never an
     empty list. Exceptions are the caller's to apply. Never raises.
@@ -1065,7 +1226,11 @@ def ci_inventory(repo_root: str | PurePath, *, max_jobs: int = 500) -> dict[str,
     or a per-list cap cut the output. Each job's ``indirect`` lists commands that may
     install packages out of sight (make, gmake, just, task, tox, nox, docker/podman
     build, buildx, compose or run, Docker build actions, repository scripts) as
-    ``[{"command": tool or script path, "line": int}]``. Never raises.
+    ``[{"command": tool or script path, "line": int}]``. Container images a job runs in or
+    starts (GitHub ``container:``, ``uses: docker://``, ``docker``/``podman run``, GitLab
+    ``image:`` with default and top-level inheritance) are ``other_tools`` with ``manager``
+    container, docker_action or docker_run; ``pinned`` means a digest, or a Docker official
+    image at a version tag. Never raises.
     """
     try:
         from ca9.ci.inventory import build_inventory
@@ -1088,7 +1253,10 @@ def audit_workflows(repo_root: str | PurePath) -> dict[str, Any]:
     Signal types: unpinned_tool_in_credentialed_job, unverified_download_into_publish,
     oidc_publish_without_environment, publish_on_dispatch_or_any_branch, and
     credentials_to_remote_reusable_workflow (investigate: secrets or tokens handed to a
-    workflow outside this repository). Findings use the package finding shape with
+    workflow outside this repository). workflow_run counts as an outside event for
+    publish_on_dispatch_or_any_branch (it runs on the default branch with secrets after a
+    workflow anyone can start, fork pull requests included), and unpinned container
+    images count as unpinned tools. Findings use the package finding shape with
     ``ecosystem`` github-actions|gitlab-ci, ``name`` the job id (or workflow file) and
     ``version`` None. The receipt lists ``unknowns`` (remote reusable workflows, remote
     GitLab includes) and ``incomplete_reasons``; ``complete`` is false whenever any part
@@ -1128,22 +1296,101 @@ def review_upgrades(
     skipped), ``block`` and ``warn`` (lists of deltas). A delta is ``{"kind", "path",
     "line", "snippet", "detail"}``. Block kinds: new_pth_code, new_sitecustomize,
     new_install_hook, new_decode_exec, new_git_or_url_dependency,
-    ships_agent_or_editor_hook. Warn kinds: new_import_time_network,
-    new_import_time_exec, obfuscation_growth, new_native_binary, publisher_change.
+    ships_agent_or_editor_hook, ambiguous_package_contents, shadows_system_command,
+    uninspectable_import_time_code, lockfile_artifact_mismatch, obfuscation_growth, and
+    new_import_time_exec / new_import_time_network for process or network calls that a
+    Python package makes at import time and for npm wallet or fetch hijacks. Warn kinds:
+    new_import_time_exec / new_import_time_network for JavaScript module capabilities
+    and stdlib-only .pth imports, new_native_binary, publisher_change,
+    install_script_changed, native_binary_changed, provenance_dropped.
     Optional result keys: ``detail``, ``info`` (informational deltas),
     ``unchanged_risky``, ``unchanged_risky_by_kind``, ``artifacts``, ``limitations``.
 
-    Options: ``network`` (default true), ``max_pairs`` (50), ``max_artifact_mb`` (50),
+    A pair whose ``old`` is missing, None or blank is a first release (a brand-new
+    package, typosquat or slopsquat): it is reviewed against an empty release, so
+    everything it ships is new and every delta keeps its upgrade level (install hooks
+    and nested sitecustomize block, native binaries warn). Such results have ``basis``
+    "new_package" and ``first_release`` true; the receipt counts them in
+    ``first_release_reviews``.
+
+    ``added: true`` (with ``old`` missing or None) marks a package new to the project, not
+    necessarily new to the registry: it is compared with the release before ``new`` on
+    the registry (the highest earlier version published before it that is installable and
+    not yanked, stable when one exists), and the result has ``basis`` "registry_previous",
+    ``old`` None, ``old_resolved`` that version and ``added`` true. With no earlier release
+    it is a first release as above. Every result for a pair that carried ``added: true``
+    echoes it, skipped ones included (``reason`` network_disabled for an offline call with
+    ``network: False``), so such a call shows whether this engine supports it; with an
+    explicit ``old`` the pair is an ordinary upgrade that still echoes ``added``. A registry lookup that fails leaves the pair skipped and the receipt
+    incomplete.
+
+    PyPI releases are reviewed wheel by wheel: the file pip installs here first, then
+    every other wheel of the release against the old release's file for the same tags or
+    platform (deltas found only there name the wheel in ``detail``). A wheel whose files
+    other than native binaries match a reviewed wheel, or differ without adding any
+    behaviour, and whose binaries are ELF/PE/Mach-O images of modules already shipped, is
+    read by byte ranges without downloading its old counterpart (``artifacts.also`` entry
+    with ``same_code_as``). Wheels for mainstream platforms (CPython or pure Python on
+    manylinux/musllinux x86_64 and aarch64, macOS arm64/x86_64/universal2, win_amd64) left
+    out by ``max_release_mb``, ``max_artifact_mb`` or the deadline are listed in
+    ``limitations`` and make the result incomplete; wheels for uncommon platforms
+    (free-threaded, PyPy, 32-bit and other architectures) are not reviewed and are named in
+    a limitation without making the result incomplete.
+
+    A release that adds a dependency (any dependency of a first release) also gets that
+    dependency reviewed as a first release when the version its range resolves to is the
+    package's first release, or the package's first release is at most 30 days older: a
+    two-stage package that only adds a dependency carries its payload there. One level,
+    at most 5 registry lookups per pair and ``max_dependency_reviews`` (10) reviews per
+    call; internal and privately resolved names are never looked up. Their deltas are
+    added to the pair with ``path`` "<name>@<version>: <path>"; ``dependency_reviews``
+    lists each lookup ({name, version, status: reviewed|established|unresolved|over_limit|
+    lookup_failed|review_failed, why?, block?, warn?, complete?}), a failed lookup is a
+    limitation, and the receipt counts ``dependency_reviews``.
+
+    Options: ``network`` (default true), ``max_pairs`` (50), ``max_artifact_mb`` (100),
+    ``max_release_mb`` (400, the bytes fetched per pair for the other wheels),
     ``cache_dir`` (keeps verified downloads; a temporary directory otherwise),
     ``trusted_registries``, ``private_registries``, ``internal_packages``. Names matching
     ``internal_packages`` are skipped as internal_package, and entries whose lockfile
     ``resolved`` URL is on a listed private registry as private_registry (unless the
     pair's ``registry_mode`` is "merged", a private registry that proxies the public
     one): neither is ever looked up on a public registry. A pair whose ``registry`` is a
-    listed private or trusted HTTPS registry is reviewed from that registry. Never
+    listed private or trusted HTTPS registry is reviewed from that registry. A pair whose
+    ``old`` equals ``new`` but carries ``integrity`` or ``resolved`` is reviewed with
+    ``basis`` "lockfile": its digest and URL are checked against the files the registry
+    serves for that version (lockfile_artifact_mismatch blocks a swapped artifact), with
+    nothing downloaded. A ``resolved`` URL the registry does not serve, with no lockfile
+    digest tying it to a served file, makes any result incomplete. Never
     raises: bad input is skipped with a reason and counted in the receipt, whose
-    ``complete`` is false when anything was not reviewed; same_version, internal_package
-    and private_registry skips are policy, not gaps, and keep it true.
+    ``complete`` is false when anything was not reviewed; same_version (no lockfile pins),
+    internal_package and private_registry skips are policy, not gaps, and keep it true.
+
+    Code for reviewers (both off by default; without them the output is unchanged; the
+    artifacts are deleted after the review, so this is the only way to see the code):
+    ``context_lines`` (int, 0-200) gives every ``block`` and ``warn`` delta in a text file
+    of the package a ``context`` string: unified-diff hunks (an ``@@ -a,b +c,d @@`` header,
+    then lines prefixed by a space, ``-`` or ``+``; no file header) of that file between
+    the old and new artifact within that many lines of the delta's ``line`` (the file's
+    first change when ``line`` is None); a file the new release adds, and every file of a
+    first release, is shown as ``+`` lines. Deltas in binary files or files over 32 MB,
+    and registry-metadata or lockfile deltas, get no ``context``. A context is at most 8 KB and the contexts of one result
+    at most 64 KB together (contexts that fit an equal share stay whole, the others share
+    the rest); a cut context keeps the delta's line in the middle and ends with the line
+    ``... (truncated)``. ``identity_diff_bytes`` (int, 0-200000): a reviewed upgrade with
+    a publisher_change or provenance_dropped delta at any level gains ``identity_diff``,
+    a unified diff (``--- a/<path>``, ``+++ b/<path>``, hunks with 3 lines of context) of
+    every changed text code file (.js, .mjs, .cjs, .ts, .py, .pth, .json, .sh, .toml,
+    .cfg, including setup.py and package.json; binaries and lockfiles skipped), files
+    with the smallest change first, at most that many bytes, and
+    ``identity_diff_truncated`` (true when a file or part of one was left out). All text
+    comes from the package files: control, bidi and other invisible characters are
+    removed (tabs stay, other whitespace becomes a space), a CR, U+2028 or U+2029 inside
+    a line is shown as ``\\r``, ``\\u2028`` or ``\\u2029`` so code after it cannot pass for
+    part of a comment, and nothing else is changed. Values that are not integers in range
+    are listed in ``invalid_options`` and ignored, like the other options. When either
+    option is passed, the receipt has ``context_lines`` (the value applied, 0 when
+    rejected or not given), so a caller can tell that this engine supports them.
     """
     from ca9.review.upgrades import review_upgrades as _review_upgrade_pairs
 

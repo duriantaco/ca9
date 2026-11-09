@@ -85,7 +85,9 @@ _UV_VALUE_FLAGS = frozenset(
         "--fork-strategy",
     }
 )
-_PIPX_VALUE_FLAGS = frozenset({"--python", "--index-url", "-i", "--pip-args", "--backend"})
+_PIPX_VALUE_FLAGS = frozenset(
+    {"--python", "--index-url", "-i", "--pip-args", "--backend", "--preinstall"}
+)
 _PYTHON_VALUE_FLAGS = frozenset({"-X", "-W", "-Q"})
 _NODE_VALUE_FLAGS = frozenset(
     {
@@ -181,7 +183,27 @@ _DOCKER_VALUE_FLAGS = frozenset(
         "--mac-address",
     }
 )
+DOCKER_RUN_VALUE_FLAGS = _DOCKER_VALUE_FLAGS
 _SHELL_WRAPPERS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_NPM_PACKAGE_FLAGS = frozenset({"-p", "--package"})
+_NPM_INDEX_FLAGS = frozenset({"--registry"})
+_UV_EXTRA_FLAGS = frozenset({"--with"})
+_UV_LOCAL_EXTRA_FLAGS = frozenset({"--with-editable", "--with-requirements"})
+_UV_INDEX_FLAGS = frozenset(
+    {"--index", "--index-url", "-i", "--extra-index-url", "--default-index", "--find-links", "-f"}
+)
+_PIPX_INDEX_FLAGS = frozenset({"--index-url", "-i"})
+_PIP_INDEX_FLAGS = frozenset({"--index-url", "-i", "--extra-index-url", "--find-links", "-f"})
+_PUBLIC_INDEXES = frozenset(
+    {
+        "https://registry.npmjs.org",
+        "https://registry.yarnpkg.com",
+        "https://pypi.org",
+        "https://pypi.org/simple",
+        "https://pypi.python.org/simple",
+    }
+)
+_NPM_PARSES_EVERYWHERE = frozenset({"npm exec"})
 
 Rebuild = Callable[[list[str]], list[str]]
 
@@ -363,7 +385,7 @@ def _npm_exec(
     argv: list[str], start: int, launcher: str, version: str | None, rebuild: Rebuild
 ) -> dict | None:
     spec_index, positional, inline = _first_positional(
-        argv, start, _NPX_VALUE_FLAGS, frozenset({"-p", "--package"})
+        argv, start, _NPX_VALUE_FLAGS, _NPM_PACKAGE_FLAGS
     )
     index = spec_index
     if index is None:
@@ -376,9 +398,93 @@ def _npm_exec(
     pinned_command = None
     if version and source == "registry" and _NPM_EXACT.match(version):
         pinned_command = rebuild(_replace(argv, index, inline, f"{package}@{version}"))
-    return _result(
+    result = _result(
         "npm", package, found, pinned, pinned_command, launcher, source != "local", spec, source
     )
+    everywhere = launcher in _NPM_PARSES_EVERYWHERE
+    extras = []
+    for value in _option_values(argv, start, _NPM_PACKAGE_FLAGS, _NPX_VALUE_FLAGS, everywhere)[1:]:
+        extra, extra_version, extra_source = _npm_spec(value)
+        extras.append(
+            _extra(extra, extra_version, _npm_pinned(extra_version, extra_source), extra_source)
+        )
+    indexes = _option_values(argv, start, _NPM_INDEX_FLAGS, _NPX_VALUE_FLAGS, everywhere)
+    return _with_fetch_sources(result, extras, indexes)
+
+
+def _option_values(
+    argv: list[str],
+    start: int,
+    names: frozenset[str],
+    value_flags: frozenset[str],
+    everywhere: bool = False,
+) -> list[str]:
+    """Values of the launcher's own ``names`` options, in order. They stop at ``--`` and,
+    unless the launcher parses options ``everywhere`` (npm exec), at the first positional:
+    npx, dlx, uvx and pipx pass what follows the package to the server."""
+    values: list[str] = []
+    index = start
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            break
+        flag, eq, inline = token.partition("=")
+        if flag in names:
+            if eq:
+                values.append(inline)
+            elif index + 1 < len(argv):
+                values.append(argv[index + 1])
+                index += 1
+            index += 1
+            continue
+        if token in value_flags:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        if not everywhere:
+            break
+        index += 1
+    return values
+
+
+def _extra(package: str, version: str | None, pinned: bool, source: str) -> dict[str, Any]:
+    return {"package": package, "version": version, "pinned": pinned, "source": source}
+
+
+def _index_url(value: str) -> str:
+    text = value.strip()
+    name, eq, rest = text.partition("=")
+    if eq and "://" not in name:
+        text = rest.strip()
+    return text
+
+
+def non_public_indexes(values: list[str]) -> list[str]:
+    """Registry or index URLs other than the public npm registry and PyPI."""
+    found: list[str] = []
+    for value in values:
+        url = _index_url(value)
+        if url and url.rstrip("/").lower() not in _PUBLIC_INDEXES and url not in found:
+            found.append(url)
+    return found
+
+
+def _with_fetch_sources(
+    result: dict[str, Any], extras: list[dict[str, Any]], indexes: list[str]
+) -> dict[str, Any]:
+    """A launch is pinned only when every package it fetches is pinned and it fetches from
+    the public registry; otherwise no single version makes it pinned."""
+    other = non_public_indexes(indexes)
+    if extras:
+        result["extra_packages"] = extras
+    if other:
+        result["indexes"] = other
+    if other or any(not item["pinned"] for item in extras):
+        result["pinned"] = False
+        result["pinned_command"] = None
+    return result
 
 
 def _npm_spec(spec: str) -> tuple[str, str | None, str]:
@@ -418,10 +524,21 @@ def _uvx(
         argv, start, _UV_VALUE_FLAGS, frozenset({"--from"})
     )
     if spec_index is not None:
-        return _pypi(argv, spec_index, inline, launcher, version, rebuild, "from")
-    if positional is None:
+        result = _pypi(argv, spec_index, inline, launcher, version, rebuild, "from")
+    elif positional is None:
         return None
-    return _pypi(argv, positional, False, launcher, version, rebuild, "uvx")
+    else:
+        result = _pypi(argv, positional, False, launcher, version, rebuild, "uvx")
+    extras = []
+    for value in _option_values(argv, start, _UV_EXTRA_FLAGS, _UV_VALUE_FLAGS):
+        for requirement in value.split(","):
+            if requirement.strip():
+                name, _extras, found, exact, source = _pypi_spec(requirement)
+                extras.append(_extra(name, found, exact, source))
+    for value in _option_values(argv, start, _UV_LOCAL_EXTRA_FLAGS, _UV_VALUE_FLAGS):
+        extras.append(_extra(value, None, False, "local"))
+    indexes = _option_values(argv, start, _UV_INDEX_FLAGS, _UV_VALUE_FLAGS)
+    return _with_fetch_sources(result, extras, indexes)
 
 
 def _pipx(argv: list[str], start: int, version: str | None, rebuild: Rebuild) -> dict | None:
@@ -429,10 +546,20 @@ def _pipx(argv: list[str], start: int, version: str | None, rebuild: Rebuild) ->
         argv, start, _PIPX_VALUE_FLAGS, frozenset({"--spec"})
     )
     if spec_index is not None:
-        return _pypi(argv, spec_index, inline, "pipx run", version, rebuild, "from")
-    if positional is None:
+        result = _pypi(argv, spec_index, inline, "pipx run", version, rebuild, "from")
+    elif positional is None:
         return None
-    return _pypi(argv, positional, False, "pipx run", version, rebuild, "pipx")
+    else:
+        result = _pypi(argv, positional, False, "pipx run", version, rebuild, "pipx")
+    extras = []
+    for value in _option_values(argv, start, frozenset({"--preinstall"}), _PIPX_VALUE_FLAGS):
+        name, _extras, found, exact, source = _pypi_spec(value)
+        extras.append(_extra(name, found, exact, source))
+    indexes = _option_values(argv, start, _PIPX_INDEX_FLAGS, _PIPX_VALUE_FLAGS)
+    for value in _option_values(argv, start, frozenset({"--pip-args"}), _PIPX_VALUE_FLAGS):
+        words = split_command(value)
+        indexes.extend(_option_values(words, 0, _PIP_INDEX_FLAGS, frozenset(), True))
+    return _with_fetch_sources(result, extras, indexes)
 
 
 def _pypi(

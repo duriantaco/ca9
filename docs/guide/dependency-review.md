@@ -119,6 +119,73 @@ payload = report.to_dict()
 exit_code = report.exit_code
 ```
 
+## Upgrade review API
+
+`ca9.api.review_upgrades` is the per-pair engine Skylos calls. It takes
+`{"ecosystem", "name", "old", "new"}` pairs for npm and PyPI, diffs the two published
+artifacts with deterministic static rules and returns the behaviours the new release
+adds as `block`, `warn` and `info` deltas (`{"kind", "path", "line", "snippet",
+"detail"}`), with a receipt. It never raises.
+
+The downloaded artifacts are deleted after the review. Two opt-in options return the
+code a reviewer needs to judge a delta, for example an AI second opinion on a `warn`.
+Both are off by default; without them the output is byte-identical to a call that does
+not know them.
+
+```python
+from ca9 import api
+
+report = api.review_upgrades(
+    [{"ecosystem": "pypi", "name": "requests", "old": "2.32.3", "new": "2.32.4"}],
+    options={"context_lines": 20, "identity_diff_bytes": 50_000},
+)
+```
+
+| Option | Range (default) | Adds |
+|---|---|---|
+| `context_lines` | 0-200 (0) | `context` (string) on every `block` and `warn` delta in a text file of the package |
+| `identity_diff_bytes` | 0-200000 (0) | `identity_diff` (string) and `identity_diff_truncated` (bool) on a result with a `publisher_change` or `provenance_dropped` delta in `block`, `warn` or `info` |
+
+`context` holds unified-diff hunks of the delta's file between the old and new
+artifact, within `context_lines` lines of the delta's `line` (the file's first change
+when `line` is null):
+
+```text
+@@ -14,3 +14,3 @@
+ const v14 = 14;
+-const v15 = 15;
++const cp = require('node:child_process');
+ const v16 = 16;
+```
+
+A file the new release adds, and every file of a first release, is shown as `+` lines
+under an `@@ -0,0 +a,b @@` header. Deltas in binary files or files over 32 MB, and
+registry-metadata or lockfile deltas, have no `context`. A context is at most 8 KB and
+the contexts of one result are at most 64 KB together: contexts that fit an equal share
+stay whole and the others share the rest. A cut context keeps the delta's line in the
+middle and ends with the line `... (truncated)`; a very long line (minified code) is
+shown in part.
+
+`identity_diff` is for releases where the only signal is a new publisher or missing
+provenance. It is a unified diff, with `--- a/<path>` and `+++ b/<path>` headers and
+three lines of context, of every changed `.js`, `.mjs`, `.cjs`, `.ts`, `.py`, `.pth`,
+`.json`, `.sh`, `.toml` and `.cfg` file (so `setup.py` and `package.json` too) between
+the compared artifacts, including added and removed files. Binary files and lockfiles
+are skipped. Files with the smallest change come first, so small edits are not crowded
+out by large rebuilt files; the text stops at `identity_diff_bytes` bytes and
+`identity_diff_truncated` is true when a file or part of one was left out.
+
+All text comes from the package files. Control, bidi and other invisible characters are
+removed (tabs stay, other whitespace becomes a space). A CR, U+2028 or U+2029 inside a
+line is shown as `\r`, ` ` or ` `, so code after a hidden line break cannot
+pass for part of a comment. Nothing else is changed: URLs and strings in the code are
+not redacted.
+
+Values that are not integers in range are listed in the receipt's `invalid_options`
+and ignored, which makes the receipt incomplete, as for the other options. When either
+option is passed, the receipt has `context_lines` with the value applied (0 when it was
+rejected or not given), so a caller can tell that the engine supports these options.
+
 ## Decisions and CI
 
 | Decision | Exit code | Meaning |

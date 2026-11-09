@@ -1,0 +1,158 @@
+{
+ "results": [
+  {
+   "ecosystem": "npm",
+   "name": "sample",
+   "old": "1.0.0",
+   "new": "1.0.1",
+   "status": "reviewed",
+   "basis": "upgrade",
+   "block": [],
+   "warn": [
+    {
+     "kind": "new_import_time_exec",
+     "path": "index.js",
+     "line": 2,
+     "snippet": "const cp = require('node:child_process');",
+     "detail": "package code loaded from its entry points now uses the child_process module"
+    },
+    {
+     "kind": "publisher_change",
+     "path": "(registry metadata)",
+     "line": null,
+     "snippet": "_npmUser: mallory",
+     "detail": "1.0.0 was published by trusted publisher github (GitHub Actions); 1.0.1 was published by account mallory"
+    }
+   ],
+   "info": [],
+   "unchanged_risky": 0,
+   "unchanged_risky_by_kind": {},
+   "artifacts": {
+    "basis": "npm tarball",
+    "old": {
+     "kind": "npm-tarball",
+     "filename": "sample-1.0.0.tgz",
+     "hash_algorithm": "sha512"
+    },
+    "new": {
+     "kind": "npm-tarball",
+     "filename": "sample-1.0.1.tgz",
+     "hash_algorithm": "sha512"
+    }
+   },
+   "complete": true
+  },
+  {
+   "ecosystem": "pypi",
+   "name": "demo",
+   "old": "1.0",
+   "new": "1.1",
+   "status": "reviewed",
+   "basis": "upgrade",
+   "block": [
+    {
+     "kind": "new_pth_code",
+     "path": "demo_boot.pth",
+     "line": 1,
+     "snippet": "import os; os.system('id')",
+     "detail": ".pth import line runs at every interpreter start and runs process, network, decode or exec code"
+    }
+   ],
+   "warn": [
+    {
+     "kind": "new_native_binary",
+     "path": "demo/_x.so",
+     "line": null,
+     "snippet": "",
+     "detail": "native binary (69 bytes); static rules cannot inspect it"
+    }
+   ],
+   "info": [],
+   "unchanged_risky": 0,
+   "unchanged_risky_by_kind": {},
+   "artifacts": {
+    "basis": "wheel pip selects on this machine",
+    "old": {
+     "kind": "wheel",
+     "filename": "demo-1.0-py3-none-any.whl",
+     "size": 623,
+     "hash_algorithm": "sha256"
+    },
+    "new": {
+     "kind": "wheel",
+     "filename": "demo-1.1-py3-none-any.whl",
+     "size": 1050,
+     "hash_algorithm": "sha256"
+    }
+   },
+   "limitations": [
+    "sdist not compared: a payload present only in the sdist would not be seen"
+   ],
+   "complete": true
+  },
+  {
+   "ecosystem": "npm",
+   "name": "fresh",
+   "old": null,
+   "new": "1.0.0",
+   "status": "reviewed",
+   "basis": "new_package",
+   "block": [
+    {
+     "kind": "new_install_hook",
+     "path": "package.json",
+     "line": 1,
+     "snippet": "node install.js",
+     "detail": "npm runs the postinstall script on install"
+    }
+   ],
+   "warn": [
+    {
+     "kind": "install_script_changed",
+     "path": "install.js",
+     "line": null,
+     "snippet": "",
+     "detail": "install-time code changed beyond version strings and other literals"
+    },
+    {
+     "kind": "new_import_time_exec",
+     "path": "index.js",
+     "line": 1,
+     "snippet": "const cp = require('node:child_process');",
+     "detail": "package code loaded from its entry points now uses the child_process module"
+    }
+   ],
+   "info": [],
+   "first_release": true,
+   "artifacts": {
+    "basis": "npm tarball",
+    "new": {
+     "kind": "npm-tarball",
+     "filename": "fresh-1.0.0.tgz",
+     "hash_algorithm": "sha512"
+    }
+   },
+   "complete": true
+  }
+ ],
+ "receipt": {
+  "schema": "ca9.upgrade_review.v1",
+  "pairs": 3,
+  "reviewed": 3,
+  "skipped": [],
+  "complete": true,
+  "invalid_options": [],
+  "network": true,
+  "artifacts_fetched": 5,
+  "pairs_with_block": 2,
+  "pairs_with_warn": 3,
+  "block_deltas": 2,
+  "warn_deltas": 5,
+  "incomplete_results": 0,
+  "first_release_reviews": 1,
+  "dependency_reviews": 0,
+  "unchanged_risky_behaviours": 0,
+  "unchanged_risky_by_kind": {},
+  "method": "deterministic static diff of the two published artifacts; registry digests verified; no package code installed, imported or executed"
+ }
+}

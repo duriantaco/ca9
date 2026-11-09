@@ -86,25 +86,36 @@ _JS_PROCESS_SINK = (
     r"child_process|exec(?:Sync|File|FileSync)?\s*\((?<![\w$.]exec\()|"
     r"\.(?:spawn|spawnSync|execFile|execFileSync|fork)\s*\("
 )
+_JS_INDIRECT_EVAL = (
+    r"\(\s*0\s*,\s*(?:\w+\s*\.\s*)?eval\s*\)\s*\(|"
+    r"\[\s*['\"`]eval['\"`]\s*\]\s*\(|\beval\s*\?\.\s*\("
+)
 _JS_ENCODED_EXEC_RE = re.compile(
     r"(?:Buffer\.from\s*\([^)]*?['\"](?:base64|hex)['\"]|atob\s*\()"
     r"[\s\S]{0,400}?"
-    r"(?:eval\s*\(|new\s+Function|" + _JS_PROCESS_SINK + r")"
+    r"(?:eval\s*\(|new\s+Function|"
+    + _JS_INDIRECT_EVAL
+    + r"|\._compile\s*\(|\brunIn(?:New|This)?Context\s*\(|"
+    + _JS_PROCESS_SINK
+    + r")"
 )
 # The sink wraps the decoder directly: eval(Buffer.from(x, 'base64').toString()).
 _JS_SINK_WRAPS_DECODE_RE = re.compile(
-    r"(?:eval|Function|vm\.runIn(?:New|This)?Context|vm\.Script)\s*\(\s*"
+    r"(?:(?:eval|Function|vm\.runIn(?:New|This)?Context|vm\.Script|\._compile)\s*\(|"
+    + _JS_INDIRECT_EVAL
+    + r")\s*"
     r"(?:['\"][\w$]*['\"]\s*,\s*)*(?:[\w$.]+\s*\(\s*)*"
     r"(?:Buffer\.from\s*\([^)]*?,\s*['\"](?:base64|hex)['\"]|atob\s*\(|"
     r"String\.fromCharCode\s*\()"
 )
+_JS_MODULE_LOAD = r"(?:\brequire|getBuiltinModule['\"`\]]*)\s*\(\s*['\"`](?:node:)?"
 _JS_PROCESS_RE = re.compile(
-    r"require\(\s*['\"](?:node:)?child_process['\"]\s*\)|"
+    _JS_MODULE_LOAD + r"child_process['\"`]\s*\)|"
     r"child_process\.(?:exec|execSync|spawn|spawnSync|fork)|"
     r"execSync\s*\("
 )
 _JS_NETWORK_RE = re.compile(
-    r"require\(\s*['\"](?:node:)?(?:https?|net|dgram|dns|tls)['\"]\s*\)|"
+    _JS_MODULE_LOAD + r"(?:https?|net|dgram|dns|tls)['\"`]\s*\)|"
     r"fetch\s*\(|axios\b|XMLHttpRequest|https?\.(?:request|get)\s*\("
 )
 # Harvesting, not mere access: dumping process.env, filtering it for secrets,
@@ -1469,19 +1480,46 @@ def _analyze_python_text(
     return findings
 
 
+_NEWLINE_RE = re.compile(r"\r\n|\r|\n")
+
+
+def pth_lines(text: str) -> list[tuple[int, str]]:
+    """(offset, line) for every line site.py may execute, each once.
+
+    Python 3.12 and older read a .pth file by newline only, so a form feed, vertical tab,
+    \\x1c-\\x1e, NEL or line separator stays inside one physical line, and that whole line
+    is executed when it starts with "import". Python 3.13 and newer use str.splitlines,
+    which also splits on those characters. Both readings are returned.
+    """
+    found: dict[tuple[int, str], None] = {}
+    start = 0
+    for match in _NEWLINE_RE.finditer(text):
+        found[(start, text[start : match.start()])] = None
+        start = match.end()
+    if start < len(text):
+        found[(start, text[start:])] = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        found[(offset, line.rstrip("\r\n\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"))] = None
+        offset += len(line)
+    return sorted(found)
+
+
+def pth_line_number(text: str, offset: int) -> int:
+    return len(_NEWLINE_RE.findall(text, 0, offset)) + 1
+
+
 def _analyze_pth(snapshot: ArtifactSnapshot, file: ArtifactFile, text: str) -> list[Finding]:
     """site.py executes .pth lines starting with "import"; other lines are paths."""
     critical: int | None = None
     investigate: int | None = None
-    offset = 0
-    for line in text.splitlines(keepends=True):
+    for offset, line in pth_lines(text):
         if line.startswith(("import ", "import\t")):
             verdict = _pth_line_verdict(line.strip())
-            if verdict == "critical" and critical is None:
+            if verdict == "critical" and (critical is None or offset < critical):
                 critical = offset
-            elif verdict == "investigate" and investigate is None:
+            elif verdict == "investigate" and (investigate is None or offset < investigate):
                 investigate = offset
-        offset += len(line)
     if critical is not None:
         return [_finding(snapshot, file, text, _PTH_RULE, critical)]
     if investigate is not None:

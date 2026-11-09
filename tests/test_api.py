@@ -249,8 +249,16 @@ def test_release_age_wrapper_is_unknown_without_the_module():
     assert set(result) >= {"published_at", "age_hours", "suggested_version", "source"}
 
 
-def test_provenance_check_is_npm_only():
-    assert api.check_provenance("pypi", "six", "1.16.0")["status"] == "not_applicable"
+def test_provenance_check_covers_npm_and_pypi_only(monkeypatch):
+    import ca9.pypi_provenance as pypi_provenance
+
+    def offline(url, *, max_bytes, accept="application/json"):
+        raise OSError("offline")
+
+    monkeypatch.setattr(pypi_provenance, "_fetch_json", offline)
+
+    assert api.check_provenance("pypi", "six", "1.16.0")["status"] == "unknown"
+    assert api.check_provenance("cargo", "serde", "1.0.0")["status"] == "not_applicable"
 
 
 def test_provenance_regression_is_a_blocking_npm_finding(monkeypatch):

@@ -10,13 +10,19 @@ other file is read as bounded text or bytes.
 from __future__ import annotations
 
 import ast
+import base64
+import binascii
+import contextlib
 import hashlib
+import ipaddress
 import json
 import posixpath
 import re
+import shlex
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import Any
@@ -26,6 +32,7 @@ from packaging.utils import canonicalize_name
 
 from ca9.analyzers import package_code as pc
 from ca9.artifacts.model import ArtifactFile, ArtifactSnapshot
+from ca9.review import code_context
 from ca9.review.behavior import _normalize_javascript
 from ca9.review.npm_entrypoints import resolve_manifest_entrypoints
 from ca9.review.redaction import redact_text
@@ -46,26 +53,75 @@ BLOCK_KINDS = (
     "shadows_system_command",
     "uninspectable_import_time_code",
     "lockfile_artifact_mismatch",
+    "obfuscation_growth",
+    "new_import_time_exec",
+    "new_import_time_network",
+    "new_exfiltration_host",
 )
 WARN_KINDS = (
     "new_import_time_network",
     "new_import_time_exec",
-    "obfuscation_growth",
     "new_native_binary",
     "publisher_change",
     "install_script_changed",
     "native_binary_changed",
+    "provenance_dropped",
+    "new_outbound_host",
 )
 MAX_SCAN_BYTES = 32 * 1024 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 SCAN_CHUNK = 1024 * 1024
 SCAN_OVERLAP = 16 * 1024
 SHADOWED_COMMANDS = frozenset(
-    {"node", "npm", "npx", "git", "pip", "pip3", "python", "python3", "sh", "bash", "curl"}
+    {
+        "bash",
+        "bun",
+        "bunx",
+        "curl",
+        "deno",
+        "docker",
+        "gh",
+        "git",
+        "kubectl",
+        "make",
+        "node",
+        "npm",
+        "npx",
+        "pip",
+        "pip3",
+        "pipx",
+        "pnpm",
+        "pnpx",
+        "poetry",
+        "python",
+        "python3",
+        "scp",
+        "sh",
+        "ssh",
+        "sudo",
+        "tsc",
+        "uv",
+        "uvx",
+        "wget",
+        "yarn",
+        "yarnpkg",
+        "zsh",
+    }
 )
+_COMMAND_PROVIDERS = {
+    "bunx": frozenset({"bun"}),
+    "npx": frozenset({"npm"}),
+    "pip3": frozenset({"pip"}),
+    "pnpm": frozenset({"corepack", "@pnpm/exe"}),
+    "pnpx": frozenset({"pnpm", "corepack", "@pnpm/exe"}),
+    "tsc": frozenset({"typescript"}),
+    "uvx": frozenset({"uv"}),
+    "yarn": frozenset({"corepack", "@yarnpkg/cli-dist"}),
+    "yarnpkg": frozenset({"yarn", "corepack", "@yarnpkg/cli-dist"}),
+}
 MAX_DELTAS_PER_KIND = 20
 MAX_SNIPPET = 200
-MAX_IMPORT_MODULES = 400
+MAX_IMPORT_MODULES = 4000
 MAX_JS_REACHABLE = 3000
 OBFUSCATION_MIN_BYTES = 20 * 1024
 _TEXT_LIMIT = pc.MAX_TEXT_BYTES
@@ -79,6 +135,7 @@ _NATIVE_MAGIC = (
     b"\xce\xfa\xed\xfe",
     b"\xcf\xfa\xed\xfe",
 )
+_FAT_MACHO_MAGIC = (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf")
 _STARTUP_MODULES = ("sitecustomize", "usercustomize")
 _STARTUP_SUFFIXES = (".py", ".pyc", ".so", ".pyd")
 _SDIST_NON_PACKAGES = frozenset(
@@ -140,11 +197,131 @@ _NPM_DEPENDENCY_GROUPS = ("dependencies", "optionalDependencies", "peerDependenc
 _NPM_INSTALL_HOOKS = ("preinstall", "install", "postinstall")
 _JS_SUFFIXES = (".js", ".cjs", ".mjs")
 _JS_SPEC_RE = re.compile(
-    r"(?:\brequire\s*\(\s*|\bimport\s*\(\s*|\bfrom\s*|\bimport\s+)(['\"])([^'\"\n]{1,300})\1"
+    r"(?:\brequire\s*\(\s*|\bimport\s*\(\s*|\bfrom\s*|\bimport\s+|"
+    r"\bprocess\s*(?:\.\s*getBuiltinModule|\[\s*['\"`]getBuiltinModule['\"`]\s*\])\s*\(\s*)"
+    r"(['\"`])([^'\"`\n$\\]{1,300})\1"
 )
 _JS_EXEC_MODULES = frozenset({"child_process", "vm"})
 _JS_NETWORK_MODULES = frozenset({"http", "https", "net", "tls", "dgram", "dns", "http2"})
 _JS_BINDING_RE = re.compile(r"\bprocess\s*\.\s*(?:binding|_linkedBinding|dlopen)\s*\(")
+_DISGUISE_SUFFIXES = frozenset(
+    {
+        ".bat",
+        ".bmp",
+        ".cfg",
+        ".cjs",
+        ".css",
+        ".csv",
+        ".gif",
+        ".htm",
+        ".html",
+        ".ico",
+        ".ini",
+        ".jpeg",
+        ".jpg",
+        ".js",
+        ".json",
+        ".lock",
+        ".map",
+        ".md",
+        ".mjs",
+        ".mp3",
+        ".otf",
+        ".pdf",
+        ".png",
+        ".ps1",
+        ".pth",
+        ".py",
+        ".pyi",
+        ".pyw",
+        ".rst",
+        ".sh",
+        ".svg",
+        ".toml",
+        ".ts",
+        ".ttf",
+        ".txt",
+        ".wav",
+        ".webp",
+        ".woff",
+        ".woff2",
+        ".xml",
+        ".yaml",
+        ".yml",
+    }
+)
+_NATIVE_LOADERS = frozenset(
+    {
+        "ctypes.CDLL",
+        "ctypes.OleDLL",
+        "ctypes.PyDLL",
+        "ctypes.WinDLL",
+        "ctypes.cdll.LoadLibrary",
+        "ctypes.oledll.LoadLibrary",
+        "ctypes.pydll.LoadLibrary",
+        "ctypes.windll.LoadLibrary",
+    }
+)
+_NATIVE_LOADER_HINT = re.compile(r"ctypes|cffi|dlopen|LoadLibrary")
+_HOST = (
+    r"((?:\d{1,3}\.){3}\d{1,3}|\[[0-9A-Fa-f:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})"
+)
+_ANY_URL_HOST_RE = re.compile(r"(?:https?|wss?)://" + _HOST, re.I)
+_QUOTED_URL_HOST_RE = re.compile(r"""['"`](?:https?|wss?)://""" + _HOST, re.I)
+_BARE_IP_RE = re.compile(r"(?<![\d.])((?:\d{1,3}\.){3}\d{1,3})(?![\d.])")
+_IPV4 = r"((?:\d{1,3}\.){3}\d{1,3})"
+_SOCKET_IP_RE = re.compile(
+    r"\b(?:connect|connect_ex|createConnection|create_connection|request|get|post|put|fetch|"
+    r"urlopen|open|sendto|Socket|socket|HTTPConnection|HTTPSConnection|WebSocket|dial|Dial)"
+    r"""\s*\(\s*(?:\d{2,5}\s*,\s*)?\(?\s*['"`]""" + _IPV4 + r"""(?::\d{1,5})?['"`]|"""
+    r"""(?<![\w$.\])])\(\s*['"`]""" + _IPV4 + r"""['"`]\s*,\s*\d{2,5}\s*\)|"""
+    r"""\b(?:host(?:name)?|address|addr|server|remote_?host)['"]?\s*[:=]\s*['"`]"""
+    + _IPV4
+    + r"""['"`]|['"`]"""
+    + _IPV4
+    + r""":\d{2,5}['"`]""",
+    re.I,
+)
+_HOST_NETWORK_RE = {
+    "npm": re.compile(
+        r"\bfetch\s*\(|XMLHttpRequest|\bhttps?\.(?:request|get)\s*\(|\baxios\b|sendBeacon|"
+        r"new\s+WebSocket|\bnet\.(?:connect|createConnection)\s*\(|\btls\.connect\s*\(|"
+        r"""['"`](?:curl|wget)['"`\s]"""
+    ),
+    "pypi": re.compile(
+        r"urlopen\s*\(|urlretrieve\s*\(|\brequests\.(?:get|post|put|patch|request|Session)|"
+        r"\bhttpx\.|\baiohttp\.|\.connect\s*\(|create_connection\s*\(|http\.client|"
+        r"""['"](?:curl|wget)['"\s]"""
+    ),
+}
+_HOST_CODE_SUFFIXES = {"npm": _JS_SUFFIXES, "pypi": (".py",)}
+_HOST_SKIP_PARTS = frozenset(
+    {
+        "test",
+        "tests",
+        "__tests__",
+        "docs",
+        "doc",
+        "example",
+        "examples",
+        "fixtures",
+        "benchmark",
+        "benchmarks",
+    }
+)
+_IGNORED_HOST_RE = re.compile(
+    r"(?:^|\.)(?:localhost|example\.(?:com|org|net)|test|invalid|local|localdomain)$", re.I
+)
+_SENSITIVE_NEAR_HOST_RE = re.compile(
+    r"private_?key|secret_?key|seed_?phrase|\bseed\b|mnemonic|keypair|key_pair|"
+    r"\bprocess\.env\b(?!\s*[.\[])|os\.environ\b(?!\s*(?:\.get|\[))|"
+    r"\bid_(?:rsa|ed25519|ecdsa)\b|\.ssh[/\\]|aws_secret_access_key|\.npmrc|\.pypirc|"
+    r"\.git-credentials",
+    re.I,
+)
+SENSITIVE_WINDOW = 600
+_GENERATED_NAME_RE = re.compile(r"[0-9a-f]{16,}")
+_NATIVE_SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".pyx", ".rs", ".f90", ".f", ".m")
 _OBFUSCATED_IDENT_RE = re.compile(r"\b_0x[0-9a-f]{4,6}\b")
 _JS_DECODE_HINT = re.compile(
     r"Buffer\.from\s*\([^;]{0,200}?['\"](?:base64|hex)['\"]|\batob\s*\(|"
@@ -176,6 +353,23 @@ _JS_EXEC_CALL_RE = re.compile(
     r"(?<![\w$])(?P<sink>execSync|exec|spawnSync|spawn|execFileSync|execFile|fork)"
     r"\s*\((?P<args>[^;\n]{0,400})"
 )
+_HOOK_DOWNLOAD_RE = re.compile(
+    r"\b(?:curl|wget|Invoke-WebRequest|Invoke-RestMethod|iwr|irm)\b|\bhttps?://", re.I
+)
+_HOOK_RUN_RE = re.compile(
+    r"\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b|\|\s*(?:python[0-9.]*|node|perl|ruby|iex)\b|"
+    r"\bchmod\b|&&\s*\.{1,2}/|\b(?:ba|z)?sh\s+-c\b|\bnode\s+-e\b|\bpython[0-9.]*\s+-c\b",
+    re.I,
+)
+_HOOK_DECODE_RE = re.compile(
+    r"\bbase64\s+(?:-d|--decode|-D)\b|\beval\b|\batob\s*\(|Buffer\.from|fromCharCode|"
+    r"b64decode|FromBase64String",
+    re.I,
+)
+_HOOK_SECRET_RE = re.compile(
+    r"\$\{?[A-Z_]*(?:TOKEN|SECRET|PASSWORD|KEY)\b|\bprintenv\b|(?:^|[\s;&|(])env\s*(?:[|>)]|$)|"
+    r"process\.env\b(?!\s*[.\[])|os\.environ\b(?!\s*(?:\.get|\[))|\.npmrc|\.ssh/"
+)
 _DECODE_TEXT_RE = re.compile(r"\batob\s*\(|Buffer\.from|fromCharCode|b64decode")
 _JS_FILE_READ_RE = re.compile(r"\breadFile(?:Sync)?\s*\(")
 _JS_CODE_SINK_RE = re.compile(
@@ -187,8 +381,36 @@ _JS_CODE_SINK_RE = re.compile(
     r"\.\s*(?P<compile_sink>_compile)\s*(?:\.\s*(?:call|apply)\s*)?\("
 )
 _JS_GLOBAL_RECEIVERS = frozenset({"global", "globalThis", "window", "self"})
+_JS_INDIRECT_EVAL_RE = re.compile(pc._JS_INDIRECT_EVAL)
+_JS_MODULE_CTOR_RE = re.compile(
+    r"""(?:\brequire\s*\(\s*|getBuiltinModule['"`\]\s]*\(\s*)['"`](?:node:)?module['"`]"""
+)
+_JS_COMPILE_CALL_RE = re.compile(r"\.\s*_compile\s*(?:\.\s*(?:call|apply)\s*)?\(")
+_JS_DECODER_RE = re.compile(
+    r"Buffer\.from\s*\([^;]{0,200}?['\"](?:base64|hex)['\"]|\batob\s*\(|"
+    r"String\.fromCharCode\s*\(|\b(?:inflate|inflateRaw|gunzip|unzip|brotliDecompress)"
+    r"(?:Sync)?\s*\("
+)
+_JS_LOOKUP_REQUIRE_RE = re.compile(r"\brequire\s*\(\s*(_0x[0-9a-fA-F]{2,8})\s*[(\[]")
+_JS_LOOKUP_MODULES = frozenset(
+    {
+        "child_process",
+        "dgram",
+        "dns",
+        "http",
+        "http2",
+        "https",
+        "module",
+        "net",
+        "tls",
+        "vm",
+        "worker_threads",
+    }
+)
+_BASE64_TOKEN_RE = re.compile(r"[A-Za-z0-9+/]{8,}={0,2}")
 _JS_VM_REQUIRE_RE = re.compile(
-    r"""require\s*\(\s*['"](?:node:)?vm['"]|from\s+['"](?:node:)?vm['"]"""
+    r"""(?:\brequire\s*\(\s*|\bfrom\s+|\bimport\s*\(\s*|getBuiltinModule['"`\]\s]*\(\s*)"""
+    r"""['"`](?:node:)?vm['"`]"""
 )
 _JS_STRING_RE = re.compile(r"'([^'\\\n]*)'|\"([^\"\\\n]*)\"|`([^`\\]*)`")
 _JS_NOT_NAMES = frozenset(
@@ -252,33 +474,128 @@ _FILE_RUN_CALLS = frozenset(
     }
 )
 _LOADER_RUN_ATTRS = frozenset({"load_module", "exec_module"})
+_CLIENT_NETWORK_METHODS = frozenset(
+    {
+        "connect",
+        "delete",
+        "endheaders",
+        "fetch",
+        "get",
+        "getresponse",
+        "head",
+        "open",
+        "options",
+        "patch",
+        "perform",
+        "post",
+        "put",
+        "putrequest",
+        "request",
+        "request_encode_body",
+        "request_encode_url",
+        "send",
+        "stream",
+        "urlopen",
+        "ws_connect",
+    }
+)
+_DYNAMIC_IMPORTS = frozenset({"importlib.import_module", "__import__", "importlib.__import__"})
+_SCRIPT_RUNNERS = frozenset(
+    {
+        "bash",
+        "bun",
+        "cmd",
+        "cscript",
+        "dash",
+        "deno",
+        "ksh",
+        "mshta",
+        "node",
+        "nodejs",
+        "perl",
+        "powershell",
+        "pwsh",
+        "py",
+        "python",
+        "python2",
+        "python3",
+        "pythonw",
+        "regsvr32",
+        "rundll32",
+        "ruby",
+        "sh",
+        "wscript",
+        "zsh",
+    }
+)
+_PYTHON_RUNNERS = frozenset({"py", "python", "python2", "python3", "pythonw"})
+_NODE_RUNNERS = frozenset({"node", "nodejs", "bun", "deno"})
+_DOWNLOAD_OUTPUTS = {
+    "curl": frozenset({"-o", "--output"}),
+    "wget": frozenset({"-O", "--output-document"}),
+}
+_RISKY_INLINE_KINDS = frozenset(
+    {
+        "blob",
+        "credential_path",
+        "decode",
+        "encoded_exec",
+        "exec_risky",
+        "harvest",
+        "network",
+        "process",
+    }
+)
+_JS_INLINE_RISK_RE = re.compile(
+    r"child_process|\beval\s*\(|\bFunction\s*\(|"
+    r"""require\s*\(\s*['"`](?:node:)?(?:https?|net|tls|dgram|vm)['"`]|\bfetch\s*\("""
+)
+_PATH_WRAPPERS = frozenset(
+    {
+        "str",
+        "os.fspath",
+        "os.path.abspath",
+        "os.path.realpath",
+        "os.path.expanduser",
+        "pathlib.Path",
+        "Path",
+    }
+)
+_EXEC_BIT_NAMES = frozenset(
+    {"S_IXUSR", "S_IXGRP", "S_IXOTH", "S_IEXEC", "S_IRWXU", "S_IRWXG", "S_IRWXO"}
+)
 _MAX_BINDINGS = 8
 _MAX_BINDING_DEPTH = 4
 _MAX_EXPANDED_NODES = 4000
 _MAX_SOURCES = 40
 _MAX_JS_SINKS = 50
+_STAGER_HINT = re.compile(r"chmod|urlretrieve|curl|wget|\.write|copyfileobj")
 _DECODE_EXEC_HINT = re.compile(
     r"exec|eval|compile|decode|loads|unhexlify|fromhex|Popen|system|spawn|subprocess|"
     r"getattr|__import__|import_module|globals|builtins|sys\.modules|urlopen"
 )
 _NPM_CODE_RULE_KINDS = {
-    "npm-encoded-execution": ("new_decode_exec", "decodes data and executes it"),
+    "npm-encoded-execution": ("new_decode_exec", "decodes data and executes it", "block"),
     "npm-obfuscated-require": (
         "new_decode_exec",
         "builds a sensitive module name at runtime before loading it",
+        "block",
     ),
-    "encoded-execution": ("new_decode_exec", "decodes data and executes it"),
+    "encoded-execution": ("new_decode_exec", "decodes data and executes it", "block"),
     "npm-credential-exfiltration": (
         "new_import_time_network",
         "reads credentials or dumps the environment next to network or process code",
+        "warn",
     ),
     "npm-wallet-network-hijack": (
         "new_import_time_network",
         "replaces fetch/XMLHttpRequest or wallet provider methods",
+        "block",
     ),
     "credential-network-exfiltration": (
         "new_import_time_network",
         "reads credentials or dumps the environment next to network code",
+        "warn",
     ),
 }
 
@@ -334,6 +651,11 @@ class _Cache:
         self.trees: dict[str, ast.Module | None] = {}
         self.calls: dict[tuple[str, bool], list[_PyCall] | None] = {}
         self.encoded: dict[str, list[int]] = {}
+        self.imports: dict[tuple[str, str, str], list[str]] = {}
+        self.hosts: dict[str, frozenset[str]] = {}
+        self.digests: dict[tuple[str, int], str] = {}
+        self.natives: dict[str, set[str]] = {}
+        self.decoders: dict[tuple[str, str], frozenset[str]] = {}
         self.deadline = deadline
 
     def check(self) -> None:
@@ -353,6 +675,9 @@ class _Side:
         self.kind = snapshot.artifact.kind
         self.entries: dict[str, _Entry] = {}
         self.role = "new"
+        self.first_release = False
+        self.native_release = False
+        self.changed: set[str] = set()
         self.ambiguous: list[tuple[str, str]] = []
         self.unparsed: set[str] = set()
         self.proven: set[str] = set()
@@ -402,15 +727,20 @@ class _Side:
 
     def digest(self, path: str) -> str:
         if path not in self._hashes:
-            self.cache.check()
-            digest = hashlib.sha256()
-            try:
-                with self.entries[path].file.path.open("rb") as stream:
-                    for chunk in iter(lambda: stream.read(_HASH_CHUNK), b""):
-                        digest.update(chunk)
-                self._hashes[path] = digest.hexdigest()
-            except OSError:
-                self._hashes[path] = f"unreadable:{path}"
+            file = self.entries[path].file
+            key = (str(file.path), file.size)
+            if key not in self.cache.digests:
+                self.cache.check()
+                digest = hashlib.sha256()
+                try:
+                    with file.path.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(_HASH_CHUNK), b""):
+                            digest.update(chunk)
+                except OSError:
+                    self._hashes[path] = f"unreadable:{path}"
+                    return self._hashes[path]
+                self.cache.digests[key] = digest.hexdigest()
+            self._hashes[path] = self.cache.digests[key]
         return self._hashes[path]
 
     def text(self, path: str) -> str | None:
@@ -502,20 +832,99 @@ def diff_artifacts(
     *,
     deadline: float | None = None,
     changed_binaries: str = "info",
+    native_release: bool = False,
+    cache: _Cache | None = None,
+    context_lines: int = 0,
 ) -> DiffResult:
     """Behaviours of ``new`` whose identity is absent from ``old``.
 
     ``changed_binaries`` is the level for native binaries replaced under the same name:
     "info" by default, because nearly every release of a compiled package rebuilds them.
+    ``native_release`` says the old release shipped compiled wheels: when ``old`` holds no
+    native binary (an sdist, or the pure wheel picked for this machine) and the project
+    already builds native code (those wheels, or C/Cython/Rust sources in the sdist), the
+    new binaries are build output of that code, reported as info, not new native code.
+    ``cache`` (from ``analysis_cache``) shares parse results between diffs of one release.
+    ``context_lines`` above 0 gives each block and warn delta in a text file of the package
+    a ``context``: the diff of that file within that many lines of the delta's line.
     """
-    cache = _Cache(deadline)
+    if cache is None:
+        cache = _Cache(deadline)
     before = _Side(old, ecosystem, cache)
     before.role = "old"
+    before.native_release = native_release
     after = _Side(new, ecosystem, cache)
     old_behaviours, new_behaviours, result = _collect(before, after, before.top_modules())
     new_behaviours.extend(_changed_binary_behaviour(before, after, changed_binaries))
-    _assemble(old_behaviours, new_behaviours, result)
+    if _builds_native(before, native_release):
+        new_behaviours = [_as_build_output(item) for item in new_behaviours]
+    new_behaviours = _without_new_hook_commands(old_behaviours, new_behaviours)
+    _assemble(old_behaviours, new_behaviours, result, _describer(before, after, context_lines))
     return result
+
+
+def analysis_cache(deadline: float | None = None) -> _Cache:
+    """Parse results keyed by file content, shared by the diffs of one release's files."""
+    return _Cache(deadline)
+
+
+def content_digest(file: ArtifactFile, cache: _Cache) -> str:
+    """SHA-256 of a file's bytes, remembered for the review."""
+    key = (str(file.path), file.size)
+    if key not in cache.digests:
+        digest = hashlib.sha256()
+        try:
+            with file.path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(_HASH_CHUNK), b""):
+                    digest.update(chunk)
+        except OSError:
+            return f"unreadable:{file.path}"
+        cache.digests[key] = digest.hexdigest()
+    return cache.digests[key]
+
+
+def native_paths(snapshot: ArtifactSnapshot, cache: _Cache) -> set[str]:
+    """Paths of a wheel's native binaries, by name or by ELF, PE or Mach-O header."""
+    key = snapshot.artifact.url or str(snapshot.extract_dir)
+    if key not in cache.natives:
+        side = _Side(snapshot, "pypi", cache)
+        cache.natives[key] = {path for path in side.entries if _is_native(side, path)}
+    return cache.natives[key]
+
+
+def native_name(path: str) -> bool:
+    """Named like a compiled binary: a native suffix, or a versioned shared library."""
+    lowered = path.lower()
+    return lowered.endswith(_NATIVE_SUFFIXES) or ".so." in PurePosixPath(lowered).name
+
+
+def native_head(head: bytes, size: int) -> bool:
+    """Starts like an ELF, PE or (thin or universal) Mach-O image."""
+    if head.startswith(b"MZ"):
+        return size >= 512
+    return head.startswith(_NATIVE_MAGIC + _FAT_MACHO_MAGIC)
+
+
+def _builds_native(before: _Side, native_release: bool) -> bool:
+    if any(_is_native(before, path) for path in before.entries):
+        return False
+    if native_release:
+        return True
+    return before.kind == "sdist" and any(
+        path.lower().endswith(_NATIVE_SOURCE_SUFFIXES) or path.endswith("Cargo.toml")
+        for path in before.entries
+    )
+
+
+def _as_build_output(item: Behaviour) -> Behaviour:
+    if item.kind != "new_native_binary" or item.identity[:1] != ("native",):
+        return item
+    return replace(
+        item,
+        level="info",
+        detail=f"{item.detail}; the old release builds native code, compared here against "
+        "a file without binaries",
+    )
 
 
 def diff_new_package(
@@ -523,35 +932,35 @@ def diff_new_package(
     ecosystem: str,
     *,
     deadline: float | None = None,
+    context_lines: int = 0,
 ) -> DiffResult:
-    """Review a newly added package on its own, against an empty baseline.
+    """Review a first release (no earlier version) as an upgrade from an empty release.
 
-    Blocks only on signals that are rare in legitimate new packages: startup .pth code
-    (tiered as for upgrades, the package's own modules counting as shipped), top-level
-    sitecustomize/usercustomize, decode-and-exec, agent/editor hook files and git/URL
-    dependencies. Install hooks, nested startup modules, import-time network or exec
-    and obfuscation are warnings; native binaries are informational.
+    Everything the release ships is new, so every behaviour keeps its upgrade level:
+    install hooks, startup .pth code (a .pth import of the package's own modules counts
+    as a module no earlier release shipped), sitecustomize/usercustomize at any depth,
+    decode-and-exec, exec of shipped files, agent/editor hooks, shadowed commands and
+    git/URL dependencies block; import-time network or exec, obfuscation and native
+    binaries warn. Only the plain dependency list is left out: every dependency is new.
+    ``context_lines`` above 0 gives each block and warn delta in a text file a ``context``:
+    that part of the new file, every line added.
     """
     cache = _Cache(deadline)
     before = _Side(replace(new, files=()), ecosystem, cache)
     before.role = "old"
     after = _Side(new, ecosystem, cache)
-    _old, new_behaviours, result = _collect(before, after, after.top_modules())
-    _assemble([], [_new_package_level(item) for item in new_behaviours], result)
+    after.first_release = True
+    _old, new_behaviours, result = _collect(before, after, set())
+    new_behaviours = _without_new_hook_commands([], new_behaviours)
+    new_behaviours = [_first_release_level(item) for item in new_behaviours]
+    _assemble([], new_behaviours, result, _describer(before, after, context_lines))
     return result
 
 
-def _new_package_level(item: Behaviour) -> Behaviour:
-    level = item.level
-    install_hook = item.kind == "new_install_hook" and level == "block"
-    nested_startup = item.kind == "new_sitecustomize" and len(item.identity) == 2
-    if install_hook or nested_startup:
-        level = "warn"
-    elif item.kind == "new_native_binary":
-        level = "info"
-    elif item.kind in {"new_dependency", "install_script_changed"}:
-        level = "drop"
-    return replace(item, level=level)
+def _first_release_level(item: Behaviour) -> Behaviour:
+    if item.kind == "new_dependency":
+        return replace(item, level="drop")
+    return item
 
 
 def _collect(
@@ -559,6 +968,8 @@ def _collect(
 ) -> tuple[list[Behaviour], list[Behaviour], DiffResult]:
     ecosystem = after.ecosystem
     changed = _changed_paths(before, after)
+    before.changed = changed
+    after.changed = changed
     result = DiffResult()
     old_behaviours: list[Behaviour] = []
     new_behaviours: list[Behaviour] = []
@@ -596,6 +1007,10 @@ def _collect(
     old_changed, new_changed = _changed_file_behaviours(before, after, changed, result)
     old_behaviours.extend(old_changed)
     new_behaviours.extend(new_changed)
+    if ecosystem == "pypi":
+        new_behaviours.extend(_top_level_behaviours(before, after))
+        new_behaviours.extend(_native_loader_behaviours(before, after))
+    new_behaviours.extend(_outbound_host_behaviours(before, after))
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
     for path in sorted((after.unparsed & changed) - after.proven):
         if path.lower().endswith(".py"):
@@ -606,7 +1021,10 @@ def _collect(
 
 
 def _assemble(
-    old_behaviours: list[Behaviour], new_behaviours: list[Behaviour], result: DiffResult
+    old_behaviours: list[Behaviour],
+    new_behaviours: list[Behaviour],
+    result: DiffResult,
+    describe: Callable[[Behaviour], str | None] | None = None,
 ) -> None:
     old_ids = {item.identity for item in old_behaviours}
     reported: set[tuple] = set()
@@ -628,12 +1046,73 @@ def _assemble(
         target = {"block": result.block, "warn": result.warn}.get(item.level, result.info)
         counts[(item.level, item.kind)] += 1
         if counts[(item.level, item.kind)] <= MAX_DELTAS_PER_KIND:
-            target.append(item.delta())
+            delta = item.delta()
+            if describe is not None and item.level in {"block", "warn"}:
+                context = describe(item)
+                if context is not None:
+                    delta["context"] = context
+            target.append(delta)
     for (level, kind), count in sorted(counts.items()):
         if count > MAX_DELTAS_PER_KIND:
             result.limitations.append(
                 f"{count - MAX_DELTAS_PER_KIND} more {level} deltas of kind {kind} not listed"
             )
+
+
+def _describer(
+    before: _Side, after: _Side, context_lines: int
+) -> Callable[[Behaviour], str | None] | None:
+    """The diff excerpt of a behaviour's file around its line; None for a binary file, a
+    path that is not a file of the new artifact, or a file that could not be shown (the
+    excerpt is for display and never fails the review)."""
+    if context_lines <= 0:
+        return None
+    diffs: dict[str, code_context.FileDiff | None] = {}
+
+    def describe(item: Behaviour) -> str | None:
+        entry = after.entries.get(item.path)
+        if entry is None:
+            return None
+        try:
+            if item.path not in diffs:
+                diffs[item.path] = _file_diff(before, entry.file, item.path)
+            diff = diffs[item.path]
+            if diff is None:
+                return None
+            return code_context.excerpt(diff, item.line, context_lines)
+        except Exception:
+            diffs[item.path] = None
+            return None
+
+    return describe
+
+
+def _file_diff(before: _Side, file: ArtifactFile, path: str) -> code_context.FileDiff | None:
+    new = code_context.read_lines(file)
+    if new is None:
+        return None
+    old = None
+    if path in before.entries:
+        old = code_context.read_lines(before.entries[path].file)
+    return code_context.FileDiff(old, new)
+
+
+def paired_files(
+    old: ArtifactSnapshot, new: ArtifactSnapshot, ecosystem: str
+) -> list[tuple[str, ArtifactFile | None, ArtifactFile | None]]:
+    """Every package path of the two artifacts with its file on each side (None where a
+    side does not ship it), by the paths the installer writes."""
+    before = _Side(old, ecosystem)
+    after = _Side(new, ecosystem)
+    paired: list[tuple[str, ArtifactFile | None, ArtifactFile | None]] = []
+    for path in sorted(before.entries.keys() | after.entries.keys()):
+        files: list[ArtifactFile | None] = [None, None]
+        for index, side in enumerate((before, after)):
+            entry = side.entries.get(path)
+            if entry is not None:
+                files[index] = entry.file
+        paired.append((path, files[0], files[1]))
+    return paired
 
 
 def _root_prefix(snapshot: ArtifactSnapshot, ecosystem: str) -> str:
@@ -734,9 +1213,10 @@ def _pth_behaviours(side: _Side, baseline_modules: set[str] | None) -> list[Beha
                 )
             )
             continue
-        for number, line in enumerate(text.splitlines(), start=1):
+        for offset, line in pc.pth_lines(text):
             if not line.startswith(("import ", "import\t")):
                 continue
+            number = pc.pth_line_number(text, offset)
             kind, level, detail = _pth_line_level(side, line.strip(), baseline_modules)
             behaviours.append(
                 Behaviour(
@@ -814,6 +1294,353 @@ def _pth_imports(tree: ast.Module, depth: int) -> set[str]:
                 else:
                     names.update(_pth_imports(nested, depth + 1))
     return names
+
+
+def _top_level_behaviours(before: _Side, after: _Side) -> list[Behaviour]:
+    """Top-level packages a wheel adds to site-packages under another distribution's name.
+
+    pip writes ``requests/__init__.py`` over the installed requests distribution's file,
+    so a wheel that ships a top-level name not taken from its own name can replace another
+    package's code. In an upgrade every such name the old release did not ship blocks. A
+    first release has no old release, so only names that imitate another distribution
+    block: one the package itself requires, or a near miss of its own name (reqeusts
+    shipping requests/). Names that carry a long hex hash are generated by compilers (mypyc
+    helper modules) and cannot be another distribution's package.
+    """
+    if after.kind != "wheel":
+        return []
+    package = after.snapshot.package.name
+    own = _plain_name(package)
+    shipped = {_plain_name(name) for name in _top_level_paths(before)}
+    required = set()
+    if after.first_release:
+        required = {_plain_name(name) for name in _required_names(after)}
+    behaviours = []
+    for name, path in sorted(_top_level_paths(after).items()):
+        plain = _plain_name(name)
+        if (
+            plain in shipped
+            or name.lower() in _SDIST_NON_PACKAGES
+            or name.lower() in _STARTUP_MODULES
+            or _GENERATED_NAME_RE.search(name)
+            or _named_after(plain, own)
+        ):
+            continue
+        detail = (
+            f"installs top-level {name}, which the old release did not ship and which is not "
+            f"named after {package}: pip writes it over the files of whichever installed "
+            "distribution owns that name"
+        )
+        if after.first_release:
+            if plain in required:
+                detail = (
+                    f"installs top-level {name}, the package of its own dependency {name}: "
+                    "installing it overwrites that distribution's files"
+                )
+            elif _near_miss(plain, own):
+                detail = (
+                    f"installs top-level {name}, a name close to but not taken from its own "
+                    f"({package}): a lookalike that ships the real package's name is "
+                    "imported in its place"
+                )
+            else:
+                continue
+        behaviours.append(
+            Behaviour(
+                "ambiguous_package_contents",
+                ("top-level", plain),
+                path,
+                None,
+                name,
+                detail,
+                "block",
+            )
+        )
+    return behaviours
+
+
+def _native_loader_behaviours(before: _Side, after: _Side) -> list[Behaviour]:
+    """A previously pure-Python package that now ships a native library and loads it with
+    ctypes or cffi: native code no static rule can inspect, run by the package itself. A
+    first release has no previous release to call pure, so it is not judged here."""
+    if not before.entries or before.native_release:
+        return []
+    if any(_is_native(before, path) for path in before.entries):
+        return []
+    if before.kind == "sdist" and _builds_native(before, False):
+        return []
+    added = {
+        PurePosixPath(path).name.lower(): path
+        for path in after.entries
+        if path not in before.entries and _is_native(after, path)
+    }
+    if not added:
+        return []
+    stems = {name.split(".", 1)[0]: path for name, path in added.items()}
+    behaviours = []
+    for path in sorted(after.changed):
+        if path not in after.entries or not path.lower().endswith(".py"):
+            continue
+        text = after.text(path)
+        if text is None or not _NATIVE_LOADER_HINT.search(text):
+            continue
+        tree = after.tree(path)
+        if tree is None:
+            continue
+        ctx = pc._PyContext(tree)
+        bindings = _bindings(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name, _obfuscated = ctx.resolve(node.func)
+            attribute = _attribute_name(node.func)
+            if name not in _NATIVE_LOADERS and attribute not in {"dlopen", "LoadLibrary"}:
+                continue
+            arguments = [*node.args, *(item.value for item in node.keywords)]
+            strings = " ".join(_strings_in(arguments, bindings)).lower()
+            uses_file = any(
+                isinstance(child, ast.Name) and child.id == "__file__"
+                for argument in arguments
+                for child in _expanded(argument, bindings)
+            )
+            library = next(
+                (shipped for stem, shipped in stems.items() if stem and stem in strings), None
+            )
+            if library is None and uses_file:
+                library = next(iter(sorted(added.values())))
+            if library is None:
+                continue
+            line, snippet = pc._line_snippet(text, pc._offset_for_line(text, node.lineno))
+            behaviours.append(
+                Behaviour(
+                    "uninspectable_import_time_code",
+                    ("native-load", after.entries[library].install_path),
+                    path,
+                    line,
+                    snippet,
+                    f"loads {library} with {name or attribute}; the previous release was pure "
+                    "Python and shipped no native code",
+                    "block",
+                )
+            )
+            break
+    return behaviours
+
+
+def _outbound_host_behaviours(before: _Side, after: _Side) -> list[Behaviour]:
+    """A hard-coded URL host or IP that no file of the old release mentions, in a changed
+    code file that makes network calls: where use-time exfiltration sends data.
+
+    BLOCK (new_exfiltration_host) when the host is a raw public or link-local IP, or key
+    material (private/secret key, seed, mnemonic, keypair) or a whole-environment dump sits
+    within a few hundred characters of it; WARN (new_outbound_host) otherwise, because SDK
+    upgrades legitimately add regional or API hosts that carry an API token. Hosts the new
+    manifest declares, local and documentation names, and tests/docs/examples are ignored.
+    A first release has no old release, so every host is new: only the BLOCK form counts.
+    """
+    ecosystem = after.ecosystem
+    old_hosts = _side_hosts(before)
+    declared = _declared_hosts(after)
+    behaviours: list[Behaviour] = []
+    reported: set[str] = set()
+    for path in sorted(after.changed):
+        if path not in after.entries or not _host_code_file(path, ecosystem):
+            continue
+        text = _host_text(after, path)
+        if not text or not _HOST_NETWORK_RE[ecosystem].search(text):
+            continue
+        for host, offset in _code_hosts(text):
+            if host in reported or host in old_hosts or host in declared or _ignored_host(host):
+                continue
+            raw_ip = _is_ip(host)
+            window = text[max(0, offset - SENSITIVE_WINDOW) : offset + SENSITIVE_WINDOW]
+            sensitive = _SENSITIVE_NEAR_HOST_RE.search(window)
+            if after.first_release and not (raw_ip and sensitive):
+                continue
+            reported.add(host)
+            line, snippet = pc._line_snippet(text, offset)
+            if raw_ip or sensitive:
+                reason = "a raw IP address"
+                if sensitive and not raw_ip:
+                    reason = f"{sensitive.group(0)} next to it"
+                elif sensitive:
+                    reason = f"a raw IP address with {sensitive.group(0)} next to it"
+                behaviours.append(
+                    Behaviour(
+                        "new_exfiltration_host",
+                        ("outbound-host", host),
+                        path,
+                        line,
+                        snippet,
+                        f"network code now sends requests to {host}, which the old release "
+                        f"never mentions: {reason}",
+                        "block",
+                    )
+                )
+            else:
+                behaviours.append(
+                    Behaviour(
+                        "new_outbound_host",
+                        ("outbound-host", host),
+                        path,
+                        line,
+                        snippet,
+                        f"network code now contacts {host}, a host the old release never mentions",
+                        "warn",
+                    )
+                )
+    return behaviours
+
+
+def _host_code_file(path: str, ecosystem: str) -> bool:
+    lowered = path.lower()
+    if lowered.endswith((".map", ".d.ts")) or not lowered.endswith(_HOST_CODE_SUFFIXES[ecosystem]):
+        return False
+    return not set(lowered.split("/")[:-1]) & _HOST_SKIP_PARTS
+
+
+def _host_text(side: _Side, path: str) -> str:
+    text = side.text(path)
+    if text is None and side.entries[path].file.size <= MAX_SCAN_BYTES:
+        text = side.read_text(path, MAX_SCAN_BYTES, allow_nul=True)
+    return text or ""
+
+
+def _side_hosts(side: _Side) -> set[str]:
+    """Every URL host and dotted-quad IP in any text file of the release."""
+
+    def build() -> set[str]:
+        hosts: set[str] = set()
+        for path in side.entries:
+            if side.entries[path].file.size <= MAX_SCAN_BYTES:
+                hosts.update(_file_hosts(side, path))
+        return hosts
+
+    return side.memo("hosts", build)
+
+
+def _file_hosts(side: _Side, path: str) -> frozenset[str]:
+    digest = side.digest(path)
+    if digest not in side.cache.hosts:
+        text = side.text(path)
+        if text is None:
+            text = side.read_text(path, MAX_SCAN_BYTES)
+        found: set[str] = set()
+        if text:
+            found.update(match.group(1).lower() for match in _ANY_URL_HOST_RE.finditer(text))
+            found.update(match.group(1) for match in _BARE_IP_RE.finditer(text))
+        side.cache.hosts[digest] = frozenset(found)
+    return side.cache.hosts[digest]
+
+
+def _declared_hosts(side: _Side) -> set[str]:
+    hosts: set[str] = set()
+    for path in side.entries:
+        name = PurePosixPath(path).name
+        top = (
+            "/" not in path or path.count("/") == 1 and path.split("/", 1)[0].endswith(".dist-info")
+        )
+        if top and name in {"package.json", "METADATA", "PKG-INFO", "pyproject.toml", "setup.cfg"}:
+            text = side.read_text(path, MAX_MANIFEST_BYTES) or ""
+            hosts.update(match.group(1).lower() for match in _ANY_URL_HOST_RE.finditer(text))
+    return hosts
+
+
+def _code_hosts(text: str) -> list[tuple[str, int]]:
+    found: list[tuple[str, int]] = []
+    for match in _QUOTED_URL_HOST_RE.finditer(text):
+        found.append((match.group(1).lower().strip("[]"), match.start(1)))
+        if len(found) >= 2000:
+            return found
+    for match in _SOCKET_IP_RE.finditer(text):
+        ip = next(group for group in match.groups() if group)
+        found.append((ip, match.start()))
+    return found
+
+
+def _ignored_host(host: str) -> bool:
+    if _IGNORED_HOST_RE.search(host):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return bool(re.fullmatch(r"[\d.]+", host))
+    private = address.is_private and not address.is_link_local
+    return (
+        address.is_loopback
+        or private
+        or address.is_unspecified
+        or address.is_multicast
+        or address.is_reserved
+    )
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _top_level_paths(side: _Side) -> dict[str, str]:
+    """Importable top-level names a wheel installs, each with the file that defines it."""
+    found: dict[str, str] = {}
+    for path, entry in sorted(side.entries.items()):
+        install = entry.install_path
+        first = install.split("/", 1)[0]
+        if first.endswith((".dist-info", ".egg-info", ".data")) or first.startswith(".."):
+            continue
+        if "/" in install:
+            name = first
+        elif first.endswith((".py", ".pyc", ".so", ".pyd")):
+            name = first.split(".", 1)[0]
+        else:
+            continue
+        if not name.isidentifier():
+            continue
+        if name not in found or install == f"{name}/__init__.py":
+            found[name] = path
+    return found
+
+
+def _required_names(side: _Side) -> set[str]:
+    names = set()
+    for _path, requirement_text, _line in _python_requirements(side):
+        try:
+            names.add(Requirement(requirement_text).name)
+        except InvalidRequirement:
+            continue
+    return names
+
+
+def _plain_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "", name.rsplit("/", 1)[-1].lower())
+
+
+def _named_after(plain: str, own: str) -> bool:
+    if plain == own:
+        return True
+    return len(plain) >= 3 and (plain in own or own in plain)
+
+
+def _near_miss(plain: str, own: str) -> bool:
+    """Within two edits (a swap of neighbours counts as one) of the package's own name."""
+    if min(len(plain), len(own)) < 4 or abs(len(plain) - len(own)) > 2:
+        return False
+    previous_row: list[int] = []
+    row = list(range(len(own) + 1))
+    for i in range(1, len(plain) + 1):
+        current = [i] + [0] * len(own)
+        for j in range(1, len(own) + 1):
+            cost = 0
+            if plain[i - 1] != own[j - 1]:
+                cost = 1
+            current[j] = min(row[j] + 1, current[j - 1] + 1, row[j - 1] + cost)
+            if i > 1 and j > 1 and plain[i - 1] == own[j - 2] and plain[i - 2] == own[j - 1]:
+                current[j] = min(current[j], previous_row[j - 2] + 1)
+        previous_row, row = row, current
+    return row[len(own)] <= 2
 
 
 def _startup_module_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]:
@@ -1066,14 +1893,47 @@ def _is_native(side: _Side, path: str) -> bool:
     return side.memo(f"native:{path}", build)
 
 
+def _native_format(side: _Side, path: str) -> str:
+    head = side.head(path, 4)
+    if head.startswith(b"MZ"):
+        return "PE"
+    if head.startswith(b"\x7fELF"):
+        return "ELF"
+    return "Mach-O"
+
+
 def _native_identity(path: str) -> str:
-    return re.sub(r"[0-9a-f]{6,}|\d+", "#", path.lower())
+    """Path of a native file with versions and Python ABI tags removed, so a module rebuilt
+    as ``_core.cpython-314-darwin.so`` or ``_core.abi3.so`` keeps one identity."""
+    directory, _slash, name = path.lower().rpartition("/")
+    extension = re.fullmatch(r"([^.]+)(?:\.[^./]+)?\.(?:so|pyd)", name)
+    if extension is not None:
+        name = f"{extension.group(1)}.pyext"
+    return re.sub(r"[0-9a-f]{6,}|\d+", "#", f"{directory}/{name}")
 
 
 def _native_binary_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]:
+    """Native binaries; one named like code, text, data or media (a PE/ELF/Mach-O image in a
+    ``.py``, ``.js``, ``.json``, ``.png``...) is disguised, which a build never produces."""
     behaviours = []
     for path, entry in side.entries.items():
         if not _is_native(side, path):
+            continue
+        suffix = PurePosixPath(path.lower()).suffix
+        if suffix in _DISGUISE_SUFFIXES:
+            side.proven.add(path)
+            behaviours.append(
+                Behaviour(
+                    "ambiguous_package_contents",
+                    ("disguised-native", path, side.digest(path)),
+                    path,
+                    None,
+                    "",
+                    f"{_native_format(side, path)} native binary ({entry.file.size} bytes) "
+                    f"named like a {suffix} file",
+                    "block",
+                )
+            )
             continue
         behaviours.append(
             Behaviour(
@@ -1122,6 +1982,38 @@ def _python_dependency_behaviours(side: _Side, result: DiffResult) -> list[Behav
                 )
             )
     return behaviours
+
+
+def declared_dependencies(snapshot: ArtifactSnapshot, ecosystem: str) -> dict[str, str]:
+    """Dependencies an artifact installs by default: npm ``dependencies``,
+    ``optionalDependencies`` and ``peerDependencies`` (name -> range), or PyPI requirements
+    that apply without extras (canonical name -> requirement text)."""
+    side = _Side(snapshot, ecosystem)
+    found: dict[str, str] = {}
+    if ecosystem == "npm":
+        manifest = _npm_manifest(side) or {}
+        for group in _NPM_DEPENDENCY_GROUPS:
+            values = manifest.get(group)
+            if isinstance(values, dict):
+                for name, spec in values.items():
+                    if isinstance(name, str) and isinstance(spec, str):
+                        found.setdefault(name, spec)
+        return found
+    for _path, text, _line in _python_requirements(side):
+        try:
+            requirement = Requirement(text)
+        except InvalidRequirement:
+            continue
+        if requirement.url:
+            continue
+        if requirement.marker is not None:
+            try:
+                if not requirement.marker.evaluate({"extra": ""}):
+                    continue
+            except Exception:
+                continue
+        found.setdefault(str(canonicalize_name(requirement.name)), text)
+    return found
 
 
 def _python_requirements(side: _Side) -> list[tuple[str, str, int | None]]:
@@ -1209,6 +2101,11 @@ def _python_calls(text: str, tree: ast.Module, *, import_time_only: bool) -> lis
                 continue
             name, _obfuscated = ctx.resolve(node.func)
             category = _call_category(node, name, ctx)
+            if category is None:
+                client = _client_call(node, ctx, bindings)
+                if client is not None:
+                    category = "network"
+                    name = client
             markers = _call_markers(node, category or "")
             sources = _file_exec_sources(node, name, ctx, bindings)
             fallback = None
@@ -1225,6 +2122,32 @@ def _python_calls(text: str, tree: ast.Module, *, import_time_only: bool) -> lis
         return calls
     except RecursionError:
         return None
+
+
+def _client_call(node: ast.Call, ctx: Any, bindings: dict[str, list[ast.AST]]) -> str | None:
+    """``Client.method`` when a network method is called on an HTTP client object: built in
+    the same expression (``requests.Session().post``), bound to a name, or opened by
+    ``with``. Building a client sends nothing; calling these methods does."""
+    func = node.func
+    if not isinstance(func, ast.Attribute) or func.attr not in _CLIENT_NETWORK_METHODS:
+        return None
+    pending: list[tuple[ast.AST, int]] = [(func.value, 0)]
+    seen: set[str] = set()
+    while pending:
+        receiver, depth = pending.pop(0)
+        if isinstance(receiver, ast.Call):
+            name, _obfuscated = ctx.resolve(receiver.func)
+            if name in pc._NETWORK_CLIENT_CALLS:
+                return f"{name}.{func.attr}"
+        elif (
+            isinstance(receiver, ast.Name)
+            and depth < _MAX_BINDING_DEPTH
+            and receiver.id not in seen
+            and receiver.id in bindings
+        ):
+            seen.add(receiver.id)
+            pending.extend((value, depth + 1) for value in bindings[receiver.id])
+    return None
 
 
 def _attribute_name(func: ast.AST) -> str | None:
@@ -1344,30 +2267,46 @@ def _url_hosts(text: str) -> set[str]:
 
 
 def _import_time_with_local_calls(tree: ast.Module) -> set[int]:
-    """Module-level nodes plus the bodies of module functions called at import time."""
+    """Module-level nodes plus the bodies of module functions that import time starts:
+    called by name, passed to threading.Thread/Timer, multiprocessing.Process, an
+    executor's submit, atexit.register or signal.signal (or decorated with
+    ``@atexit.register``), including lambdas passed there."""
     found = pc._import_time_nodes(tree)
     functions = {
         node.name: node
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    pending = [tree]
+    ctx = pc._PyContext(tree)
+    pending: list[ast.AST] = [tree]
     expanded: set[str] = set()
+    decorated = {
+        name
+        for name, node in functions.items()
+        if any(_registers_callback(decorator, ctx) for decorator in node.decorator_list)
+    }
     for _round in range(4):
-        called = set()
+        called = set(decorated - expanded)
+        lambdas: list[ast.AST] = []
         for scope in pending:
             for node in ast.walk(scope):
-                if (
-                    isinstance(node, ast.Call)
-                    and id(node) in found
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id in functions
-                    and node.func.id not in expanded
-                ):
-                    called.add(node.func.id)
-        if not called:
+                if not isinstance(node, ast.Call) or id(node) not in found:
+                    continue
+                references = list(_callback_references(node, ctx))
+                if isinstance(node.func, ast.Name):
+                    references.append(node.func)
+                for reference in references:
+                    if isinstance(reference, ast.Name) and reference.id in functions:
+                        if reference.id not in expanded:
+                            called.add(reference.id)
+                    elif isinstance(reference, ast.Lambda):
+                        lambdas.append(reference.body)
+        if not called and not lambdas:
             break
         pending = []
+        for body in lambdas:
+            found |= {id(child) for child in ast.walk(body)}
+            pending.append(body)
         for name in sorted(called):
             expanded.add(name)
             body = ast.Module(body=functions[name].body, type_ignores=[])
@@ -1376,10 +2315,40 @@ def _import_time_with_local_calls(tree: ast.Module) -> set[int]:
     return found
 
 
+_CALLBACK_ARGUMENTS = {
+    "threading.Thread": (None, "target"),
+    "threading.Timer": (1, "function"),
+    "multiprocessing.Process": (None, "target"),
+    "atexit.register": (0, None),
+    "signal.signal": (1, "handler"),
+}
+
+
+def _registers_callback(node: ast.AST, ctx: Any) -> bool:
+    name, _obfuscated = ctx.resolve(node)
+    return name == "atexit.register"
+
+
+def _callback_references(node: ast.Call, ctx: Any) -> list[ast.AST]:
+    name, _obfuscated = ctx.resolve(node.func)
+    position, keyword = _CALLBACK_ARGUMENTS.get(name or "", (None, None))
+    if name is None and isinstance(node.func, ast.Attribute) and node.func.attr == "submit":
+        position = 0
+    references = []
+    if position is not None and len(node.args) > position:
+        references.append(node.args[position])
+    for item in node.keywords:
+        if keyword is not None and item.arg == keyword:
+            references.append(item.value)
+    return references
+
+
 def _call_category(node: ast.Call, name: str | None, ctx: Any) -> str | None:
     if name in pc._PROCESS_CALLS:
         arguments = [*node.args, *(item.value for item in node.keywords)]
         if any(pc._data_kinds(argument, ctx) & {"decoded", "fetched"} for argument in arguments):
+            return "decode_exec"
+        if any(_inline_code_risky(command) for command in _commands(node, name, ctx)):
             return "decode_exec"
         return "exec"
     if name in _PY_EXEC_NAMES and node.args:
@@ -1404,6 +2373,331 @@ def _call_category(node: ast.Call, name: str | None, ctx: Any) -> str | None:
     ):
         return "network"
     return None
+
+
+@dataclass(frozen=True)
+class _Token:
+    keys: frozenset[str]
+    text: str | None
+    rendered: str = ""
+
+
+def _commands(node: ast.Call, name: str | None, ctx: Any) -> list[list[_Token]]:
+    """The argv of a process call, or each command of a shell string, as tokens that
+    carry the path keys of their expressions (names, folded constants, f-string fields)."""
+    if not node.args:
+        return []
+    first = node.args[0]
+    if name and name.startswith(("os.exec", "os.spawn")):
+        position = 1 if name.startswith("os.spawn") else 0
+        if len(node.args) <= position:
+            return []
+        program = _token(node.args[position], ctx)
+        rest = []
+        if len(node.args) > position + 1 and isinstance(
+            node.args[position + 1], (ast.List, ast.Tuple)
+        ):
+            rest = [_token(item, ctx) for item in node.args[position + 1].elts[1:]]
+        return [[program, *rest]]
+    if name == "asyncio.create_subprocess_exec":
+        return [[_token(item, ctx) for item in node.args]]
+    if isinstance(first, (ast.List, ast.Tuple)):
+        return [[_token(item, ctx) for item in first.elts]]
+    text = _rendered(first, ctx)
+    if text is None:
+        return []
+    commands = []
+    for part in re.split(r"&&|\|\||;|\|", text):
+        try:
+            words = shlex.split(part, posix=True)
+        except ValueError:
+            words = part.split()
+        if words:
+            commands.append([_word_token(word) for word in words])
+    return commands
+
+
+def _rendered(node: ast.AST, ctx: Any) -> str | None:
+    """A string expression's text; f-string fields that do not fold become ``${name}``."""
+    folded, _built = pc._fold(node, ctx, 0)
+    if folded is not None:
+        return folded
+    if not isinstance(node, ast.JoinedStr):
+        return None
+    parts = []
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            parts.append(value.value)
+        elif isinstance(value, ast.FormattedValue):
+            inner, _built = pc._fold(value.value, ctx, 0)
+            if inner is not None:
+                parts.append(inner)
+            elif isinstance(value.value, ast.Name):
+                parts.append("${" + value.value.id + "}")
+            else:
+                parts.append("${expr}")
+    return "".join(parts)
+
+
+def _word_token(word: str) -> _Token:
+    field = re.fullmatch(r"\$\{(\w+)\}", word)
+    if field is not None:
+        return _Token(frozenset({f"name:{field.group(1)}"}), None, field.group(1))
+    return _Token(frozenset({f"const:{word}"}), word, word)
+
+
+def _token(node: ast.AST, ctx: Any) -> _Token:
+    resolved, _obfuscated = ctx.resolve(node)
+    if resolved == "sys.executable":
+        return _Token(frozenset({"const:python"}), "python")
+    keys = _path_keys(node, ctx)
+    text = None
+    rendered = _rendered(node, ctx)
+    if rendered is None:
+        rendered = ast.unparse(node)[:200]
+    elif "${" not in rendered:
+        text = rendered
+    return _Token(frozenset(keys), text, rendered)
+
+
+def _path_keys(node: ast.AST, ctx: Any) -> set[str]:
+    for _depth in range(4):
+        if isinstance(node, ast.Call) and len(node.args) == 1:
+            name, _obfuscated = ctx.resolve(node.func)
+            if name in _PATH_WRAPPERS:
+                node = node.args[0]
+                continue
+        break
+    keys = set()
+    if isinstance(node, ast.Name):
+        keys.add(f"name:{node.id}")
+    folded = _rendered(node, ctx)
+    if folded is not None:
+        whole = re.fullmatch(r"\$\{(\w+)\}", folded)
+        if whole is not None:
+            keys.add(f"name:{whole.group(1)}")
+        elif "${" not in folded:
+            keys.add(f"const:{folded}")
+    if not isinstance(node, (ast.Name, ast.Constant)):
+        keys.add("expr:" + ast.dump(node, include_attributes=False))
+    return keys
+
+
+def _program(token: _Token) -> str:
+    if token.text is None:
+        return ""
+    return re.sub(r"\.exe$", "", posixpath.basename(token.text.replace("\\", "/")).lower())
+
+
+def _inline_code_risky(command: list[_Token]) -> bool:
+    """``python -c CODE`` or ``node -e CODE`` whose code decodes, downloads, starts processes
+    or evaluates decoded or risky code: parsed as code, the way a .pth line is. Exec of code
+    built locally from literals alone (``exec(compile(textwrap.dedent('...')))``) delivers
+    nothing and does not count."""
+    if not command:
+        return False
+    program = _program(command[0])
+    flags = set()
+    if program in _PYTHON_RUNNERS or re.fullmatch(r"python[\d.]*", program):
+        flags = {"-c"}
+    elif program in _NODE_RUNNERS:
+        flags = {"-e", "--eval", "-p", "--print"}
+    for index, token in enumerate(command[1:-1], start=1):
+        if token.text not in flags:
+            continue
+        code = command[index + 1].rendered
+        if program in _NODE_RUNNERS:
+            return bool(
+                _JS_INLINE_RISK_RE.search(code)
+                or pc._JS_ENCODED_EXEC_RE.search(code)
+                or pc._JS_SINK_WRAPS_DECODE_RE.search(code)
+            )
+        events = pc._python_events(code, 1)
+        if events is None:
+            return bool(
+                pc._ENCODED_EXEC_RE.search(code) or re.search(r"\b(?:exec|eval)\s*\(", code)
+            )
+        return any(event.kind in _RISKY_INLINE_KINDS for event in events)
+    return False
+
+
+def _python_stager_behaviours(side: _Side, path: str, text: str) -> list[Behaviour]:
+    """A file staged and then run: decoded or downloaded bytes written to a path, a
+    download with urlretrieve or curl/wget -o, or chmod +x, followed by a process call that
+    runs that path directly or through an interpreter (``[sys.executable, p]``). Upgrades
+    report it wherever it runs; a first release only at import time, since installer tools
+    legitimately fetch and run binaries when called."""
+    tree = side.tree(path)
+    if tree is None or not _STAGER_HINT.search(text):
+        return []
+    try:
+        chains = _stager_chains(tree)
+    except RecursionError:
+        return []
+    import_time = None
+    if side.first_release:
+        import_time = _import_time_with_local_calls(tree)
+    behaviours = []
+    for shape, node, staged in chains:
+        if import_time is not None and id(node) not in import_time:
+            continue
+        line, snippet = pc._line_snippet(text, pc._offset_for_line(text, node.lineno))
+        detail = {
+            "decoded": f"writes decoded data to {staged} and runs it",
+            "downloaded": f"downloads {staged} and runs it",
+            "executable": f"makes {staged} executable and runs it",
+        }[shape]
+        behaviours.append(
+            Behaviour(
+                "new_decode_exec",
+                ("stager", side.entries[path].install_path, shape),
+                path,
+                line,
+                snippet,
+                detail,
+                "block",
+            )
+        )
+    return behaviours
+
+
+def _stager_chains(tree: ast.Module) -> list[tuple[str, ast.Call, str]]:
+    ctx = pc._PyContext(tree)
+    bindings = _bindings(tree)
+    staged: dict[str, tuple[str, str]] = {}
+    runs: list[tuple[ast.Call, list[_Token]]] = []
+
+    def stage(keys: set[str] | frozenset[str], shape: str, label: str) -> None:
+        for key in keys:
+            if key not in staged or shape != "executable":
+                staged[key] = (shape, label)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name, _obfuscated = ctx.resolve(node.func)
+        if name in {"urllib.request.urlretrieve", "urllib.urlretrieve"}:
+            target = node.args[1] if len(node.args) > 1 else _keyword(node, "filename")
+            if target is not None:
+                stage(_path_keys(target, ctx), "downloaded", ast.unparse(target)[:80])
+        elif name in {"os.chmod", "os.lchmod"} and len(node.args) > 1:
+            if _sets_exec_bit(node.args[1], ctx):
+                stage(_path_keys(node.args[0], ctx), "executable", ast.unparse(node.args[0])[:80])
+        elif isinstance(node.func, ast.Attribute) and node.func.attr == "chmod" and node.args:
+            if _sets_exec_bit(node.args[0], ctx):
+                keys = _receiver_keys(node.func.value, ctx, bindings)
+                stage(keys, "executable", ast.unparse(node.func.value)[:80])
+        elif isinstance(node.func, ast.Attribute) and node.func.attr in {
+            "write",
+            "write_bytes",
+            "write_text",
+        }:
+            if node.args:
+                kinds = pc._data_kinds(node.args[0], ctx)
+                shape = ""
+                if "fetched" in kinds:
+                    shape = "downloaded"
+                elif "decoded" in kinds:
+                    shape = "decoded"
+                if shape:
+                    keys = _receiver_keys(node.func.value, ctx, bindings)
+                    stage(keys, shape, _file_label(node.func.value, ctx, bindings))
+        elif name == "shutil.copyfileobj" and len(node.args) > 1:
+            if pc._data_kinds(node.args[0], ctx) & {"fetched", "decoded"}:
+                keys = _receiver_keys(node.args[1], ctx, bindings)
+                stage(keys, "downloaded", _file_label(node.args[1], ctx, bindings))
+        if name in pc._PROCESS_CALLS or (name or "").startswith(("os.exec", "os.spawn")):
+            for command in _commands(node, name, ctx):
+                _stage_command(command, stage)
+                runs.append((node, command))
+    chains: list[tuple[str, ast.Call, str]] = []
+    reported: set[str] = set()
+    for node, command in runs:
+        for keys in _run_targets(command):
+            hit = next((staged[key] for key in sorted(keys) if key in staged), None)
+            if hit is not None and hit[0] not in reported:
+                reported.add(hit[0])
+                chains.append((hit[0], node, hit[1]))
+    return chains
+
+
+def _stage_command(command: list[_Token], stage: Any) -> None:
+    program = _program(command[0])
+    if program in _DOWNLOAD_OUTPUTS:
+        flags = _DOWNLOAD_OUTPUTS[program]
+        for index, token in enumerate(command[:-1]):
+            if token.text in flags:
+                target = command[index + 1]
+                stage(target.keys, "downloaded", target.rendered)
+    elif program == "chmod" and len(command) > 2:
+        mode = command[1].text or ""
+        if "x" in mode or re.fullmatch(r"0?[0-7]*[1357][0-7]?[0-7]?|0?[0-7]?[1357][0-7]?", mode):
+            for target in command[2:]:
+                stage(target.keys, "executable", target.rendered)
+
+
+def _run_targets(command: list[_Token]) -> list[frozenset[str]]:
+    """Path keys of what a command executes: the program, or the script an interpreter
+    is given (not ``-c``/``-e`` code, ``-m`` modules or flags)."""
+    if not command:
+        return []
+    program = _program(command[0])
+    if program in _SCRIPT_RUNNERS or re.fullmatch(r"python[\d.]*", program):
+        for token in command[1:]:
+            text = token.text or ""
+            if text in {"-c", "-e", "-m", "--eval", "-p", "--print", "/c", "-Command", "-c:"}:
+                return []
+            if text.startswith("-"):
+                continue
+            return [token.keys]
+        return []
+    return [command[0].keys]
+
+
+def _receiver_keys(node: ast.AST, ctx: Any, bindings: dict[str, list[ast.AST]]) -> set[str]:
+    """Keys of the file a handle or Path object refers to: ``open(P)``, ``Path(P)``, or a
+    name bound to one of those (``with open(P) as f``)."""
+    keys = set()
+    values = [node]
+    if isinstance(node, ast.Name):
+        keys.add(f"name:{node.id}")
+        values.extend(bindings.get(node.id, []))
+    for value in values:
+        if isinstance(value, ast.Call) and value.args:
+            name, _obfuscated = ctx.resolve(value.func)
+            if name in {"open", "io.open", "codecs.open", "pathlib.Path", "Path"}:
+                keys |= _path_keys(value.args[0], ctx)
+        elif value is not node:
+            keys |= _path_keys(value, ctx)
+    return keys
+
+
+def _file_label(node: ast.AST, ctx: Any, bindings: dict[str, list[ast.AST]]) -> str:
+    values = [node]
+    if isinstance(node, ast.Name):
+        values.extend(bindings.get(node.id, []))
+    for value in values:
+        if isinstance(value, ast.Call) and value.args:
+            name, _obfuscated = ctx.resolve(value.func)
+            if name in {"open", "io.open", "codecs.open", "pathlib.Path", "Path"}:
+                return ast.unparse(value.args[0])[:80]
+    return ast.unparse(node)[:80]
+
+
+def _keyword(node: ast.Call, name: str) -> ast.AST | None:
+    return next((item.value for item in node.keywords if item.arg == name), None)
+
+
+def _sets_exec_bit(node: ast.AST, ctx: Any) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Constant) and isinstance(child.value, int):
+            if not isinstance(child.value, bool) and child.value & 0o111:
+                return True
+        if isinstance(child, ast.Attribute) and child.attr in _EXEC_BIT_NAMES:
+            return True
+        if isinstance(child, ast.Name) and child.id in _EXEC_BIT_NAMES:
+            return True
+    return False
 
 
 def _reads_local_file(node: ast.AST, ctx: Any) -> bool:
@@ -1520,7 +2814,7 @@ def _with_local_imports(side: _Side, hook_files: set[str]) -> set[str]:
         if tree is None:
             continue
         targets = []
-        for target in _module_imports(tree, ""):
+        for target in _module_imports(tree, "", everywhere=True):
             targets.extend(modules.get(prefix) for prefix in _prefixes(target))
         targets.extend(_exec_targets(side, path, False))
         for module_path in targets:
@@ -1612,17 +2906,31 @@ def _python_modules(side: _Side) -> dict[str, str]:
 
 
 def _import_graph(side: _Side, roots: list[str]) -> tuple[list[tuple[str, str]], set[str], bool]:
-    """Modules executed when ``roots`` are imported, every name they import, and truncation."""
+    """Modules executed when ``roots`` are imported, every name they import, and truncation.
+
+    Changed modules are visited before unchanged ones, so a cap reached in a large package
+    still covers the code that changed."""
     modules = _python_modules(side)
     names = {path: name for name, path in modules.items()}
     seen: list[tuple[str, str]] = []
     visited: set[str] = set()
     imported: set[str] = set()
-    queue = list(roots)
-    while queue and len(visited) < MAX_IMPORT_MODULES:
+    changed: deque[str] = deque()
+    others: deque[str] = deque()
+
+    def push(name: str) -> None:
+        if name in modules and name not in visited:
+            if modules[name] in side.changed:
+                changed.append(name)
+            else:
+                others.append(name)
+
+    for root in roots:
+        push(root)
+    while (changed or others) and len(visited) < MAX_IMPORT_MODULES:
         side.cache.check()
-        module = queue.pop(0)
-        if module in visited or module not in modules:
+        module = changed.popleft() if changed else others.popleft()
+        if module in visited:
             continue
         visited.add(module)
         path = modules[module]
@@ -1633,20 +2941,28 @@ def _import_graph(side: _Side, roots: list[str]) -> tuple[list[tuple[str, str]],
         package = module
         if not path.endswith("__init__.py"):
             package = module.rpartition(".")[0]
-        for target in _module_imports(tree, package):
+        key = (side.digest(path), package, module)
+        if key not in side.cache.imports:
+            side.cache.imports[key] = _module_imports(tree, package, module)
+        for target in side.cache.imports[key]:
             for prefix in _prefixes(target):
                 imported.add(prefix)
-                if prefix in modules and prefix not in visited:
-                    queue.append(prefix)
+                push(prefix)
         for target in _exec_targets(side, path, True):
             name = names.get(target)
-            if name is not None and name not in visited:
-                queue.append(name)
-    return seen, imported, bool(queue)
+            if name is not None:
+                push(name)
+    remaining = [name for name in (*changed, *others) if name not in visited]
+    return seen, imported, bool(remaining)
 
 
 def _default_graph(side: _Side) -> tuple[list[tuple[str, str]], set[str], bool]:
-    roots = sorted(name for name in _python_modules(side) if "." not in name)
+    """Every top of an import chain is a root: plain top-level modules and the first
+    importable level under a PEP 420 namespace directory (no ``__init__.py``)."""
+    modules = _python_modules(side)
+    roots = sorted(
+        name for name in modules if not any(prefix in modules for prefix in _prefixes(name)[:-1])
+    )
     return side.memo("graph", lambda: _import_graph(side, roots))
 
 
@@ -1671,12 +2987,13 @@ def _python_import_time_behaviours(side: _Side, result: DiffResult) -> list[Beha
                     call.line,
                     call.snippet,
                     f"{call.callee} runs when {module} is imported",
-                    "warn",
+                    "block",
                 )
             )
-    if truncated:
-        result.limitations.append(
-            f"import-time analysis stopped after {MAX_IMPORT_MODULES} modules"
+    if truncated and side.role == "new":
+        result.incomplete.append(
+            f"import-time analysis stopped after {MAX_IMPORT_MODULES} modules; changed modules "
+            "were visited first, the rest were not inspected"
         )
     return behaviours
 
@@ -1768,7 +3085,7 @@ def _startup_imports(side: _Side) -> set[str]:
         lowered = path.lower()
         if lowered.endswith(".pth"):
             text = side.text(path) or ""
-            for line in text.splitlines():
+            for _offset, line in pc.pth_lines(text):
                 if line.startswith(("import ", "import\t")):
                     tree = pc._parse_python(line.strip())
                     if tree is not None:
@@ -1780,11 +3097,22 @@ def _startup_imports(side: _Side) -> set[str]:
     return names
 
 
-def _module_imports(tree: ast.Module, package: str) -> list[str]:
+def _module_imports(
+    tree: ast.Module, package: str, module: str = "", *, everywhere: bool = False
+) -> list[str]:
+    """Modules imported at import time: import statements and ``importlib.import_module``
+    or ``__import__`` calls with a constant name (relative names resolved as importlib
+    does, against ``package=``, ``__name__`` or ``__package__``)."""
     import_time = pc._import_time_nodes(tree)
+    ctx = pc._PyContext(tree)
     targets = []
     for node in ast.walk(tree):
-        if id(node) not in import_time:
+        if not everywhere and id(node) not in import_time:
+            continue
+        if isinstance(node, ast.Call):
+            target = _dynamic_import(node, ctx, package, module)
+            if target:
+                targets.append(target)
             continue
         if isinstance(node, ast.Import):
             targets.extend(alias.name for alias in node.names)
@@ -1803,6 +3131,42 @@ def _module_imports(tree: ast.Module, package: str) -> list[str]:
             targets.append(base)
             targets.extend(f"{base}.{alias.name}" for alias in node.names if alias.name != "*")
     return targets
+
+
+def _dynamic_import(node: ast.Call, ctx: Any, package: str, module: str) -> str | None:
+    name, _obfuscated = ctx.resolve(node.func)
+    if name not in _DYNAMIC_IMPORTS or not node.args:
+        return None
+    target, _folded = pc._fold(node.args[0], ctx, 0)
+    if not target:
+        return None
+    if not target.startswith("."):
+        return target
+    anchor_node = None
+    if name == "importlib.import_module":
+        if len(node.args) > 1:
+            anchor_node = node.args[1]
+        for keyword in node.keywords:
+            if keyword.arg == "package":
+                anchor_node = keyword.value
+    anchor = None
+    if isinstance(anchor_node, ast.Name) and anchor_node.id == "__name__":
+        anchor = module or package
+    elif isinstance(anchor_node, ast.Name) and anchor_node.id == "__package__":
+        anchor = package
+    elif anchor_node is not None:
+        anchor, _folded = pc._fold(anchor_node, ctx, 0)
+    if not anchor:
+        return None
+    level = len(target) - len(target.lstrip("."))
+    parts = anchor.split(".")
+    if level - 1 >= len(parts):
+        return None
+    base = ".".join(parts[: len(parts) - (level - 1)])
+    rest = target[level:]
+    if not rest:
+        return base
+    return f"{base}.{rest}"
 
 
 def _prefixes(name: str) -> list[str]:
@@ -1852,32 +3216,20 @@ def _npm_manifest_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]
                     )
                 )
                 continue
-            behaviours.append(
-                Behaviour(
-                    "new_install_hook",
-                    ("npm-hook", prefix + hook, command.strip()),
-                    path,
-                    line,
-                    command,
-                    f"npm runs the {hook} script on install",
-                    "block",
-                )
-            )
+            behaviours.extend(_npm_hook_behaviours(path, line, prefix + hook, command))
         binding = posixpath.join(posixpath.dirname(path), "binding.gyp")
         if (
             binding in side.entries
             and data.get("gypfile") is not False
             and not any(isinstance(scripts.get(hook), str) for hook in ("preinstall", "install"))
         ):
-            behaviours.append(
-                Behaviour(
-                    "new_install_hook",
-                    ("npm-hook", prefix + "install", "node-gyp rebuild"),
+            behaviours.extend(
+                _npm_hook_behaviours(
                     binding,
                     None,
+                    prefix + "install",
                     "node-gyp rebuild",
                     "binding.gyp makes npm compile native code on install",
-                    "block",
                 )
             )
         if path != "package.json":
@@ -1915,6 +3267,71 @@ def _npm_manifest_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]
                         )
                     )
     return behaviours
+
+
+def _npm_hook_behaviours(
+    path: str, line: int | None, event: str, command: str, detail: str = ""
+) -> list[Behaviour]:
+    """An install hook: the event itself (new: block), its command (changed: warn) and the
+    download-and-run, decode/eval and exfiltration sinks the command uses (new: block)."""
+    hook = event.rpartition(":")[2]
+    behaviours = [
+        Behaviour(
+            "new_install_hook",
+            ("npm-hook", event),
+            path,
+            line,
+            command,
+            detail or f"npm runs the {hook} script on install",
+            "block",
+        ),
+        Behaviour(
+            "install_script_changed",
+            ("npm-hook-command", event, " ".join(command.split())),
+            path,
+            line,
+            command,
+            f"the {hook} install hook command changed; npm runs it on install",
+            "warn",
+        ),
+    ]
+    for sink, what in _hook_command_sinks(command):
+        behaviours.append(
+            Behaviour(
+                "new_install_hook",
+                ("npm-hook-sink", sink),
+                path,
+                line,
+                command,
+                f"the {hook} install hook command now {what}",
+                "block",
+            )
+        )
+    return behaviours
+
+
+def _hook_command_sinks(command: str) -> list[tuple[str, str]]:
+    sinks = []
+    download = _HOOK_DOWNLOAD_RE.search(command) is not None
+    if _SHELL_PIPE_RE.search(command) or (download and _HOOK_RUN_RE.search(command)):
+        sinks.append(("download-execute", "downloads and runs a program or code"))
+    if _HOOK_DECODE_RE.search(command):
+        sinks.append(("decode-eval", "decodes or evaluates code"))
+    if download and _HOOK_SECRET_RE.search(command):
+        sinks.append(("exfiltration", "sends environment or credential data over the network"))
+    return sinks
+
+
+def _without_new_hook_commands(
+    old_behaviours: list[Behaviour], new_behaviours: list[Behaviour]
+) -> list[Behaviour]:
+    """The command of a hook event the old release lacks is part of that new hook."""
+    events = {item.identity for item in old_behaviours if item.identity[:1] == ("npm-hook",)}
+    return [
+        item
+        for item in new_behaviours
+        if item.identity[:1] != ("npm-hook-command",) or ("npm-hook", item.identity[1]) in events
+    ]
 
 
 def _npm_import_time_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]:
@@ -1964,6 +3381,8 @@ def _npm_import_time_behaviours(side: _Side, result: DiffResult) -> list[Behavio
                 )
             )
         binding = _JS_BINDING_RE.search(text)
+        if binding and not _JS_BINDING_RE.search(_normalize_javascript(text, path, [])):
+            binding = None
         if binding:
             line, snippet = pc._line_snippet(text, binding.start())
             behaviours.append(
@@ -2062,10 +3481,12 @@ def _file_code_behaviours(
         return behaviours
     if js_like:
         behaviours.extend(_decoded_sink_behaviours(side, path, text))
+        behaviours.extend(_js_runtime_module_behaviours(side, path, text))
     if side.ecosystem == "npm":
         behaviours.extend(_npm_code_behaviours(side, path, text, js_like and not python))
     if side.ecosystem == "pypi" and python:
         behaviours.extend(_python_decode_exec(side, path, text))
+        behaviours.extend(_python_stager_behaviours(side, path, text))
     return behaviours
 
 
@@ -2122,25 +3543,34 @@ def _python_decoders(side: _Side) -> set[str]:
     def build() -> set[str]:
         decoders: set[str] = set()
         for module, path in _python_modules(side).items():
-            text = side.text(path)
-            if text is None or not _PY_DECODE_HINT.search(text):
-                continue
-            tree = side.tree(path)
-            if tree is None:
-                continue
-            ctx = pc._PyContext(tree)
-            for node in tree.body:
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Call):
-                        name, _obfuscated = ctx.resolve(child.func)
-                        if name in pc._DECODE_CALLS:
-                            decoders.add(f"{module}.{node.name}")
-                            break
+            key = (side.digest(path), module)
+            if key not in side.cache.decoders:
+                side.cache.decoders[key] = frozenset(_module_decoders(side, module, path))
+            decoders.update(side.cache.decoders[key])
         return decoders
 
     return side.memo("decoders", build)
+
+
+def _module_decoders(side: _Side, module: str, path: str) -> set[str]:
+    text = side.text(path)
+    if text is None or not _PY_DECODE_HINT.search(text):
+        return set()
+    tree = side.tree(path)
+    if tree is None:
+        return set()
+    decoders = set()
+    ctx = pc._PyContext(tree)
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                name, _obfuscated = ctx.resolve(child.func)
+                if name in pc._DECODE_CALLS:
+                    decoders.add(f"{module}.{node.name}")
+                    break
+    return decoders
 
 
 def _cross_module_decode_exec(
@@ -2226,10 +3656,7 @@ def _npm_code_behaviours(side: _Side, path: str, text: str, javascript: bool) ->
         if mapped is None or rule in seen:
             continue
         seen.add(rule)
-        kind, detail = mapped
-        level = "warn"
-        if kind in BLOCK_KINDS:
-            level = "block"
+        kind, detail, level = mapped
         line, snippet = _rule_location(text, rule)
         if not snippet and finding.evidence:
             snippet = str(finding.evidence[0].metadata.get("snippet") or "")
@@ -2245,6 +3672,65 @@ def _npm_code_behaviours(side: _Side, path: str, text: str, javascript: bool) ->
             )
         )
     return behaviours
+
+
+def _js_runtime_module_behaviours(side: _Side, path: str, text: str) -> list[Behaviour]:
+    """Code that becomes a module at runtime: a decoded string compiled with
+    ``Module.prototype._compile``, or ``require`` of a name looked up in an obfuscator
+    string array that holds a process, network or vm module (plainly or base64-encoded)."""
+    behaviours = []
+    if _JS_MODULE_CTOR_RE.search(text) and _JS_DECODER_RE.search(text):
+        for match in _JS_COMPILE_CALL_RE.finditer(text):
+            argument = _call_argument(text, match.end())
+            if _js_file_read(text, argument) is not None:
+                continue
+            line, snippet = pc._line_snippet(text, match.start())
+            behaviours.append(
+                Behaviour(
+                    "new_decode_exec",
+                    ("decoded-compile", path),
+                    path,
+                    line,
+                    snippet,
+                    "decodes a string and compiles it as a module with Module._compile",
+                    "block",
+                )
+            )
+            break
+    lookup = _JS_LOOKUP_REQUIRE_RE.search(text)
+    if lookup is not None:
+        module = _lookup_module(text)
+        if module is not None:
+            line, snippet = pc._line_snippet(text, lookup.start())
+            behaviours.append(
+                Behaviour(
+                    "new_decode_exec",
+                    ("lookup-require", path),
+                    path,
+                    line,
+                    snippet,
+                    f"loads modules through an obfuscator string-array lookup whose array "
+                    f"holds {module}",
+                    "block",
+                )
+            )
+    return behaviours
+
+
+def _lookup_module(text: str) -> str | None:
+    for count, match in enumerate(_JS_STRING_RE.finditer(text)):
+        if count >= 20000:
+            break
+        value = next((group for group in match.groups() if group is not None), "")
+        candidates = [value]
+        if _BASE64_TOKEN_RE.fullmatch(value):
+            with contextlib.suppress(binascii.Error, ValueError, UnicodeDecodeError):
+                candidates.append(base64.b64decode(value, validate=True).decode("ascii"))
+        for candidate in candidates:
+            name = candidate.strip().removeprefix("node:")
+            if name in _JS_LOOKUP_MODULES:
+                return name
+    return None
 
 
 def _js_reachable(side: _Side) -> set[str]:
@@ -2468,8 +3954,8 @@ def _decoder_source(side: _Side, path: str, text: str, name: str) -> str | None:
         return "defined in this file"
     escaped = re.escape(name)
     patterns = (
-        rf"(?:const|let|var)\s*\{{[^}}]*\b{escaped}\b[^}}]*\}}\s*=\s*require\(\s*['\"](\.[^'\"]+)['\"]",
-        rf"(?:const|let|var)\s+{escaped}\s*=\s*require\(\s*['\"](\.[^'\"]+)['\"]",
+        rf"(?:const|let|var)\s*\{{[^}}]*\b{escaped}\b[^}}]*\}}\s*=\s*require\(\s*['\"`](\.[^'\"`$]+)['\"`]",
+        rf"(?:const|let|var)\s+{escaped}\s*=\s*require\(\s*['\"`](\.[^'\"`$]+)['\"`]",
         rf"import\s*\{{[^}}]*\b{escaped}\b[^}}]*\}}\s*from\s*['\"](\.[^'\"]+)['\"]",
         rf"import\s+{escaped}\s+from\s*['\"](\.[^'\"]+)['\"]",
     )
@@ -2552,6 +4038,11 @@ def _obfuscation_behaviours(side: _Side, path: str) -> list[Behaviour]:
     elif blob is not None and path.lower().endswith(".py"):
         reason = f"{len(blob.group(0))}-character encoded string"
         offset = blob.start()
+    elif blob is not None and path.lower().endswith(_JS_SUFFIXES):
+        payload = _js_executed_blob(text)
+        if payload is not None:
+            reason = f"{len(payload.group(0))}-character encoded string decoded into eval"
+            offset = payload.start()
     if not reason:
         return []
     line, snippet = pc._line_snippet(text, offset)
@@ -2563,9 +4054,25 @@ def _obfuscation_behaviours(side: _Side, path: str) -> list[Behaviour]:
             line,
             snippet[:120],
             f"large obfuscated file ({entry.file.size} bytes, {reason})",
-            "warn",
+            "block",
         )
     ]
+
+
+def _js_executed_blob(text: str) -> re.Match[str] | None:
+    """A large encoded string (not a data: URI or inline source map) in a file that decodes
+    data and evaluates code; embedded wasm, fonts and source maps have no eval."""
+    if not _JS_DECODER_RE.search(text):
+        return None
+    sink = _JS_INDIRECT_EVAL_RE.search(text) is not None or any(
+        _js_sink(match, text) is not None for match in _JS_CODE_SINK_RE.finditer(text)
+    )
+    if not sink:
+        return None
+    for blob in _BLOB_RE.finditer(text):
+        if "base64," not in text[max(0, blob.start() - 40) : blob.start()]:
+            return blob
+    return None
 
 
 def _npm_install_targets(side: _Side) -> dict[str, str]:
@@ -2711,20 +4218,38 @@ def _install_signatures(path: str, text: str, language: str) -> list[Behaviour]:
                 )
             )
         download = pc._JS_DOWNLOAD_RE.search(chunk)
-        if download is not None and pc._JS_EXECUTE_RE.search(chunk):
+        sinks = _install_sinks(chunk, text, language)
+        if download is not None and sinks:
             line, snippet = pc._line_snippet(chunk, download.start())
             behaviours.append(
                 Behaviour(
                     "new_install_hook",
-                    ("install-download-execute",),
+                    ("install-download-execute", sinks),
                     path,
                     line,
                     snippet,
-                    "install-time code downloads and executes a program",
+                    "install-time code downloads and executes a program or code "
+                    f"({', '.join(sinks)})",
                     "block",
                 )
             )
     return behaviours
+
+
+def _install_sinks(chunk: str, text: str, language: str) -> tuple[str, ...]:
+    """How install-time code can run what it downloads: process calls, chmod, shell pipes
+    and, in JavaScript, eval/Function/vm/Module._compile. A sink the old release did not
+    use makes the download-and-run behaviour new even when the file already downloaded."""
+    sinks = {
+        re.sub(r"[\s(.|]", "", match.group(0)).lower()
+        for match in pc._JS_EXECUTE_RE.finditer(chunk)
+    }
+    if language == "js":
+        for match in _JS_CODE_SINK_RE.finditer(chunk):
+            sink = _js_sink(match, text)
+            if sink is not None:
+                sinks.add(sink.lower())
+    return tuple(sorted(sinks))
 
 
 def _process_arguments(text: str, language: str) -> list[tuple[str, int]]:
@@ -2865,11 +4390,14 @@ def _ambiguity_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]:
 
 def _command_behaviours(side: _Side, result: DiffResult) -> list[Behaviour]:
     """New executables named like common system tools (node, git, pip, sh, curl...)."""
-    package = canonicalize_name(side.snapshot.package.name.rsplit("/", 1)[-1])
+    full_name = side.snapshot.package.name.lower()
+    package = canonicalize_name(full_name.rsplit("/", 1)[-1])
     behaviours = []
     for name, path in _declared_commands(side):
         command = re.sub(r"\.(?:exe|cmd|ps1|bat|py)$", "", name.lower())
         if command not in SHADOWED_COMMANDS or canonicalize_name(command) == package:
+            continue
+        if full_name in _COMMAND_PROVIDERS.get(command, frozenset()):
             continue
         behaviours.append(
             Behaviour(

@@ -308,7 +308,10 @@ def test_startup_module_downgrades_block(registry):
     )
 
     assert _kinds(package_startup, "block") == ["new_sitecustomize"]
-    assert _kinds(shadowed, "block") == ["new_pth_code"]
+    assert _kinds(shadowed, "block") == ["ambiguous_package_contents", "new_pth_code"]
+    assert [d["path"] for d in shadowed["block"] if d["kind"] == "ambiguous_package_contents"] == [
+        f"{shadow}.py"
+    ]
     assert "new_pth_code" in _kinds(report["results"][0], "block")
 
 
@@ -463,8 +466,10 @@ def test_import_time_exec_of_a_shipped_file_blocks_and_names_the_file(registry):
 
         result, _receipt = _one("pypi", name, "1.0", "1.1")
 
-        assert _kinds(result, "block") == ["new_decode_exec"], code
-        assert f"{name}/{payload}" in result["block"][0]["detail"], code
+        decoded = [delta for delta in result["block"] if delta["kind"] == "new_decode_exec"]
+        assert len(decoded) == 1, code
+        assert f"{name}/{payload}" in decoded[0]["detail"], code
+        assert set(_kinds(result, "block")) <= {"new_decode_exec", "new_import_time_exec"}, code
 
 
 def test_npm_eval_of_a_shipped_file_blocks_at_load_and_install_time(registry):
