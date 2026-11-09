@@ -174,7 +174,8 @@ New `scripts/build_feed.py` (+ `tests/test_build_feed.py`), pure-stdlib where po
 2. Parse OSV `MAL-` records → `npm-malware` / `pypi-malware` per §2 mapping; normalize names;
    dedupe by `(name, version|∅, id)`.
 3. (v1.1) Pull last-30-day releases → `npm-releases` / `pypi-releases` with `covers_since`.
-4. Emit `schema: ca9.feed.v1`, `created_at = now`, `expires_at = now + 7d`.
+4. Emit `schema: ca9.feed.v1`, `created_at = now`, `osv_built_at` (when the OSV datasets were
+   built), `expires_at = osv_built_at + 7d`.
 5. Write inline bundle (v1) or file-backed snapshot dir (v1.1); the existing
    `update_feed_from_source` does hashing/snapshot-id — the builder can just emit datasets and
    let a publish step run `update_feed_from_source` to produce canonical output, or replicate the
@@ -182,10 +183,18 @@ New `scripts/build_feed.py` (+ `tests/test_build_feed.py`), pure-stdlib where po
 
 ## 6. Hosting & refresh (zero infra cost)
 
-- A scheduled GitHub Actions workflow (`.github/workflows/feed.yml`, daily) runs the builder and
-  publishes the bundle to the dedicated `feed` branch.
-- `DEFAULT_FEED_URL` points at that stable URL; `expires_at = now + 7d` gives a 6-day grace
-  window before `feed status` reports `stale`.
+- A scheduled GitHub Actions workflow (`.github/workflows/feed.yml`, hourly at minute 17) runs
+  the builder and publishes the bundle to the dedicated `feed` branch. The OSV-derived datasets
+  (malware, malware ranges, releases) are rebuilt every 6 hours by default (workflow input
+  `osv_rebuild_hours` or repository variable `CA9_OSV_REBUILD_HOURS`); in the hours between, they
+  are copied unchanged from the previously published bundle. The bundle's `osv_built_at` says
+  when they were built, and `ca9 feed status` shows it. If the previous bundle cannot be read,
+  the OSV datasets are rebuilt that hour.
+- Every hour the same build job also runs the sentinel (`scripts/sentinel.py`), which adds the
+  `npm-suspicious` and `pypi-suspicious` datasets (see the supply-chain guide).
+- `DEFAULT_FEED_URL` points at that stable URL; `expires_at = osv_built_at + 7d` gives about a
+  6-day grace window before `feed status` reports `stale`, and carrying OSV data forward never
+  extends it.
 - Consider a sibling `ca9-feed` repo so feed publish cadence is decoupled from code releases.
 
 ## 7. Code changes summary
@@ -196,7 +205,7 @@ New `scripts/build_feed.py` (+ `tests/test_build_feed.py`), pure-stdlib where po
 | `package_feed.py` | add `DEFAULT_FEED_URL`; add release-window helpers; wrap feed download/JSON errors cleanly | v1 / v1.1 |
 | `preflight.py`, `npm_gateway.py`, `pypi_gateway.py` | case-2 "absent ⇒ old enough" age short-circuit; npm can use registry metadata time map in the gateway | v1.1 |
 | `cli.py` `vet_cmd` | use installed local feed malware and package-age findings | v1 / v1.1 |
-| `scripts/build_feed.py` + workflow | new builder + daily publish | v1 |
+| `scripts/build_feed.py` + workflow | new builder + hourly publish (OSV rebuilt every 6 h) | v1 |
 | docs / README | document zero-arg `feed update`, refresh, provenance/licenses | v1 |
 
 ## 8. Risks / open questions

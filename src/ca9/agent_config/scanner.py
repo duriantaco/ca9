@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import posixpath
 import re
@@ -11,7 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ca9.agent_config import commands, impersonation, jsonc
-from ca9.agent_config.mcp_launch import parse_launch
+from ca9.agent_config.mcp_launch import non_public_indexes, parse_launch
 
 try:
     import tomllib
@@ -46,7 +47,18 @@ _SKIP_DIRS = frozenset(
     }
 )
 _CONFIG_DIRECTORIES = frozenset(
-    {".claude", ".gemini", ".cursor", ".codex", ".vscode", ".roo", ".amazonq", ".windsurf", ".kiro"}
+    {
+        ".claude",
+        ".gemini",
+        ".cursor",
+        ".codex",
+        ".vscode",
+        ".roo",
+        ".amazonq",
+        ".windsurf",
+        ".kiro",
+        ".zed",
+    }
 )
 _HOOK_ROLES = frozenset(
     {
@@ -56,9 +68,11 @@ _HOOK_ROLES = frozenset(
         "codex_hooks",
         "vscode_tasks",
         "code_workspace",
+        "kiro_hook",
     }
 )
 _AGENT_NAMES = {
+    "kiro": "Kiro",
     "claude": "Claude Code",
     "gemini": "Gemini CLI",
     "cursor": "Cursor",
@@ -100,6 +114,21 @@ _OFFICIAL_HOSTS = {
 }
 _CODE_LOADING_ENV = frozenset(
     {"NODE_OPTIONS", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PYTHONSTARTUP"}
+)
+_INDEX_ENV = frozenset(
+    {
+        "NPM_CONFIG_REGISTRY",
+        "YARN_NPM_REGISTRY_SERVER",
+        "BUN_CONFIG_REGISTRY",
+        "UV_INDEX",
+        "UV_INDEX_URL",
+        "UV_EXTRA_INDEX_URL",
+        "UV_DEFAULT_INDEX",
+        "UV_FIND_LINKS",
+        "PIP_INDEX_URL",
+        "PIP_EXTRA_INDEX_URL",
+        "PIP_FIND_LINKS",
+    }
 )
 _SEVERITY_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 _SALVAGE_COMMAND = re.compile(r'"command"\s*:\s*("(?:[^"\\]|\\.)*")', re.DOTALL)
@@ -158,8 +187,12 @@ def role_for(path: str | Path) -> str | None:
         grand = parts[-3]
     if name == ".mcp.json":
         return "mcp"
+    if name in {"opencode.json", "opencode.jsonc"}:
+        return "opencode"
     if name.endswith(".code-workspace"):
         return "code_workspace"
+    if name.endswith(".kiro.hook") and (grand, parent) == (".kiro", "hooks"):
+        return "kiro_hook"
     roles = {
         (".claude", "settings.json"): "claude_settings",
         (".claude", "settings.local.json"): "claude_settings",
@@ -174,6 +207,7 @@ def role_for(path: str | Path) -> str | None:
         (".roo", "mcp.json"): "mcp",
         (".amazonq", "mcp.json"): "mcp",
         (".windsurf", "mcp.json"): "mcp",
+        (".zed", "settings.json"): "zed_settings",
     }
     if (parent, name) in roles:
         return roles[(parent, name)]
@@ -224,6 +258,7 @@ def analyze_text(rel_path: str, text: str, *, truncated: bool = False) -> FileRe
     if role == "claude_settings":
         _hooks_block(rel_path, document, value, "claude", "claude_hook", result)
         _claude_commands(rel_path, document, value, result)
+        _claude_plugins(rel_path, document, value, result)
         _env_overrides(rel_path, document, value.get("env"), result)
         _servers_block(rel_path, document, value, result)
     elif role == "gemini_settings":
@@ -244,6 +279,12 @@ def analyze_text(rel_path: str, text: str, *, truncated: bool = False) -> FileRe
         mcp = value.get("mcp")
         if isinstance(mcp, jsonc.LineDict):
             _servers_block(rel_path, document, mcp, result)
+    elif role == "kiro_hook":
+        _kiro_hook(rel_path, document, value, result)
+    elif role == "opencode":
+        _named_servers(rel_path, document, value.get("mcp"), result)
+    elif role == "zed_settings":
+        _named_servers(rel_path, document, value.get("context_servers"), result)
     else:
         _servers_block(rel_path, document, value, result)
     return result
@@ -573,6 +614,95 @@ def _claude_commands(
             )
 
 
+def _claude_plugins(
+    rel: str, document: jsonc.Document, value: jsonc.LineDict, result: FileResult
+) -> None:
+    """Plugins a committed settings file enables; their hooks and MCP servers run code that
+    lives in the marketplace, not in this repository."""
+    plugins = value.get("enabledPlugins")
+    if not isinstance(plugins, jsonc.LineDict):
+        return
+    markets = value.get("extraKnownMarketplaces")
+    for name, enabled in plugins.items():
+        if enabled is not True:
+            continue
+        marketplace = _marketplace(markets, str(name).rpartition("@")[2])
+        command = f"plugin {name}"
+        if marketplace:
+            command = f"plugin {name} from marketplace {marketplace}"
+        result.hooks.append(
+            _hook(
+                rel,
+                document,
+                "claude_setting",
+                "enabledPlugins",
+                command,
+                plugins.offsets.get(name),
+                "claude",
+                {"plugin": str(name), "marketplace": marketplace},
+            )
+        )
+
+
+def _marketplace(markets: Any, name: str) -> str:
+    if not isinstance(markets, jsonc.LineDict) or not name:
+        return ""
+    entry = markets.get(name)
+    source = None
+    if isinstance(entry, jsonc.LineDict):
+        source = entry.get("source")
+    if not isinstance(source, jsonc.LineDict):
+        return ""
+    kind = source.get("source")
+    for key in ("repo", "url", "path"):
+        if isinstance(source.get(key), str) and source[key].strip():
+            return f"{kind}:{source[key].strip()}"
+    return str(kind or "")
+
+
+def _kiro_hook(
+    rel: str, document: jsonc.Document, value: jsonc.LineDict, result: FileResult
+) -> None:
+    """A Kiro agent hook (``.kiro/hooks/*.kiro.hook``) whose ``then`` runs a command."""
+    if value.get("enabled") is False:
+        return
+    action = value.get("then")
+    if not isinstance(action, jsonc.LineDict):
+        return
+    command = _command_text(action.get("command"))
+    if command is None:
+        return
+    event = "unknown"
+    when = value.get("when")
+    if isinstance(when, jsonc.LineDict) and isinstance(when.get("type"), str):
+        event = when["type"]
+    extra: dict[str, Any] = {}
+    if isinstance(action.get("type"), str):
+        extra["handler_type"] = action["type"]
+    result.hooks.append(
+        _hook(
+            rel, document, "kiro_hook", event, command, action.offsets.get("command"), "kiro", extra
+        )
+    )
+
+
+def _named_servers(rel: str, document: jsonc.Document, servers: Any, result: FileResult) -> None:
+    """opencode ``mcp`` and Zed ``context_servers``: a name per server, the command as a
+    list, a string with ``args``, or ``{path, args, env}``."""
+    if not isinstance(servers, jsonc.LineDict):
+        return
+    for name, config in servers.items():
+        if not isinstance(config, jsonc.LineDict) or config.get("enabled") is False:
+            continue
+        line = document.line(servers.offsets[name])
+        command = config.get("command")
+        if isinstance(command, jsonc.LineDict):
+            config = {**config, **command, "command": command.get("path")}
+        server = _server(rel, str(name), config, line)
+        if server is not None:
+            result.servers.append(server)
+
+
 def _gemini_commands(
     rel: str, document: jsonc.Document, value: jsonc.LineDict, result: FileResult
 ) -> None:
@@ -666,8 +796,11 @@ def _server(rel: str, name: str, config: dict[str, Any], line: int) -> Server | 
     if not argv and url is None:
         return None
     env: dict[str, str] = {}
-    if isinstance(config.get("env"), dict):
-        env = {str(k): str(v) for k, v in config["env"].items() if isinstance(v, (str, int, float))}
+    for key in ("env", "environment"):
+        if isinstance(config.get(key), dict):
+            env.update(
+                {str(k): str(v) for k, v in config[key].items() if isinstance(v, (str, int, float))}
+            )
     cwd = None
     if isinstance(config.get("cwd"), str):
         cwd = config["cwd"]
@@ -997,6 +1130,22 @@ def _hook_finding(hook: Hook) -> dict[str, Any]:
         notes += " The entry is hidden behind long whitespace padding."
     if hook.extra.get("unparsed"):
         notes += " The file could not be parsed; this command was recovered from its text."
+    if hook.extra.get("plugin"):
+        source = hook.extra.get("marketplace") or "a marketplace"
+        return _finding(
+            "agent_hook_command",
+            severity,
+            action,
+            hook.event,
+            f"{agent} enables plugin {hook.extra['plugin']} from {source}",
+            f"Plugins ship hooks, MCP servers and commands that {agent} runs for anyone who "
+            f"trusts this folder; their code lives in {source}, not in this repository.{notes}",
+            "Enable plugins in user settings after reviewing them, or pin the marketplace to a "
+            "reviewed commit; keep committed settings free of plugins the team did not vet.",
+            evidence,
+            hook.file,
+            hook.line,
+        )
     if hook.kind == "vscode_task":
         label = hook.extra.get("label", "unnamed task")
         trigger = "runs on folder open"
@@ -1034,10 +1183,85 @@ def _hook_finding(hook: Hook) -> dict[str, Any]:
     )
 
 
+def _launch(server: Server) -> dict[str, Any] | None:
+    """The server's launch, unpinned when its env points the package manager at another
+    registry or index (npm_config_registry, UV_INDEX_URL, PIP_INDEX_URL...)."""
+    launch = parse_launch(server.argv[0], server.argv[1:])
+    if launch is None or not launch["fetches"]:
+        return launch
+    values = [
+        part
+        for key, value in server.env.items()
+        if key.upper() in _INDEX_ENV
+        for part in str(value).split()
+    ]
+    found = [url for url in non_public_indexes(values) if url not in launch.get("indexes", [])]
+    if found:
+        launch = {
+            **launch,
+            "pinned": False,
+            "pinned_command": None,
+            "indexes": [*launch.get("indexes", []), *found],
+        }
+    return launch
+
+
+def _remote_findings(server: Server) -> list[dict[str, Any]]:
+    """A remote MCP server reached over cleartext http, or at a bare IP address with no
+    host name a certificate could prove: whoever sits on the path serves the tools."""
+    try:
+        parsed = urlsplit(server.url or "")
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return []
+    if not host:
+        return []
+    address = None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if host == "localhost" or host.endswith(".localhost") or (address and address.is_loopback):
+        return []
+    problems = []
+    if parsed.scheme.lower() == "http":
+        problems.append("over cleartext http")
+    if address is not None:
+        problems.append("at a bare IP address")
+    if not problems:
+        return []
+    target = redact_url(server.url or "")
+    return [
+        _finding(
+            "mcp_server_unpinned",
+            "MEDIUM",
+            "warn",
+            server.name,
+            f"Remote MCP server '{server.name}' is reached {' and '.join(problems)}: {target}",
+            f"The agent loads tools from {target} {' and '.join(problems)}, so anyone on the "
+            "network path, or whoever holds that address, decides which tools and "
+            "instructions the agent receives.",
+            "Use an https URL with a host name the server's certificate proves, or remove the "
+            "server from committed settings.",
+            {
+                "server": server.name,
+                "url": target,
+                "transport": "http",
+                "cleartext": parsed.scheme.lower() == "http",
+                "bare_ip": address is not None,
+            },
+            server.file,
+            server.line,
+            "remote",
+            None,
+        )
+    ]
+
+
 def _server_findings(server: Server) -> list[dict[str, Any]]:
     if not server.argv:
-        return []
-    launch = parse_launch(server.argv[0], server.argv[1:])
+        return _remote_findings(server)
+    launch = _launch(server)
     if launch is None:
         return []
     shown = commands.display(" ".join(server.argv))
@@ -1050,6 +1274,9 @@ def _server_findings(server: Server) -> list[dict[str, Any]]:
         "spec": launch["spec"],
         "source": launch["source"],
     }
+    for key in ("indexes", "extra_packages"):
+        if launch.get(key):
+            base[key] = launch[key]
     findings: list[dict[str, Any]] = []
     hidden = _hidden_launch(server)
     if hidden is not None:
@@ -1074,6 +1301,23 @@ def _server_findings(server: Server) -> list[dict[str, Any]]:
             )
         )
     if launch["fetches"] and not launch["pinned"]:
+        reason = (
+            f"Each start fetches whatever {launch['package']} resolves to at that moment "
+            f"({launch['launcher']}); postmark-mcp shipped fifteen clean versions before "
+            f"1.0.16 started copying every email to the attacker."
+        )
+        loose = [item["package"] for item in launch.get("extra_packages", []) if not item["pinned"]]
+        if launch.get("indexes"):
+            reason = (
+                f"Each start fetches {launch['package']} from {', '.join(launch['indexes'])}, "
+                "not the public registry, so whoever runs that index decides which code runs, "
+                "whatever version is pinned."
+            )
+        elif loose and launch["pinned"] is False and launch.get("version"):
+            reason = (
+                f"The launch also installs {', '.join(loose)} without an exact version; each "
+                "start runs whatever those resolve to."
+            )
         findings.append(
             _finding(
                 "mcp_server_unpinned",
@@ -1081,9 +1325,7 @@ def _server_findings(server: Server) -> list[dict[str, Any]]:
                 "warn",
                 server.name,
                 f"MCP server '{server.name}' is not pinned: {shown}",
-                f"Each start fetches whatever {launch['package']} resolves to at that moment "
-                f"({launch['launcher']}); postmark-mcp shipped fifteen clean versions before "
-                f"1.0.16 started copying every email to the attacker.",
+                reason,
                 "Pin an exact, reviewed version (pkg@1.2.3, pkg==1.2.3, a full git commit or an "
                 "image digest).",
                 base,
@@ -1250,7 +1492,7 @@ def _server_inventory(server: Server) -> dict[str, Any]:
             "transport": "http",
             "fetches": False,
         }
-    launch = parse_launch(server.argv[0], server.argv[1:]) or {}
+    launch = _launch(server) or {}
     return {
         "file": server.file,
         "name": server.name,

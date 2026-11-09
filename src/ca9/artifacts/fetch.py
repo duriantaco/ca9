@@ -49,6 +49,9 @@ DEFAULT_MAX_EXTRACTED_BYTES = 250 * 1024 * 1024
 DEFAULT_MAX_EXTRACTED_FILES = 5000
 DEFAULT_REQUEST_TIMEOUT = 30.0
 _READ_CHUNK = 64 * 1024
+_MAX_RANGES_PER_REQUEST = 100
+_MULTIPART_PART_OVERHEAD = 1024
+_MULTIPART_LINE = 1024
 # Public registries whose artifact hosts are fetched without further configuration.
 DEFAULT_ARTIFACT_INDEXES = (
     "https://registry.npmjs.org",
@@ -135,6 +138,10 @@ class RegistryDocumentNotFound(ValueError):
 
 class TransferTimeout(ValueError):
     """A registry or artifact transfer exceeded its per-request timeout or overall deadline."""
+
+
+class RangeNotServed(ValueError):
+    """The server did not answer a byte-range request with exactly the bytes asked for."""
 
 
 class _BlockedRedirect(urllib.error.URLError):
@@ -768,6 +775,201 @@ def _download_artifact(
         if _is_timeout(exc):
             raise TransferTimeout(f"timed out downloading {_display_url(url)}") from None
         raise ValueError(f"cannot download artifact {url}: {exc}") from exc
+
+
+def _read_artifact_range(
+    url: str, start: int, length: int, size: int, config: ArtifactScanConfig
+) -> bytes:
+    """``length`` bytes from offset ``start`` of the ``size``-byte artifact at ``url``.
+
+    The request passes the same URL policy, address checks and deadline as a full
+    download; a local file is read only beneath ``allowed_local_roots``. A server that
+    ignores the range or reports another total size raises RangeNotServed.
+    """
+    if length <= 0:
+        return b""
+    source_path = _local_artifact_path(url)
+    if source_path is not None:
+        if config.url_validator is not None and not config.url_validator(url):
+            raise _UntrustedArtifactURL("artifact URL blocked by policy")
+        resolved = _validate_local_artifact_source(source_path, config.allowed_local_roots)
+        try:
+            with resolved.open("rb") as stream:
+                if os.fstat(stream.fileno()).st_size != size:
+                    raise RangeNotServed(f"local artifact is not {size} bytes: {source_path}")
+                stream.seek(start)
+                data = stream.read(length)
+        except OSError as exc:
+            raise ValueError(f"cannot read local artifact {source_path}: {exc}") from exc
+        if len(data) != length:
+            raise RangeNotServed(f"local artifact ended before byte {start + length}")
+        return data
+    policy = _URLPolicy.from_config(config)
+    rejection = policy.rejection(url)
+    if rejection is not None:
+        raise _UntrustedArtifactURL(rejection)
+    end = start + length - 1
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "ca9-artifact-scanner",
+            "Range": f"bytes={start}-{end}",
+            "Accept-Encoding": "identity",
+        },
+    )
+    try:
+        with policy.opener().open(request, timeout=policy.timeout(url)) as response:
+            served = response.headers.get("Content-Range", "")
+            if response.status != 206 or served.strip() != f"bytes {start}-{end}/{size}":
+                raise RangeNotServed(
+                    f"{_display_url(url)} did not serve bytes {start}-{end} of {size}"
+                )
+            data = bytearray()
+            for chunk in _read_chunks(response, policy, url):
+                data.extend(chunk)
+                if len(data) > length:
+                    break
+    except _BlockedRedirect as exc:
+        raise _UntrustedArtifactURL(str(exc.reason)) from None
+    except ValueError:
+        raise
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        if _is_timeout(exc):
+            raise TransferTimeout(f"timed out reading {_display_url(url)}") from None
+        raise ValueError(f"cannot read artifact {url}: {exc}") from exc
+    if len(data) != length:
+        raise RangeNotServed(f"{_display_url(url)} served {len(data)} of {length} bytes")
+    return bytes(data)
+
+
+def _read_artifact_ranges(
+    url: str, spans: list[tuple[int, int]], size: int, config: ArtifactScanConfig
+) -> list[bytes]:
+    """Bytes of each ``(start, end)`` span of the ``size``-byte artifact at ``url``.
+
+    Spans are asked for in multipart byte-range requests of at most
+    ``_MAX_RANGES_PER_REQUEST``; any span the server leaves out, or every span when it
+    does not answer with multipart byte ranges, is read on its own."""
+    if len(spans) <= 1 or _local_artifact_path(url) is not None:
+        return [_read_artifact_range(url, start, end - start, size, config) for start, end in spans]
+    found: dict[tuple[int, int], bytes] = {}
+    for first in range(0, len(spans), _MAX_RANGES_PER_REQUEST):
+        batch = spans[first : first + _MAX_RANGES_PER_REQUEST]
+        with contextlib.suppress(RangeNotServed):
+            found.update(_multipart_ranges(url, batch, size, config))
+    return [
+        found.get((start, end)) or _read_artifact_range(url, start, end - start, size, config)
+        for start, end in spans
+    ]
+
+
+def _multipart_ranges(
+    url: str, spans: list[tuple[int, int]], size: int, config: ArtifactScanConfig
+) -> dict[tuple[int, int], bytes]:
+    policy = _URLPolicy.from_config(config)
+    rejection = policy.rejection(url)
+    if rejection is not None:
+        raise _UntrustedArtifactURL(rejection)
+    wanted = set(spans)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "ca9-artifact-scanner",
+            "Range": "bytes=" + ",".join(f"{start}-{end - 1}" for start, end in spans),
+            "Accept-Encoding": "identity",
+        },
+    )
+    limit = sum(end - start for start, end in spans) + _MULTIPART_PART_OVERHEAD * len(spans)
+    try:
+        with policy.opener().open(request, timeout=policy.timeout(url)) as response:
+            boundary = response.headers.get_param("boundary")
+            if (
+                response.status != 206
+                or response.headers.get_content_type() != "multipart/byteranges"
+                or not isinstance(boundary, str)
+                or not boundary
+            ):
+                raise RangeNotServed(f"{_display_url(url)} did not serve multipart byte ranges")
+            reader = _BoundedReader(response, policy, url, limit)
+            parts = _byte_range_parts(reader, boundary.encode("ascii", "replace"), size)
+    except _BlockedRedirect as exc:
+        raise _UntrustedArtifactURL(str(exc.reason)) from None
+    except ValueError:
+        raise
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        if _is_timeout(exc):
+            raise TransferTimeout(f"timed out reading {_display_url(url)}") from None
+        raise RangeNotServed(f"cannot read byte ranges of {_display_url(url)}: {exc}") from exc
+    if len(parts) > len(spans):
+        raise RangeNotServed(f"{_display_url(url)} served more parts than were asked for")
+    return {(start, end): data for start, end, data in parts if (start, end) in wanted}
+
+
+class _BoundedReader:
+    """Reads a response at most ``limit`` bytes far, checking the deadline between reads."""
+
+    def __init__(
+        self, response: http.client.HTTPResponse, policy: _URLPolicy, url: str, limit: int
+    ) -> None:
+        self.response = response
+        self.policy = policy
+        self.url = url
+        self.left = limit
+
+    def readline(self) -> bytes:
+        self.policy.check_deadline(self.url)
+        line = self.response.readline(min(_MULTIPART_LINE, self.left + 1))
+        self._charge(len(line))
+        return line
+
+    def read(self, size: int) -> bytes:
+        data = bytearray()
+        while len(data) < size:
+            self.policy.check_deadline(self.url)
+            chunk = self.response.read(min(_READ_CHUNK, size - len(data)))
+            if not chunk:
+                break
+            self._charge(len(chunk))
+            data.extend(chunk)
+        return bytes(data)
+
+    def _charge(self, count: int) -> None:
+        self.left -= count
+        if self.left < 0:
+            raise RangeNotServed(f"{_display_url(self.url)} served more bytes than asked for")
+
+
+def _byte_range_parts(
+    reader: _BoundedReader, boundary: bytes, size: int
+) -> list[tuple[int, int, bytes]]:
+    """The (start, end, bytes) parts of a multipart/byteranges body."""
+    delimiter = b"--" + boundary
+    parts: list[tuple[int, int, bytes]] = []
+    while True:
+        line = reader.readline()
+        if not line:
+            return parts
+        line = line.rstrip(b"\r\n")
+        if not line:
+            continue
+        if line == delimiter + b"--":
+            return parts
+        if line != delimiter:
+            raise RangeNotServed("malformed multipart byte-range body")
+        span = None
+        while header := reader.readline().rstrip(b"\r\n"):
+            name, _colon, value = header.partition(b":")
+            if name.strip().lower() == b"content-range":
+                match = re.fullmatch(rb"bytes (\d+)-(\d+)/(\d+)", value.strip())
+                if match is None or int(match[3]) != size or int(match[2]) < int(match[1]):
+                    raise RangeNotServed("malformed Content-Range in a multipart part")
+                span = (int(match[1]), int(match[2]) + 1)
+        if span is None:
+            raise RangeNotServed("multipart part without Content-Range")
+        data = reader.read(span[1] - span[0])
+        if len(data) != span[1] - span[0]:
+            raise RangeNotServed("multipart part ended early")
+        parts.append((span[0], span[1], data))
 
 
 def _read_chunks(

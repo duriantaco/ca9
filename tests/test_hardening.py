@@ -496,3 +496,114 @@ def test_pnpm10_never_built_removal_and_pnpm11_migration(tmp_path):
         "pnpm-workspace.yaml": "allowBuilds:\n  esbuild: true\n",
     }
     assert _regressions(tmp_path / "migrated", old, new) == []
+
+
+JOB = "jobs:\n  t:\n    runs-on: x\n"
+PINNED_BASE = {
+    ".npmrc": "ignore-scripts=true\nmin-release-age=3\n",
+    "pnpm-workspace.yaml": "minimumReleaseAge: 4320\n",
+    ".yarnrc.yml": 'npmMinimalAgeGate: "3d"\n',
+    ".github/workflows/ci.yml": JOB,
+}
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "    steps:\n      - run: npm ci --no-ignore-scripts\n",
+        "    steps:\n      - run: npm ci --ignore-scripts false\n",
+        "    steps:\n      - run: pnpm install --config.ignore-scripts=false\n",
+        "    steps:\n      - run: echo ignore-scripts=false >> .npmrc && npm ci\n",
+        "    steps:\n      - run: pnpm config set ignore-scripts false\n",
+        "    steps:\n      - run: yarn config set enableScripts true\n",
+        "    steps:\n      - run: echo 'enableScripts: true' >> .yarnrc.yml\n",
+    ],
+)
+def test_cli_flag_and_config_write_overrides_reenable_install_scripts(tmp_path, line):
+    head = {**PINNED_BASE, ".github/workflows/ci.yml": JOB + line}
+
+    assert _regressions(tmp_path, PINNED_BASE, head) == [
+        ("ignore_scripts_disabled", "workflow_overrides")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("line", "setting"),
+    [
+        ("    env:\n      npm_config_min_release_age: 0\n", "npm_days"),
+        ("    steps:\n      - run: npm install --min-release-age=0\n", "npm_days"),
+        ("    steps:\n      - run: npm ci --min-release-age 1\n", "npm_days"),
+        ("    steps:\n      - run: echo min-release-age=0 >> .npmrc\n", "npm_days"),
+        ("    steps:\n      - run: pnpm install --config.minimum-release-age=0\n", "pnpm_minutes"),
+        ("    env:\n      PNPM_CONFIG_MINIMUM_RELEASE_AGE: 10\n", "pnpm_minutes"),
+        ("    env:\n      YARN_NPM_MINIMAL_AGE_GATE: 0\n", "yarn"),
+    ],
+)
+def test_workflow_overrides_that_lower_the_cooldown(tmp_path, line, setting):
+    head = {**PINNED_BASE, ".github/workflows/ci.yml": JOB + line}
+
+    items = api.hardening_regressions(
+        _repo(tmp_path / "base", PINNED_BASE), _repo(tmp_path / "head", head)
+    )
+
+    assert _kinds(items) == [("cooldown_lowered", setting)]
+    assert items[0]["path"] == ".github/workflows/ci.yml" and items[0]["line"] >= 4
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "    steps:\n      - run: npm ci --ignore-scripts\n",
+        "    steps:\n      - run: npm ci --ignore-scripts=true\n",
+        "    steps:\n      - run: echo ignore-scripts=true >> .npmrc\n",
+        "    steps:\n      # - run: npm ci --no-ignore-scripts\n",
+        "    env:\n      npm_config_min_release_age: 7\n",
+        "    steps:\n      - run: npm ci --min-release-age=3\n",
+    ],
+)
+def test_overrides_that_keep_or_raise_the_hardening_are_quiet(tmp_path, line):
+    head = {**PINNED_BASE, ".github/workflows/ci.yml": JOB + line}
+
+    assert _regressions(tmp_path, PINNED_BASE, head) == []
+
+
+def test_cooldown_override_without_a_base_cooldown_or_already_in_base_is_quiet(tmp_path):
+    override = JOB + "    env:\n      npm_config_min_release_age: 0\n"
+    bare = {".github/workflows/ci.yml": JOB}
+
+    assert _regressions(tmp_path / "a", bare, {".github/workflows/ci.yml": override}) == []
+    already = {**PINNED_BASE, ".github/workflows/ci.yml": override}
+    assert _regressions(tmp_path / "b", already, already) == []
+
+
+def test_new_unpinned_action_in_a_fully_pinned_repository_is_reported(tmp_path):
+    base = {
+        ".github/workflows/ci.yml": _workflow(
+            f"actions/checkout@{SHA}", f"actions/setup-node@{SHA}"
+        )
+    }
+    added = {
+        ".github/workflows/ci.yml": _workflow(
+            f"actions/checkout@{SHA}", f"actions/setup-node@{SHA}", "someone/setup-tool@v1"
+        )
+    }
+    pinned_add = {
+        ".github/workflows/ci.yml": _workflow(
+            f"actions/checkout@{SHA}", f"someone/setup-tool@{SHA}"
+        )
+    }
+    mixed = {".github/workflows/ci.yml": _workflow(f"actions/checkout@{SHA}", "other/tool@v2")}
+    mixed_added = {
+        ".github/workflows/ci.yml": _workflow(
+            f"actions/checkout@{SHA}", "other/tool@v2", "someone/setup-tool@v1"
+        )
+    }
+
+    items = api.hardening_regressions(
+        _repo(tmp_path / "base", base), _repo(tmp_path / "head", added)
+    )
+
+    assert _kinds(items) == [("action_unpinned", "actions")]
+    assert "someone/setup-tool" in items[0]["detail"]
+    assert _regressions(tmp_path / "p", base, pinned_add) == []
+    assert _regressions(tmp_path / "m", mixed, mixed_added) == []

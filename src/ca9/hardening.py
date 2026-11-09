@@ -104,10 +104,43 @@ _USES = re.compile(r"^\s*(?:-\s*)?uses\s*:\s*(['\"]?)([^'\"\s#]+)\1", re.MULTILI
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SCRIPT_OVERRIDES = re.compile(
     r"\b(?P<npm>npm_config_ignore_scripts)\s*[:=]\s*['\"]?(?P<npm_value>false|0|no|off)\b"
-    r"|(?P<flag>--ignore-scripts)=(?P<flag_value>false|0)\b"
-    r"|\bnpm\s+config\s+set\s+(?P<config>ignore-scripts)[\s=]+['\"]?(?P<config_value>false|0)\b"
-    r"|\b(?P<yarn>yarn_enable_scripts)\s*[:=]\s*['\"]?(?P<yarn_value>true|1|yes|on)\b",
+    r"|(?<![\w-])(?P<negated>--no-ignore-scripts)\b"
+    r"|(?<![\w.-])(?P<flag>--(?:config\.)?ignore-scripts)(?:[ \t]*=[ \t]*|[ \t]+)['\"]?"
+    r"(?P<flag_value>false|0|no|off)\b"
+    r"|\b(?:npm|pnpm|yarn)[ \t]+config[ \t]+set[ \t]+(?:-\S+[ \t]+)*(?P<config>ignore-scripts)"
+    r"[ \t=]+['\"]?(?P<config_value>false|0)\b"
+    r"|(?<![\w.-])(?P<rc>ignore-scripts)[ \t]*=[ \t]*['\"]?(?P<rc_value>false|0)\b"
+    r"|\b(?P<yarn>yarn_enable_scripts)\s*[:=]\s*['\"]?(?P<yarn_value>true|1|yes|on)\b"
+    r"|\b(?P<berry>enableScripts)(?:[ \t]*[:=][ \t]*|[ \t]+)['\"]?(?P<berry_value>true|1)\b",
     re.IGNORECASE,
+)
+_OVERRIDE_GROUPS = ("npm", "negated", "flag", "config", "rc", "yarn", "berry")
+_COOLDOWN_OVERRIDES = (
+    (
+        "npm_days",
+        re.compile(
+            r"(?<![\w.-])(?P<option>npm_config_min_release_age|(?:--)?(?:config\.)?min-release-age)"
+            r"(?:[ \t]*[:=][ \t]*|[ \t]+)['\"]?(?P<value>\d+(?:\.\d+)?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "pnpm_minutes",
+        re.compile(
+            r"(?<![\w.-])(?P<option>(?:npm|pnpm)_config_minimum_release_age|"
+            r"(?:--)?(?:config\.)?minimum-release-age)"
+            r"(?:[ \t]*[:=][ \t]*|[ \t]+)['\"]?(?P<value>\d+(?:\.\d+)?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "yarn",
+        re.compile(
+            r"(?<![\w.-])(?P<option>yarn_npm_minimal_age_gate|npmMinimalAgeGate)"
+            r"(?:[ \t]*[:=][ \t]*|[ \t]+)['\"]?(?P<value>\d[\w.]*)",
+            re.IGNORECASE,
+        ),
+    ),
 )
 _RENOVATE_PACKAGE_MATCHERS = (
     "matchPackageNames",
@@ -185,6 +218,7 @@ class _State:
         self.managers: dict[str, str] = {}
         self.renovate_presets: list[str] = []
         self.renovate_rules: list[dict[str, Any]] = []
+        self.cooldown_overrides: list[dict[str, Any]] = []
         self.ignored: list[dict[str, str]] = []
         self.pnpm_major: int | None = None
         self.errors: list[dict[str, str]] = []
@@ -241,6 +275,7 @@ class _State:
             "managers": self.managers,
             "renovate_presets": self.renovate_presets,
             "renovate_rules": self.renovate_rules,
+            "cooldown_overrides": self.cooldown_overrides,
             "ignored": self.ignored,
             "errors": self.errors,
             "status": status,
@@ -658,23 +693,50 @@ def _yaml_uses(text: str) -> list[str] | None:
 
 
 def _workflow_overrides(state: _State, rel: str, text: str) -> None:
+    """CI lines that turn install scripts back on or lower a cooldown: environment
+    variables, CLI flags (``--no-ignore-scripts``, ``--ignore-scripts false``,
+    ``--config.ignore-scripts=false``, ``--min-release-age=0``), ``config set`` and
+    lines written into .npmrc or .yarnrc.yml."""
     for match in _SCRIPT_OVERRIDES.finditer(text):
-        line_start = text.rfind("\n", 0, match.start()) + 1
-        if text[line_start : match.start()].strip().startswith("#"):
+        if _commented(text, match.start()):
             continue
         groups = match.groupdict()
-        for name in ("npm", "flag", "config", "yarn"):
-            if groups[name]:
-                state.scripts["workflow_overrides"].append(
-                    {
-                        "file": rel,
-                        "line": text.count("\n", 0, match.start()) + 1,
-                        "setting": groups[name].lower(),
-                        "value": groups[f"{name}_value"].lower(),
-                    }
-                )
-                state.sources["workflow_overrides"] = rel
-                break
+        for name in _OVERRIDE_GROUPS:
+            if not groups[name]:
+                continue
+            setting = groups[name].lower()
+            value = (groups.get(f"{name}_value") or "false").lower()
+            if name == "negated":
+                setting = "--ignore-scripts"
+            state.scripts["workflow_overrides"].append(
+                {
+                    "file": rel,
+                    "line": text.count("\n", 0, match.start()) + 1,
+                    "setting": setting,
+                    "value": value,
+                }
+            )
+            state.sources["workflow_overrides"] = rel
+            break
+    for key, pattern in _COOLDOWN_OVERRIDES:
+        for match in pattern.finditer(text):
+            if _commented(text, match.start()):
+                continue
+            state.cooldown_overrides.append(
+                {
+                    "file": rel,
+                    "line": text.count("\n", 0, match.start()) + 1,
+                    "setting": key,
+                    "option": match.group("option").lower(),
+                    "value": match.group("value"),
+                }
+            )
+            state.sources["cooldown_overrides"] = rel
+
+
+def _commented(text: str, offset: int) -> bool:
+    line_start = text.rfind("\n", 0, offset) + 1
+    return text[line_start:offset].strip().startswith("#")
 
 
 def _ref_pinned(uses: str) -> tuple[bool, str]:
@@ -876,6 +938,7 @@ def regressions(base: Any, head: Any) -> list[dict[str, Any]]:
         _exclusion_regressions(old, new, found)
         _script_regressions(old, new, found)
         _override_regressions(old, new, found)
+        _cooldown_override_regressions(old, new, found)
         _action_regressions(old, new, found)
     found.sort(key=lambda item: (item["kind"], item["path"] or "", item["detail"]))
     return found
@@ -1177,6 +1240,42 @@ def _override_regressions(
         found.append(entry)
 
 
+def _cooldown_override_regressions(
+    old: Mapping[str, Any], new: Mapping[str, Any], found: list[dict[str, Any]]
+) -> None:
+    """A CI line that sets a shorter cooldown than base configures weakens it."""
+    cooldown = _group(old, "cooldown")
+    before = {
+        (item.get("file"), item.get("setting"), str(item.get("value")))
+        for item in old.get("cooldown_overrides") or []
+        if isinstance(item, Mapping)
+    }
+    reported: set[tuple[Any, Any, str]] = set()
+    for item in new.get("cooldown_overrides") or []:
+        if not isinstance(item, Mapping) or item.get("setting") not in COOLDOWN_KEYS:
+            continue
+        key = (item.get("file"), item.get("setting"), str(item.get("value")))
+        if key in before or key in reported:
+            continue
+        setting = str(item.get("setting"))
+        base_minutes = cooldown_minutes(cooldown, setting)
+        head_minutes = cooldown_minutes({setting: item.get("value")}, setting)
+        if base_minutes is None or head_minutes is None or head_minutes >= base_minutes:
+            continue
+        reported.add(key)
+        entry = _item(
+            "cooldown_lowered",
+            f"{item.get('file')} sets {item.get('option')}={item.get('value')} in CI, lowering "
+            f"{_COOLDOWN_LABELS[setting]} from {cooldown.get(setting)}",
+            item.get("file"),
+            setting,
+            cooldown.get(setting),
+            item.get("value"),
+        )
+        entry["line"] = item.get("line")
+        found.append(entry)
+
+
 def _exclusion_regressions(
     old: Mapping[str, Any], new: Mapping[str, Any], found: list[dict[str, Any]]
 ) -> None:
@@ -1307,23 +1406,34 @@ def _action_regressions(
         for ref in base_refs
         if isinstance(ref, Mapping) and not ref.get("pinned")
     }
+    counts = _group(old, "actions")
+    fully_pinned = counts.get("unpinned") == 0 and bool(counts.get("pinned"))
     reported: set[tuple[Any, Any, Any]] = set()
     for ref in head_refs:
         if not isinstance(ref, Mapping) or ref.get("pinned"):
             continue
         uses = str(ref.get("uses")).lower()
         key = (uses, ref.get("ref"), ref.get("file"))
+        retagged = uses in pinned_before
         if (
-            uses not in pinned_before
+            not (retagged or fully_pinned)
             or (uses, ref.get("ref")) in unpinned_before
             or key in reported
         ):
             continue
         reported.add(key)
+        detail = (
+            f"{ref.get('uses')} was pinned to a commit SHA and is now used at "
+            f"{ref.get('ref') or 'no ref'}"
+        )
+        if not retagged:
+            detail = (
+                f"every action in base was pinned to a commit SHA; {ref.get('uses')} is added "
+                f"at {ref.get('ref') or 'no ref'}"
+            )
         item = _item(
             "action_unpinned",
-            f"{ref.get('uses')} was pinned to a commit SHA and is now used at "
-            f"{ref.get('ref') or 'no ref'}",
+            detail,
             ref.get("file"),
             "actions",
             "sha",

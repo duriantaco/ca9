@@ -30,6 +30,7 @@ RULES = (
 )
 _UNTRUSTED_EVENTS = (
     "pull_request_target",
+    "workflow_run",
     "issue_comment",
     "issues",
     "discussion",

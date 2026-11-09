@@ -16,6 +16,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit
 
@@ -30,7 +31,8 @@ from packaging.utils import (
 from packaging.version import InvalidVersion, Version
 
 from ca9.artifacts import fetch
-from ca9.artifacts.pypi import parse_release_document, release_json_url
+from ca9.artifacts.pypi import PYPI_JSON_ORIGIN, parse_release_document, release_json_url
+from ca9.version_order import is_prerelease, version_key
 
 NPM_PUBLIC_REGISTRY = "https://registry.npmjs.org"
 NPM_REGISTRY_ALIASES = frozenset({"https://registry.npmjs.org", "https://registry.yarnpkg.com"})
@@ -38,10 +40,15 @@ PYPI_PUBLIC_INDEXES = frozenset(
     {"https://pypi.org", "https://pypi.org/simple", "https://pypi.python.org/simple"}
 )
 PYPI_SIMPLE_JSON = "application/vnd.pypi.simple.v1+json"
+NPM_ABBREVIATED = "application/vnd.npm.install-v1+json"
 _SRI = re.compile(r"(sha256|sha384|sha512)-([A-Za-z0-9+/]+={0,2})\Z")
 _SHA1_HEX = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
 _NPM_NAME = re.compile(r"(?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*\Z")
+_MAINSTREAM_PLATFORM = re.compile(
+    r"any|win_amd64|(?:many|musl)?linux(?:_\d+_\d+|1|2010|2014)?_(?:x86_64|aarch64)"
+    r"|macosx_\d+_\d+_(?:arm64|x86_64|universal2)"
+)
 _PLATFORM_RANK = (
     ("manylinux", "x86_64"),
     ("linux", "x86_64"),
@@ -79,6 +86,152 @@ class ReleaseFile:
         algorithm = self.hash.split(":", 1)[0].split("-", 1)[0]
         result["hash_algorithm"] = algorithm
         return result
+
+
+@dataclass(frozen=True)
+class RegistryRelease:
+    version: str
+    published: datetime | None
+    available: bool = True
+    yanked: bool = False
+
+
+def registry_releases(
+    ecosystem: str, name: str, registry: str | None, config: fetch.ArtifactScanConfig
+) -> list[RegistryRelease]:
+    """Every version the registry lists for a package, with publish time, whether it is
+    still installable (npm unpublish) and whether it is yanked (every PyPI file yanked).
+
+    npm: the packument (the abbreviated one, without publish times, when the full one is
+    over the size cap). PyPI: the JSON API on pypi.org, PEP 691 elsewhere."""
+    if ecosystem == "npm":
+        if not _NPM_NAME.fullmatch(name.lower()):
+            raise ReleaseMetadataError("invalid npm package name")
+        url = f"{npm_registry_base(registry)}/{quote(name, safe='@')}"
+        try:
+            document = _registry_document(url, config)
+        except ValueError as exc:
+            if "exceeds" not in str(exc):
+                raise
+            document = _json_object(_registry_bytes(url, config, NPM_ABBREVIATED))
+        return _npm_releases(document, name)
+    project = quote(str(canonicalize_name(name)), safe="")
+    if is_public_registry("pypi", registry):
+        document = _registry_document(f"{PYPI_JSON_ORIGIN}/pypi/{project}/json", config)
+        return _pypi_releases(document)
+    base = (registry or "").strip().rstrip("/") + "/"
+    url = urljoin(base, f"{project}/")
+    return _simple_releases(_json_object(_registry_bytes(url, config, PYPI_SIMPLE_JSON)), name)
+
+
+def previous_release(ecosystem: str, version: str, releases: list[RegistryRelease]) -> str | None:
+    """The release a new one is compared with: the highest version below it that was
+    published before it, is installable and not yanked, stable when any stable one exists
+    (the rule ca9's sentinel uses). None means a first release."""
+    target_key = version_key(ecosystem, version)
+    if target_key is None:
+        raise ReleaseMetadataError(f"{version} is not a valid {ecosystem} version")
+    target = next((item for item in releases if item.version == version), None)
+    if target is None:
+        raise ReleaseUnavailable(f"{version} is not listed in the registry metadata")
+    earlier = []
+    for other in releases:
+        if other.version == version or not other.available or other.yanked:
+            continue
+        if (
+            target.published is not None
+            and other.published is not None
+            and other.published >= target.published
+        ):
+            continue
+        key = version_key(ecosystem, other.version)
+        if key is not None and key < target_key:
+            earlier.append((key, other.version))
+    stable = [item for item in earlier if not is_prerelease(ecosystem, item[1])]
+    pool = stable or earlier
+    if not pool:
+        return None
+    return max(pool, key=lambda item: item[0])[1]
+
+
+def _npm_releases(document: dict[str, Any], name: str) -> list[RegistryRelease]:
+    if str(document.get("name", "")).lower() != name.lower():
+        raise ReleaseMetadataError("registry document names a different package")
+    versions = document.get("versions")
+    if not isinstance(versions, dict):
+        versions = {}
+    times = document.get("time")
+    releases = []
+    if isinstance(times, dict):
+        for version, stamp in times.items():
+            if version in {"created", "modified"} or not isinstance(version, str):
+                continue
+            releases.append(
+                RegistryRelease(version, _parse_time(stamp), available=version in versions)
+            )
+        return releases
+    return [RegistryRelease(str(version), None) for version in versions]
+
+
+def _pypi_releases(document: dict[str, Any]) -> list[RegistryRelease]:
+    listed = document.get("releases")
+    if not isinstance(listed, dict):
+        raise ReleaseMetadataError("project metadata has no releases map")
+    releases = []
+    for version, files in listed.items():
+        entries = [item for item in files or [] if isinstance(item, dict)]
+        if not entries:
+            continue
+        stamps = [
+            _parse_time(item.get("upload_time_iso_8601") or item.get("upload_time"))
+            for item in entries
+        ]
+        known = [stamp for stamp in stamps if stamp is not None]
+        yanked = all(bool(item.get("yanked")) for item in entries)
+        releases.append(RegistryRelease(str(version), min(known, default=None), yanked=yanked))
+    return releases
+
+
+def _simple_releases(document: dict[str, Any], name: str) -> list[RegistryRelease]:
+    files = document.get("files")
+    if not isinstance(files, list):
+        raise ReleaseMetadataError("simple index response has no file list")
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in files:
+        if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
+            continue
+        _kind, version = _filename_release(item["filename"], name)
+        if version is not None:
+            grouped.setdefault(version, []).append(item)
+    releases = []
+    for version, entries in grouped.items():
+        stamps = [_parse_time(item.get("upload-time")) for item in entries]
+        known = [stamp for stamp in stamps if stamp is not None]
+        yanked = all(bool(item.get("yanked")) for item in entries)
+        releases.append(RegistryRelease(version, min(known, default=None), yanked=yanked))
+    return releases
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _json_object(raw: bytes) -> dict[str, Any]:
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ReleaseMetadataError("registry metadata is not valid JSON") from None
+    if not isinstance(document, dict):
+        raise ReleaseMetadataError("registry metadata is not an object")
+    return document
 
 
 def npm_registry_base(registry: str | None) -> str:
@@ -238,6 +391,77 @@ def comparable_pairs(
     ):
         pairs.append(same)
     return pairs
+
+
+def other_wheels(
+    entries: list[dict[str, Any]], reviewed: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Wheels of a release that no reviewed file covers (by name or identical bytes).
+
+    pip installs a different wheel on each platform, so a payload can sit in one
+    platform's wheel only; every wheel has to be reviewed for the release to be complete.
+    """
+    names = {entry["filename"] for entry in reviewed}
+    digests = {entry["sha256"] for entry in reviewed}
+    found = []
+    for entry in sorted(entries, key=lambda item: item["filename"]):
+        if entry["kind"] != "wheel" or entry["filename"] in names or entry["sha256"] in digests:
+            continue
+        names.add(entry["filename"])
+        digests.add(entry["sha256"])
+        found.append(entry)
+    return found
+
+
+def counterpart(
+    old_entries: list[dict[str, Any]], new_entry: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The old release's file that installs where ``new_entry`` does: the same tags, the
+    same platform, the same platform family, else the pure wheel, pip's choice here, any
+    wheel or the sdist."""
+    wheels = sorted(
+        (entry for entry in old_entries if entry["kind"] == "wheel"),
+        key=lambda entry: entry["filename"],
+    )
+    tags = new_entry["tags"]
+    platforms = {tag.platform for tag in tags}
+    ranks = {key[0] for key in _wheel_keys(new_entry)}
+    for matches in (
+        lambda entry: bool(entry["tags"] & tags),
+        lambda entry: bool({tag.platform for tag in entry["tags"]} & platforms),
+        lambda entry: bool({key[0] for key in _wheel_keys(entry)} & ranks),
+    ):
+        found = [entry for entry in wheels if matches(entry)]
+        if found:
+            return found[0]
+    pure = _pure_wheels(old_entries)
+    if pure:
+        return pure[0]
+    choice = pip_choice(old_entries)
+    if choice is not None and choice[0]["kind"] == "wheel":
+        return choice[0]
+    if wheels:
+        return wheels[0]
+    if choice is not None:
+        return choice[0]
+    return None
+
+
+def pure_wheels(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Wheels that install on any platform (py3-none-any)."""
+    return _pure_wheels(entries)
+
+
+def mainstream_wheel(tags: frozenset[Tag]) -> bool:
+    """A wheel most installs use: CPython or pure Python on Linux (glibc or musl) x86_64 or
+    aarch64, macOS arm64, x86_64 or universal2, or 64-bit Windows. Free-threaded (``t``)
+    ABIs, PyPy and GraalPy, 32-bit and other architectures are uncommon platforms."""
+    return any(
+        tag.interpreter.startswith(("cp", "py"))
+        and not tag.abi.endswith("t")
+        and _MAINSTREAM_PLATFORM.fullmatch(tag.platform) is not None
+        for tag in tags
+    )
 
 
 def _file_type(entry: dict[str, Any]) -> str:

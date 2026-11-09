@@ -454,6 +454,16 @@ verify`, requiring a signature from `.github/workflows/feed.yml` running on
 `refs/heads/main` (exact certificate identity and source ref, GitHub-hosted
 runner), and installs nothing unless that passes (a missing `gh` fails too). The GitHub Action runs it before `protect`.
 
+The hosted feed is published every hour. Its OSV malware data is rebuilt every 6
+hours and copied forward unchanged in between; `ca9 feed status` shows when it was
+built (`OSV data built`), and a bundle expires 7 days after that time. Every hour a
+sentinel job also reviews new releases of the most downloaded npm and PyPI packages
+with ca9's static upgrade review and publishes the ones that look malicious in the
+optional `npm-suspicious` and `pypi-suspicious` datasets, often before they reach OSV.
+These are flags from a static review, not confirmed reports; reviewed false positives
+are listed in `sentinel/allow.json`. The [supply-chain guide](docs/guide/supply-chain.md)
+describes both and how to report a false positive.
+
 Feed sources must be `https://` URLs or local paths. Downloads are capped at
 256 MiB, snapshots dated more than a day in the future are rejected, and a
 snapshot is never treated as fresh for more than 30 days after it was built.
@@ -1061,9 +1071,43 @@ it skips bad entries and counts them in the receipt. Network checks (release
 age, npm provenance) run only with `network: True` and stop at `max_lookups`.
 `api.check_provenance`, `api.check_release_age`, and `api.malware_matches`
 expose the single checks, and `api.feed_status` reports whether the malware feed
-is ready, stale, missing, or tampered. Names matching `internal_packages`, or
+is ready, stale, missing, or tampered, and when its OSV data was built.
+`api.suspicious_matches` matches exact versions against the sentinel's
+suspicious-release datasets offline, and `api.refresh_feed` updates the installed
+feed only when it is older than `max_age_hours` (6 by default), within a time limit,
+without raising. Names matching `internal_packages`, or
 hosted only on a private registry, are never sent to a public registry for the
 release-age or provenance lookups.
+
+`api.review_upgrades` diffs the old and new published artifacts of each dependency
+upgrade and returns the behaviours the new release adds as `block`, `warn` and
+`info` deltas (`{"kind", "path", "line", "snippet", "detail"}`). The artifacts are
+deleted after the review, so two opt-in options return the code a reviewer (for
+example an AI second opinion on a warn) needs to read. Both are off by default, and
+without them the output is unchanged:
+
+```python
+report = api.review_upgrades(
+    [{"ecosystem": "npm", "name": "left-pad", "old": "1.3.0", "new": "1.3.1"}],
+    options={"context_lines": 20, "identity_diff_bytes": 50_000},
+)
+result = report["results"][0]
+result["warn"][0]["context"]       # diff hunks of that file around the delta's line
+result.get("identity_diff")        # only after publisher_change or provenance_dropped
+result.get("identity_diff_truncated")
+report["receipt"]["context_lines"]  # 20: this engine supports the options
+```
+
+| Option | Range (default) | Adds |
+|---|---|---|
+| `context_lines` | 0-200 (0) | `context` on every `block` and `warn` delta in a text file: unified-diff hunks of that file between the old and new artifact within that many lines of the delta's line, `+` lines for a new file and for first releases. At most 8 KB per delta and 64 KB per result; a cut context keeps the delta line in the middle and ends with `... (truncated)`. Binary files, files over 32 MB and registry-metadata or lockfile deltas get none. |
+| `identity_diff_bytes` | 0-200000 (0) | On a result with a `publisher_change` or `provenance_dropped` delta (any level): `identity_diff`, a unified diff of every changed text code file (`.js .mjs .cjs .ts .py .pth .json .sh .toml .cfg`, binaries and lockfiles skipped), smallest change first, at most that many bytes, and `identity_diff_truncated`. |
+
+The text is the package's own. Control, bidi and other invisible characters are
+removed (tabs stay), a CR, U+2028 or U+2029 inside a line is shown as `\r`,
+` ` or ` `, and nothing else is changed. Values that are not integers in
+range are listed in the receipt's `invalid_options` and ignored. When either option is
+passed, the receipt carries `context_lines` with the value applied.
 
 ## Zero heavy dependencies
 
@@ -1090,8 +1134,13 @@ without pulling in a large dependency tree.
   gateway, the nested install sees the loopback registry and may be blocked.
 - Environment stripping is defense in depth, not a sandbox. Install scripts that
   ca9 allows still run as your user and can read credential files on disk.
-- The default hosted feed is published, and local bundles or `CA9_FEED_URL` can
-  override it. Feed availability still depends on GitHub hosting/network access.
+- The default hosted feed is published hourly (OSV malware data rebuilt every 6
+  hours), and local bundles or `CA9_FEED_URL` can override it. Installed feeds only
+  change when you run `ca9 feed update` or call `api.refresh_feed`. Feed availability
+  still depends on GitHub hosting/network access.
+- Suspicious-release entries come from a static review of popular packages' new
+  releases and can be wrong; ca9's own `vet`, `protect` and `run` do not act on them
+  yet.
 - The feed builder ships malware data and empty releases datasets (kept so older
   clients still load the bundle). Release age comes from registry metadata
   instead, so it needs network access the first time each package is checked.

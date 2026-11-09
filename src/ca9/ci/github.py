@@ -9,6 +9,7 @@ from typing import Any
 
 from ca9.ci import jobs as jobtools
 from ca9.ci.conditions import NOTHING, condition_facts
+from ca9.ci.images import image_pinned, image_reference
 from ca9.ci.model import ActionRef, Indirect, Job, Origin, Publish, Tool, Workflow
 from ca9.ci.shell import ScriptFacts, ShellContext, scan_script
 from ca9.ci.yamlload import (
@@ -505,6 +506,18 @@ class _JobBuilder:
             self.local_action(uses, with_map, order, line, visits, depth, seen, inputs)
             return
         if uses.startswith("docker://"):
+            image = image_reference(uses.removeprefix("docker://"))
+            if image is not None:
+                self.job.other_tools.append(
+                    Tool(
+                        image,
+                        "docker_action",
+                        image_pinned(image),
+                        line,
+                        manager="docker_action",
+                        origin=origin,
+                    )
+                )
             return
         name, _, ref = uses.partition("@")
         parts = name.split("/")
@@ -756,6 +769,17 @@ def _job(
                     kind="workflow",
                 )
             )
+    image = image_reference(node.get("container"))
+    if image is not None:
+        job.other_tools.append(
+            Tool(
+                image,
+                "container",
+                image_pinned(image),
+                node.key_line("container"),
+                manager="container",
+            )
+        )
     builder = _JobBuilder(repo_root, job, node, document, workflow_env, project)
     builder.steps(node.get("steps"), (), visits)
     jobtools.finalize(job, builder.facts, builder.contexts)
