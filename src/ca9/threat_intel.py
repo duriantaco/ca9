@@ -1,159 +1,165 @@
+"""Legacy adapter for dated EPSS/KEV context.
+
+Undated numeric/map helper results are retained for compatibility, and cannot
+establish freshness. Production batch lookup uses the dated contract only.
+"""
+
 from __future__ import annotations
 
 import json
-import os
 import time
-import urllib.error
-import urllib.request
-from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
-from ca9 import __version__
+from ca9 import risk_context as risk
 from ca9.models import ThreatIntelData
 
 EPSS_API_URL = "https://api.first.org/data/v1/epss"
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
-
-CACHE_DIR = Path(os.environ.get("CA9_CACHE_DIR", Path.home() / ".cache" / "ca9" / "threat_intel"))
-CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 hours
-EPSS_BATCH_SIZE = 100
-
-
-def _ensure_cache_dir() -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _cache_path(name: str) -> Path:
-    return CACHE_DIR / name
+EPSS_BATCH_SIZE = 16
 
 
 def _read_cache(name: str) -> dict | None:
-    path = _cache_path(name)
-    if not path.is_file():
-        return None
-    try:
-        stat = path.stat()
-        if time.time() - stat.st_mtime > CACHE_TTL_SECONDS:
-            return None
-        return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
+    """Undated legacy cache files are intentionally ignored, never migrated."""
+    return None
 
 
 def _read_stale_cache(name: str) -> dict | None:
-    path = _cache_path(name)
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
+    """Undated legacy cache files cannot establish provider freshness."""
+    return None
 
 
 def _write_cache(name: str, data: dict) -> None:
-    _ensure_cache_dir()
-    import contextlib
-
-    with contextlib.suppress(OSError):
-        _cache_path(name).write_text(json.dumps(data))
+    """Only the dated risk-context cache is written by production lookups."""
 
 
 def _http_get(url: str, timeout: int = 15) -> bytes | None:
-    try:
-        req = urllib.request.Request(
-            url, headers={"User-Agent": f"ca9-security-tool/{__version__}"}
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except (urllib.error.URLError, OSError, TimeoutError):
+    """Compatibility transport restricted to the two fixed provider endpoints."""
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or parsed.fragment or parsed.username or parsed.password:
         return None
+    if parsed.netloc == "api.first.org" and parsed.path == "/data/v1/epss":
+        query = parse_qs(parsed.query)
+        if set(query) != {"cve"} or len(query["cve"]) != 1:
+            return None
+        ids = query["cve"][0].split(",")
+        if len(ids) > EPSS_BATCH_SIZE or risk.canonical_cves(ids) != sorted(set(ids)):
+            return None
+        limit = 256 * 1024
+    elif parsed.netloc == "www.cisa.gov" and parsed.path == risk._KEV_PATH and not parsed.query:
+        limit = risk.MAX_CACHE_BYTES
+    else:
+        return None
+    payload = risk._fetch_json(
+        parsed.netloc,
+        parsed.path + ("?" + parsed.query if parsed.query else ""),
+        limit,
+        time.monotonic() + max(0, min(15, timeout)),
+    )
+    return json.dumps(payload, allow_nan=False).encode() if payload is not None else None
 
 
 def _fetch_epss_batch(cve_ids: list[str]) -> dict[str, tuple[float, float]]:
-    """Fetch EPSS scores for a batch of CVE IDs. Returns {cve_id: (score, percentile)}."""
-    results: dict[str, tuple[float, float]] = {}
-
-    for i in range(0, len(cve_ids), EPSS_BATCH_SIZE):
-        batch = cve_ids[i : i + EPSS_BATCH_SIZE]
-        cve_param = ",".join(batch)
-        url = f"{EPSS_API_URL}?cve={cve_param}"
-
-        raw = _http_get(url)
-        if raw is None:
-            continue
-
-        try:
-            data = json.loads(raw)
-            for item in data.get("data", []):
-                cve = item.get("cve", "")
-                score = float(item.get("epss", 0))
-                percentile = float(item.get("percentile", 0))
+    """Legacy undated observations; never used for confidence boosts."""
+    ids = risk.canonical_cves(cve_ids)
+    if not ids:
+        return {}
+    raw = _http_get(f"{EPSS_API_URL}?cve={','.join(ids)}")
+    if raw is None:
+        return {}
+    try:
+        data = json.loads(raw)
+        rows = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(rows, list) or len(rows) > EPSS_BATCH_SIZE:
+            return {}
+        results, duplicates, seen = {}, set(), set()
+        for item in rows:
+            if not isinstance(item, dict) or not isinstance(item.get("cve"), str):
+                continue
+            cve = item["cve"]
+            if cve not in ids:
+                continue
+            if cve in seen:
+                duplicates.add(cve)
+            seen.add(cve)
+            score, percentile = risk._number(item.get("epss")), risk._number(item.get("percentile"))
+            if score is not None and percentile is not None:
                 results[cve] = (score, percentile)
-        except (json.JSONDecodeError, ValueError, TypeError):
-            continue
-
-    return results
+        return {cve: value for cve, value in results.items() if cve not in duplicates}
+    except (ValueError, TypeError, RecursionError):
+        return {}
 
 
 def _fetch_kev_catalog() -> dict[str, str]:
-    """Fetch CISA KEV catalog. Returns {cve_id: due_date}."""
-    cache_name = "kev_catalog.json"
-    cached = _read_cache(cache_name)
+    """Legacy positive observations; no claim of current catalog coverage."""
+    cached = _read_cache("kev_catalog.json")
     if cached is not None:
         return cached
-
-    raw = _http_get(KEV_URL, timeout=30)
+    raw = _http_get(KEV_URL)
     if raw is None:
-        stale = _read_stale_cache(cache_name)
-        return stale or {}
-
+        return _read_stale_cache("kev_catalog.json") or {}
     try:
         data = json.loads(raw)
-        kev_index: dict[str, str] = {}
-        for vuln in data.get("vulnerabilities", []):
-            cve_id = vuln.get("cveID", "")
-            due_date = vuln.get("dueDate", "")
-            if cve_id:
-                kev_index[cve_id] = due_date
-
-        _write_cache(cache_name, kev_index)
-        return kev_index
-    except (json.JSONDecodeError, ValueError):
-        stale = _read_stale_cache(cache_name)
-        return stale or {}
-
-
-def fetch_threat_intel_batch(cve_ids: list[str]) -> dict[str, ThreatIntelData]:
-    """Fetch EPSS + KEV data for a batch of CVE IDs."""
-    if not cve_ids:
+        rows = data.get("vulnerabilities") if isinstance(data, dict) else None
+        if not isinstance(rows, list) or len(rows) > 100000:
+            return {}
+        result = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                return {}
+            cve, due = row.get("cveID"), row.get("dueDate")
+            if (
+                not isinstance(cve, str)
+                or not risk._CVE.fullmatch(cve)
+                or risk._date(due, risk.dt.date.today(), future=True) is None
+                or cve in result
+            ):
+                return {}
+            result[cve] = due
+        return result
+    except (ValueError, TypeError, RecursionError):
         return {}
 
-    # Check EPSS cache
-    epss_cache_name = "epss_batch.json"
-    epss_cached = _read_cache(epss_cache_name) or {}
 
-    uncached_cves = [c for c in cve_ids if c not in epss_cached]
-    if uncached_cves:
-        fresh_epss = _fetch_epss_batch(uncached_cves)
-        for cve, (score, pctl) in fresh_epss.items():
-            epss_cached[cve] = [score, pctl]
-        _write_cache(epss_cache_name, epss_cached)
+def fetch_threat_intel_batch(
+    cve_ids: list[str], *, project_root=None
+) -> dict[str, ThreatIntelData]:
+    """Use the same bounded dated lookup as api.threat_context.
 
-    kev_index = _fetch_kev_catalog()
-
-    results: dict[str, ThreatIntelData] = {}
-    for cve_id in cve_ids:
-        epss_entry = epss_cached.get(cve_id)
-        epss_score = epss_entry[0] if epss_entry else None
-        epss_pctl = epss_entry[1] if epss_entry else None
-
-        in_kev = cve_id in kev_index
-        kev_due = kev_index.get(cve_id) or None
-
-        results[cve_id] = ThreatIntelData(
-            epss_score=epss_score,
-            epss_percentile=epss_pctl,
-            in_kev=in_kev,
-            kev_due_date=kev_due,
+    Missing KEV evidence is nullable, never false. Stale observations stay
+    visible, and cannot receive a confidence or priority boost.
+    """
+    if not cve_ids:
+        return {}
+    ids = sorted(
+        {
+            cve
+            for offset in range(0, len(cve_ids), EPSS_BATCH_SIZE)
+            for cve in risk.canonical_cves(cve_ids[offset : offset + EPSS_BATCH_SIZE])
+        }
+    )
+    results = {}
+    deadline = time.monotonic() + 15
+    for offset in range(0, len(ids), EPSS_BATCH_SIZE):
+        remaining = max(0.0, deadline - time.monotonic())
+        context = risk.threat_context(
+            ids[offset : offset + EPSS_BATCH_SIZE],
+            network=remaining > 0,
+            timeout=remaining,
+            project_root=project_root,
         )
-
+        for row in context["cves"]:
+            epss, kev = row["epss"], row["kev"]
+            results[row["cve_id"]] = ThreatIntelData(
+                epss_score=epss["score"],
+                epss_percentile=epss["percentile"],
+                in_kev=kev["in_catalog"],
+                kev_due_date=kev["due_date"],
+                epss_status=epss["status"],
+                epss_score_date=epss["score_date"],
+                epss_retrieved_at=epss["retrieved_at"],
+                kev_status=kev["status"],
+                kev_date_added=kev["date_added"],
+                kev_catalog_date=kev["catalog_date"],
+                kev_retrieved_at=kev["retrieved_at"],
+            )
     return results

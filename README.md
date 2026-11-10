@@ -1079,6 +1079,60 @@ without raising. Names matching `internal_packages`, or
 hosted only on a private registry, are never sent to a public registry for the
 release-age or provenance lookups.
 
+### Dated EPSS and CISA KEV context
+
+ca9 0.9.0 adds the optional `api.threat_context` capability. It is separate
+from reachability analysis: calling it does not change confidence, severity,
+remediation priority, or a policy decision. Existing `analyze(threat_intel=True)`
+remains an explicit legacy scoring option. Its object adapter now uses the same
+dated lookup and reports per-provider status/dates in JSON, SARIF and VEX.
+Only current, validated positives qualify for its existing confidence/priority
+boost; stale, missing, malformed and undated observations never qualify.
+Ordinary analysis keeps threat intelligence disabled.
+
+```python
+context = api.threat_context(
+    ["CVE-2021-44228", "CVE-2020-28500"],
+    project_root="/path/to/repository",
+    timeout=15.0,
+)
+# Cache-only lookup: api.threat_context(ids, network=False)
+```
+
+The result is `{"schema_version": 1, "cves": [...]}`. Each sorted, deduplicated
+canonical `cve_id` has `epss` (`status`, `score`, `percentile`, `score_date`,
+`retrieved_at`) and `kev` (`status`, `in_catalog`, `date_added`, `due_date`,
+`catalog_date`, `retrieved_at`). Status is `current`, `stale`, or `unknown`.
+Unknown values are JSON `null`; an actual EPSS zero remains `0.0`. KEV absence
+is `false` only with a validated current complete catalog; unavailable or stale
+absence is unknown. A cached positive remains visible as stale after an outage.
+
+Calls accept up to 16 valid CVEs (sorted before truncation), send only CVE IDs
+to FIRST's EPSS API and download CISA's public KEV catalog. Both use fixed HTTPS
+hosts, certificate verification, no redirects, a shared maximum 15-second
+request/read budget, a 5-second socket timeout, and response size limits (256 KiB
+for EPSS, 8 MiB for KEV). No repository files or package names are sent.
+Provider dates and per-record retrieval times must both be within 7 days for
+`current`; future dates are rejected (future KEV remediation due dates are valid).
+Cached data is refreshed after 24 hours. A failed refresh does not extend its
+age and marks retained evidence stale.
+
+The separate `risk-context-v1.json` cache lives under
+`~/.cache/ca9/threat_intel/` or `CA9_CACHE_DIR`. Reads and atomic replacements
+reject symlinks; files are bounded and newly created files use mode 0600.
+Pass `project_root` to ignore a cache directory inside scanned source.
+Undated legacy cache files are ignored, and failed refreshes never rewrite age.
+An unavailable cache never prevents a network lookup or creates a negative result.
+Platforms lacking safe descriptor-relative, no-follow file primitives use network
+lookups without a disk cache. A bounded pair of daemon transports enforces the
+caller deadline even while platform DNS resolution is blocked; a late connection
+does not send an HTTP request after its deadline.
+
+Rollout: publish ca9 0.9.0 before consumers require this capability. API version
+remains `1` because this is additive. Consumers supporting earlier ca9 releases
+must check `callable(getattr(api, "threat_context", None))` and represent missing
+support as unknown rather than calling the legacy scoring option.
+
 `api.review_upgrades` diffs the old and new published artifacts of each dependency
 upgrade and returns the behaviours the new release adds as `block`, `warn` and
 `info` deltas (`{"kind", "path", "line", "snippet", "detail"}`). The artifacts are

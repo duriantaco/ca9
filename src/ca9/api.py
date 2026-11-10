@@ -67,6 +67,19 @@ from ca9.readers.requirements import valid_hash_pins
 API_VERSION = 1
 DEFAULT_MAX_LOOKUPS = 200
 
+
+def threat_context(cve_ids, *, network=True, project_root=None, timeout=15.0):
+    """Return dated EPSS/CISA KEV risk_context v1; never change policy scores.
+
+    This additive capability is available in ca9 0.9.0+. Each call accepts at
+    most sixteen canonical CVEs. Use ``network=False`` for cache-only lookup.
+    Missing or unavailable provider evidence is explicit unknown, never zero.
+    """
+    from ca9.risk_context import threat_context as lookup
+
+    return lookup(cve_ids, network=network, project_root=project_root, timeout=timeout)
+
+
 _ECOSYSTEMS = frozenset({"npm", "pypi"})
 _REGISTRY_MODES = frozenset({"exclusive", "merged"})
 _SOURCE_KINDS = {"registry": "registry", "git": "git", "url": "direct_url", "path": "path"}

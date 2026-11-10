@@ -77,8 +77,8 @@ def _compute_priority(result: VerdictResult) -> str:
     confidence = result.confidence_score
 
     ti = result.threat_intel
-    has_high_epss = ti is not None and ti.epss_score is not None and ti.epss_score >= 0.5
-    is_kev = ti is not None and ti.in_kev
+    has_high_epss = ti is not None and ti.current_high_epss
+    is_kev = ti is not None and ti.current_kev
 
     if verdict == Verdict.REACHABLE:
         br = _get_blast_radius(result)

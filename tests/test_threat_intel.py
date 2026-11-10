@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
 from unittest.mock import patch
 
@@ -98,19 +99,51 @@ class TestFetchKevCatalog:
 
 class TestFetchThreatIntelBatch:
     def test_combines_epss_and_kev(self):
-        with (
-            patch("ca9.threat_intel._fetch_epss_batch") as mock_epss,
-            patch("ca9.threat_intel._fetch_kev_catalog") as mock_kev,
-            patch("ca9.threat_intel._read_cache", return_value=None),
-            patch("ca9.threat_intel._write_cache"),
-        ):
-            mock_epss.return_value = {
-                "CVE-2024-0001": (0.87, 0.97),
-            }
-            mock_kev.return_value = {
-                "CVE-2024-0001": "2024-03-15",
-            }
-
+        now = dt.datetime.now(dt.timezone.utc)
+        today = now.date().isoformat()
+        stamp = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        context = {
+            "schema_version": 1,
+            "cves": [
+                {
+                    "cve_id": "CVE-2024-0001",
+                    "epss": {
+                        "status": "current",
+                        "score": 0.87,
+                        "percentile": 0.97,
+                        "score_date": today,
+                        "retrieved_at": stamp,
+                    },
+                    "kev": {
+                        "status": "current",
+                        "in_catalog": True,
+                        "date_added": "2024-03-01",
+                        "due_date": "2024-03-15",
+                        "catalog_date": today,
+                        "retrieved_at": stamp,
+                    },
+                },
+                {
+                    "cve_id": "CVE-2024-9999",
+                    "epss": {
+                        "status": "unknown",
+                        "score": None,
+                        "percentile": None,
+                        "score_date": None,
+                        "retrieved_at": None,
+                    },
+                    "kev": {
+                        "status": "current",
+                        "in_catalog": False,
+                        "date_added": None,
+                        "due_date": None,
+                        "catalog_date": today,
+                        "retrieved_at": stamp,
+                    },
+                },
+            ],
+        }
+        with patch("ca9.risk_context.threat_context", return_value=context):
             result = fetch_threat_intel_batch(["CVE-2024-0001", "CVE-2024-9999"])
 
             assert "CVE-2024-0001" in result
@@ -130,11 +163,23 @@ class TestFetchThreatIntelBatch:
         assert result == {}
 
     def test_uses_cached_epss(self):
-        cached_epss = {"CVE-2024-0001": [0.5, 0.8]}
+        now = dt.datetime.now(dt.timezone.utc)
+        cached_epss = {
+            "schema_version": 1,
+            "epss": {
+                "CVE-2024-0001": {
+                    "score": 0.5,
+                    "percentile": 0.8,
+                    "score_date": now.date().isoformat(),
+                    "retrieved_at": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                }
+            },
+            "kev": None,
+        }
         with (
-            patch("ca9.threat_intel._read_cache", return_value=cached_epss),
-            patch("ca9.threat_intel._write_cache"),
-            patch("ca9.threat_intel._fetch_kev_catalog", return_value={}),
+            patch("ca9.risk_context._read_cache", return_value=cached_epss),
+            patch("ca9.risk_context._write_cache"),
+            patch("ca9.risk_context._fetch_json", return_value=None),
         ):
             result = fetch_threat_intel_batch(["CVE-2024-0001"])
             assert result["CVE-2024-0001"].epss_score == 0.5

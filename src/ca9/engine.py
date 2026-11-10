@@ -767,7 +767,7 @@ def analyze(
             from ca9.threat_intel import fetch_threat_intel_batch
 
             cve_ids = [v.id for v in vulnerabilities if v.id.startswith("CVE-")]
-            threat_intel_data = fetch_threat_intel_batch(cve_ids)
+            threat_intel_data = fetch_threat_intel_batch(cve_ids, project_root=repo_path)
         except Exception as exc:
             analysis_warnings.append(f"threat intelligence enrichment unavailable: {exc}")
 
