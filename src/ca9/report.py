@@ -79,12 +79,7 @@ def _evidence_to_dict(evidence) -> dict | None:
         d["coverage_completeness_pct"] = evidence.coverage_completeness_pct
     if evidence.threat_intel is not None:
         ti = evidence.threat_intel
-        d["threat_intel"] = {
-            "epss_score": ti.epss_score,
-            "epss_percentile": ti.epss_percentile,
-            "in_kev": ti.in_kev,
-            "kev_due_date": ti.kev_due_date,
-        }
+        d["threat_intel"] = ti.to_dict()
     if evidence.production_observed is not None:
         d["production_observed"] = evidence.production_observed
         d["production_trace_count"] = evidence.production_trace_count
@@ -165,14 +160,7 @@ def _result_to_dict(r) -> dict:
         ]
         if r.exploit_paths
         else [],
-        "threat_intel": {
-            "epss_score": r.threat_intel.epss_score,
-            "epss_percentile": r.threat_intel.epss_percentile,
-            "in_kev": r.threat_intel.in_kev,
-            "kev_due_date": r.threat_intel.kev_due_date,
-        }
-        if r.threat_intel
-        else None,
+        "threat_intel": r.threat_intel.to_dict() if r.threat_intel else None,
         "affected_component": _component_to_dict(r.affected_component),
         "evidence": _evidence_to_dict(r.evidence),
     }
@@ -496,13 +484,27 @@ def write_table(
                     ti = r.threat_intel
                     ti_parts = []
                     if ti.epss_score is not None:
-                        pctl = f" ({ti.epss_percentile:.0%}ile)" if ti.epss_percentile else ""
-                        ti_parts.append(f"EPSS: {ti.epss_score:.2f}{pctl}")
+                        pctl = (
+                            f" ({ti.epss_percentile:.0%}ile)"
+                            if ti.epss_percentile is not None
+                            else ""
+                        )
+                        ti_parts.append(
+                            f"EPSS: {ti.epss_score:.2f}{pctl} [{ti.epss_status}, {ti.epss_score_date}]"
+                        )
+                    else:
+                        ti_parts.append("EPSS: unknown")
                     if ti.in_kev:
-                        kev_info = "CISA KEV"
+                        kev_info = f"CISA KEV [{ti.kev_status}, {ti.kev_catalog_date}]"
                         if ti.kev_due_date:
                             kev_info += f" (due {ti.kev_due_date})"
                         ti_parts.append(kev_info)
+                    else:
+                        ti_parts.append(
+                            "CISA KEV: not listed"
+                            if ti.in_kev is False and ti.kev_status == "current"
+                            else "CISA KEV: unknown"
+                        )
                     if ti_parts:
                         lines.append(f"  {'':>{id_w}} -> {', '.join(ti_parts)}")
 
@@ -663,10 +665,7 @@ def write_sarif(report: Report, output: Path | TextIO | None = None) -> str:
             result["properties"]["exploit_path_count"] = len(r.exploit_paths)
         if r.threat_intel:
             ti = r.threat_intel
-            result["properties"]["threat_intel"] = {
-                "epss_score": ti.epss_score,
-                "in_kev": ti.in_kev,
-            }
+            result["properties"]["threat_intel"] = ti.to_dict()
         results.append(result)
 
     run = {

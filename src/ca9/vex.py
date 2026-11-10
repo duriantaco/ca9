@@ -146,12 +146,7 @@ def _build_statement(
 
     if result.threat_intel:
         ti = result.threat_intel
-        ca9_meta["threat_intel"] = {
-            "epss_score": ti.epss_score,
-            "epss_percentile": ti.epss_percentile,
-            "in_kev": ti.in_kev,
-            "kev_due_date": ti.kev_due_date,
-        }
+        ca9_meta["threat_intel"] = ti.to_dict()
 
     if result.runtime_mitigations:
         ca9_meta["runtime_mitigations"] = result.runtime_mitigations

@@ -36,10 +36,10 @@ def _threat_intel_boost(ev: Evidence) -> int:
     if ti is None:
         return 0
     boost = 0
-    has_high_epss = ti.epss_score is not None and ti.epss_score >= 0.5
-    if has_high_epss and ti.in_kev:
+    has_high_epss = ti.current_high_epss
+    if has_high_epss and ti.current_kev:
         boost = 15
-    elif has_high_epss or ti.in_kev:
+    elif has_high_epss or ti.current_kev:
         boost = 10
     return boost
 
