@@ -1,0 +1,118 @@
+{
+  "built_at": "2026-11-14T17:04:01Z",
+  "expires_at": "2026-11-21T17:04:01Z",
+  "malware_counts": {
+    "npm-malware": 237195,
+    "pypi-malware": 17511
+  },
+  "malware_range_counts": {
+    "npm-malware-ranges": 1403,
+    "pypi-malware-ranges": 14
+  },
+  "malware_stats": {
+    "npm-malware": {
+      "bounded_skipped": 806,
+      "cwe506_records": 391,
+      "malicious_records": 224392,
+      "versioned": 15225,
+      "whole_package": 208481,
+      "withdrawn_skipped": 341
+    },
+    "npm-malware-ranges": {
+      "range_unusable": 0,
+      "ranged": 1403
+    },
+    "pypi-malware": {
+      "bounded_skipped": 4,
+      "cwe506_records": 8,
+      "malicious_records": 12074,
+      "versioned": 5669,
+      "whole_package": 6404,
+      "withdrawn_skipped": 25
+    },
+    "pypi-malware-ranges": {
+      "range_unusable": 0,
+      "ranged": 14
+    }
+  },
+  "osv_built_at": "2026-11-14T17:04:01Z",
+  "osv_reason": "the previous OSV data is 6.7h old (rebuild every 6h)",
+  "osv_rebuilt": true,
+  "schema": "ca9.feed.v1",
+  "sentinel": {
+    "npm": {
+      "abandoned": 0,
+      "allowlisted": 0,
+      "budget_hit": false,
+      "checked": 4997,
+      "complete": true,
+      "deferred": 0,
+      "dropped_entries": 0,
+      "elapsed_seconds": 233.7,
+      "entries": 1,
+      "expired_entries": 0,
+      "failed_reasons": {},
+      "flagged": 0,
+      "incomplete": 0,
+      "lagging": 0,
+      "metadata_errors": 0,
+      "new_versions": 14,
+      "not_found": 3,
+      "not_reached": 0,
+      "pending": 0,
+      "prereleases_skipped": 2,
+      "reviewed": 13,
+      "run_at": "2026-11-14T17:04:22Z",
+      "unchanged": 4982,
+      "unpublished": 0,
+      "watched": 5000,
+      "watermark_source": "previous",
+      "window": {
+        "since": "2026-11-14T10:01:18Z",
+        "until": "2026-11-14T16:44:22Z"
+      }
+    },
+    "pypi": {
+      "abandoned": 0,
+      "allowlisted": 0,
+      "budget_hit": false,
+      "checked": 4998,
+      "complete": false,
+      "deferred": 0,
+      "dropped_entries": 0,
+      "elapsed_seconds": 233.7,
+      "entries": 4,
+      "expired_entries": 0,
+      "failed_reasons": {
+        "timeout": 1
+      },
+      "flagged": 0,
+      "incomplete": 2,
+      "lagging": 0,
+      "metadata_errors": 0,
+      "new_versions": 33,
+      "not_found": 2,
+      "not_reached": 0,
+      "pending": 1,
+      "prereleases_skipped": 4,
+      "reviewed": 29,
+      "run_at": "2026-11-14T17:04:22Z",
+      "unchanged": 4807,
+      "unpublished": 0,
+      "watched": 5000,
+      "watermark_source": "previous",
+      "window": {
+        "since": "2026-11-14T10:01:18Z",
+        "until": "2026-11-14T16:44:22Z"
+      }
+    }
+  },
+  "sources": {
+    "PyPI": "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip",
+    "npm": "https://osv-vulnerabilities.storage.googleapis.com/npm/all.zip"
+  },
+  "suspicious_counts": {
+    "npm-suspicious": 1,
+    "pypi-suspicious": 4
+  }
+}
