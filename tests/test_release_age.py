@@ -332,9 +332,9 @@ def test_repository_policy_cannot_turn_the_runtime_hold_off(tmp_path, monkeypatc
 def test_npm_gateway_tarball_check_reuses_the_shared_release_cache(tmp_path):
     from ca9.runtime.npm_gateway import NpmGatewayState, _tarball_decision
 
-    now = datetime.now(timezone.utc)
+    now = NOW
     feed_dir = tmp_path / "cache" / "feed"
-    update_feed_from_source(_empty_feed(tmp_path), cache_dir=feed_dir)
+    update_feed_from_source(_empty_feed(tmp_path), cache_dir=feed_dir, now=now)
     upstream = "http://127.0.0.1:9"
     check_release_age(
         "npm",
@@ -355,6 +355,7 @@ def test_npm_gateway_tarball_check_reuses_the_shared_release_cache(tmp_path):
                 package_age=PackageAgePolicy(enabled=True, minimum_hours=24),
             ),
             feed_cache_dir=feed_dir,
+            now=now,
             release_age_defaulted=defaulted,
         )
 

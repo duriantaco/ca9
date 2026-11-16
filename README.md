@@ -1072,6 +1072,9 @@ age, npm provenance) run only with `network: True` and stop at `max_lookups`.
 `api.check_provenance`, `api.check_release_age`, and `api.malware_matches`
 expose the single checks, and `api.feed_status` reports whether the malware feed
 is ready, stale, missing, or tampered, and when its OSV data was built.
+`api.package_history` says whether a package name is new or barely used on its
+registry (first publish time and release count), which is how a registered
+AI-invented name is told apart from an established package.
 `api.suspicious_matches` matches exact versions against the sentinel's
 suspicious-release datasets offline, and `api.refresh_feed` updates the installed
 feed only when it is older than `max_age_hours` (6 by default), within a time limit,
