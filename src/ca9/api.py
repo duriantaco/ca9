@@ -31,6 +31,12 @@ within a time limit, and never raises.
 the feed's ``*-suspicious`` datasets: new releases of popular packages that
 ca9's hourly sentinel flagged from a static review before any public malware
 report. Its findings use signal type ``suspicious_release``.
+
+``package_history(ecosystem, name)`` says whether a name is new or barely used
+on its registry ("new", "thin_history", "established", "missing", "unknown")
+from its first publish time and release count, with links for a reviewer. It
+is how a caller tells a registered AI-invented name (slopsquatting) from an
+established package; existence alone cannot.
 """
 
 from __future__ import annotations
@@ -270,6 +276,67 @@ def check_release_age(
     except Exception as exc:
         return _unknown_age(f"release age check failed: {exc}")
     return _normalized_age(result)
+
+
+def package_history(
+    ecosystem: str,
+    name: str,
+    *,
+    new_days: int = 30,
+    young_days: int = 180,
+    max_thin_releases: int = 2,
+    cache_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Whether a package name is new or barely used on its registry.
+
+    ``status`` is "new" (first published under ``new_days`` ago), "thin_history"
+    (under ``young_days`` old with at most ``max_thin_releases`` releases),
+    "established", "missing" or "unknown". A name an AI model invented and someone
+    then registered exists, so only its age and history give it away. The result
+    also has ``first_published_at``, ``latest_published_at``, ``age_days``,
+    ``release_count``, ``owners``, ``source_url``, ``registry_url``, ``report_url``,
+    ``thresholds``, ``source`` and ``reason``. Links and owners are for a reviewer;
+    they never decide the status. "unknown" is neither safe nor risky.
+    """
+    checker = _optional_function("ca9.package_history", "package_history")
+    if checker is None:
+        return _unknown_history(ecosystem, name, "ca9.package_history is not available in this ca9")
+    try:
+        result = checker(
+            ecosystem,
+            name,
+            new_days=new_days,
+            young_days=young_days,
+            max_thin_releases=max_thin_releases,
+            cache_dir=cache_dir,
+        )
+    except Exception as exc:
+        return _unknown_history(ecosystem, name, f"package history check failed: {exc}")
+    if not isinstance(result, dict) or result.get("status") not in _HISTORY_STATUSES:
+        return _unknown_history(ecosystem, name, "package history returned no usable result")
+    return result
+
+
+_HISTORY_STATUSES = frozenset({"new", "thin_history", "established", "missing", "unknown"})
+
+
+def _unknown_history(ecosystem: str, name: str, reason: str) -> dict[str, Any]:
+    return {
+        "status": "unknown",
+        "ecosystem": str(ecosystem or "").lower(),
+        "name": str(name or ""),
+        "first_published_at": None,
+        "latest_published_at": None,
+        "age_days": None,
+        "release_count": None,
+        "owners": [],
+        "source_url": None,
+        "registry_url": None,
+        "report_url": None,
+        "thresholds": {},
+        "source": "unavailable",
+        "reason": reason,
+    }
 
 
 def malware_matches(
