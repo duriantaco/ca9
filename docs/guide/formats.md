@@ -211,6 +211,11 @@ Generate prioritized remediation actions:
 ca9 check snyk-report.json --repo . -f remediation -o remediation.json
 ```
 
+For a reachable finding, ca9 selects the lowest reported patch newer than the
+installed version that falls outside the advisory's affected ranges. If the
+report gives only a version range for the installed package, ca9 keeps the
+scanner's patch candidates available for review.
+
 ### Action plan
 
 Generate a CI/CD decision object:
@@ -219,6 +224,11 @@ Generate a CI/CD decision object:
 ca9 check snyk-report.json --repo . -f action-plan -o action-plan.json
 ca9 action-plan snyk-report.json --repo . -o action-plan.json
 ```
+
+Upgrade actions list the reachable advisory IDs for each package and installed
+version. If their reported fixes establish a common target, the plan recommends
+one upgrade. Otherwise a review action lists the individual fixes. Project
+dependency constraints still need to be checked when applying the upgrade.
 
 ### SBOM enrichment
 

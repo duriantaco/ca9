@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
-from ca9.models import Report, Verdict
-from ca9.remediation import generate_remediation_plan
+from ca9.core.models import package_key
+from ca9.models import Report, ScanCoverage, Verdict, VerdictResult
+from ca9.remediation import RemediationAction, common_fix_version, generate_remediation
 
 
 @dataclass
@@ -35,9 +36,11 @@ class ActionPlan:
     exit_code: int
     actions: list[ActionItem] = field(default_factory=list)
     summary: str = ""
+    scan_coverage: ScanCoverage | None = None
 
     def to_dict(self) -> dict:
         return {
+            **({"scan_coverage": self.scan_coverage.to_dict()} if self.scan_coverage else {}),
             "decision": self.decision,
             "exit_code": self.exit_code,
             "summary": self.summary,
@@ -64,43 +67,87 @@ def _get_blast_radius(result):
     return br
 
 
+def _package_upgrade(group: list[tuple[VerdictResult, RemediationAction]]) -> ActionItem:
+    result, first = group[0]  # Ordered by priority.
+    target = common_fix_version([item.vulnerability for item, _ in group])
+    details = {
+        "ecosystem": result.vulnerability.ecosystem,
+        "current_version": first.package_version,
+        "vuln_ids": sorted({rem.vuln_id for _, rem in group}),
+    }
+    if target is None:
+        details["individual_fixes"] = {rem.vuln_id: rem.fix_version for _, rem in group}
+        reported = {
+            rem.vuln_id: list(rem.reported_fix_versions)
+            for _, rem in group
+            if rem.fix_version is None and rem.reported_fix_versions
+        }
+        if reported:
+            details["reported_fix_versions"] = reported
+        controls = sorted(
+            {
+                control
+                for _, rem in group
+                if rem.action == "mitigate"
+                for control in rem.compensating_controls
+            }
+        )
+        if controls:
+            details["compensating_controls"] = controls
+        return ActionItem(
+            "notify",
+            first.package_name,
+            "Review upgrade options: the reported fixes do not establish one version "
+            "that addresses all of these advisories.",
+            first.priority,
+            details,
+        )
+    details.update(
+        {
+            "fix_version": target,
+            "is_direct": first.is_direct_dependency,
+            "dependency_chain": first.dependency_chain,
+        }
+    )
+    action_type = "open_pr" if first.priority in ("critical", "high") else "notify"
+    return ActionItem(
+        action_type,
+        first.package_name,
+        f"Upgrade {first.package_name} to {target}",
+        first.priority,
+        details,
+    )
+
+
 def generate_action_plan(report: Report) -> ActionPlan:
     actions: list[ActionItem] = []
-    remediation = generate_remediation_plan(report)
+    priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    findings = [(result, generate_remediation(result)) for result in report.results]
+    findings.sort(
+        key=lambda pair: (
+            priority_order.get(pair[1].priority, 4),
+            pair[1].package_name,
+            pair[1].vuln_id,
+        )
+    )
 
-    for rem in remediation:
-        if rem.action == "none":
-            continue
+    groups: dict[str, list[tuple[VerdictResult, RemediationAction]]] = {}
+    for result, rem in findings:
+        if result.verdict == Verdict.REACHABLE:
+            key = package_key(result.vulnerability.ecosystem, rem.package_name, rem.package_version)
+            groups.setdefault(key, []).append((result, rem))
+    upgrades = {
+        key: _package_upgrade(group)
+        for key, group in groups.items()
+        if any(
+            rem.action == "upgrade"
+            or rem.priority in ("critical", "high")
+            or _get_blast_radius(result) is None
+            for result, rem in group
+        )
+    }
 
-        result = _find_result(report, rem.vuln_id, rem.package_name)
-
-        if rem.action == "upgrade" and rem.priority in ("critical", "high"):
-            actions.append(
-                ActionItem(
-                    action_type="open_pr",
-                    target=rem.package_name,
-                    reason=f"Upgrade {rem.package_name} to {rem.fix_version}",
-                    priority=rem.priority,
-                    details={
-                        "current_version": rem.package_version,
-                        "fix_version": rem.fix_version or "",
-                        "is_direct": rem.is_direct_dependency,
-                        "dependency_chain": rem.dependency_chain,
-                    },
-                )
-            )
-
-        if rem.action == "upgrade" and rem.priority in ("medium", "low"):
-            actions.append(
-                ActionItem(
-                    action_type="notify",
-                    target=rem.package_name,
-                    reason=f"Non-critical upgrade available: {rem.package_name} to {rem.fix_version}",
-                    priority=rem.priority,
-                    details={"fix_version": rem.fix_version or ""},
-                )
-            )
-
+    for result, rem in findings:
         if rem.action == "mitigate":
             br = _get_blast_radius(result) if result else None
             if br:
@@ -124,17 +171,6 @@ def generate_action_plan(report: Report) -> ActionPlan:
                                 },
                             )
                         )
-
-            if not br or rem.priority in ("critical", "high"):
-                actions.append(
-                    ActionItem(
-                        action_type="notify",
-                        target=rem.package_name,
-                        reason=f"No fix available for {rem.package_name} — manual review needed",
-                        priority=rem.priority,
-                        details={"compensating_controls": rem.compensating_controls},
-                    )
-                )
 
         if rem.action == "investigate":
             actions.append(
@@ -201,6 +237,10 @@ def generate_action_plan(report: Report) -> ActionPlan:
         decision = "warn"
         exit_code = 1
         summary = f"Deployment warning: {report.reachable_count} reachable vulnerabilities"
+    elif report.scan_coverage and not report.scan_coverage.complete:
+        decision = "warn"
+        exit_code = 2
+        summary = "Dependency scan incomplete"
     elif report.inconclusive_count > 0:
         decision = "warn"
         exit_code = 2
@@ -218,7 +258,7 @@ def generate_action_plan(report: Report) -> ActionPlan:
             seen.add(key)
             unique_actions.append(a)
 
-    priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    unique_actions.extend(upgrades.values())
     unique_actions.sort(key=lambda a: priority_order.get(a.priority, 4))
 
     if has_critical or has_critical_blast or has_kev_reachable:
@@ -237,14 +277,8 @@ def generate_action_plan(report: Report) -> ActionPlan:
         exit_code=exit_code,
         summary=summary,
         actions=unique_actions,
+        scan_coverage=report.scan_coverage,
     )
-
-
-def _find_result(report: Report, vuln_id: str, pkg_name: str):
-    for r in report.results:
-        if r.vulnerability.id == vuln_id and r.vulnerability.package_name == pkg_name:
-            return r
-    return None
 
 
 def write_action_plan(plan: ActionPlan, output: Path | TextIO | None = None) -> str:

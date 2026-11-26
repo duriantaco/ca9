@@ -19,9 +19,10 @@ class TestMCPServer:
         assert "Invalid JSON" in data["error"]
 
     def test_scan_dependencies_handles_osv_failure(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("requests==2.31.0\n")
         with (
             patch("ca9.scanner.get_installed_packages", return_value=[("requests", "2.31.0")]),
-            patch("ca9.scanner.query_osv_batch", side_effect=ConnectionError("network down")),
+            patch("ca9.scanner._post_osv_batch", side_effect=ConnectionError("network down")),
         ):
             data = json.loads(server.scan_dependencies(repo_path=str(tmp_path)))
 
@@ -33,13 +34,21 @@ class TestMCPServer:
 
         with (
             patch("ca9.scanner.get_installed_packages", return_value=[("unused", "0.1.0")]),
-            patch("ca9.scanner.query_osv_batch", return_value=[]),
+            patch("ca9.scanner.CACHE_DIR", tmp_path / "cache"),
+            patch("ca9.scanner._post_osv_batch", return_value={"results": [{}]}),
         ):
             data = json.loads(server.scan_dependencies(repo_path=str(tmp_path)))
 
         assert data["packages_scanned"] == 1
         assert data["inventory_source"] == "repo"
         assert data["message"] == "No known vulnerabilities found in scanned packages."
+
+    def test_scan_dependencies_reports_unresolved_inventory(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("sample>=1")
+        data = json.loads(server.scan_dependencies(repo_path=str(tmp_path)))
+        assert data["message"] == "Dependency scan incomplete."
+        assert data["scan_coverage"]["unresolved"] == 1
+        assert data["scan_coverage"]["status"] == "partial"
 
     def test_ingest_sarif_returns_evidence_report(self, tmp_path):
         sarif = {

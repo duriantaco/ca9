@@ -16,6 +16,15 @@ def _grype_report(matches: list[object]) -> dict:
     }
 
 
+def test_grype_only_uses_confirmed_patches():
+    data = json.loads(FIXTURE.read_text())
+    record = data["matches"][0]["vulnerability"]
+    record["fix"] = {"state": "fixed", "versions": ["1.1", "2.3"]}
+    assert GrypeParser().parse(data)[0].fixed_versions == ("1.1", "2.3")
+    record["fix"]["state"] = "unknown"
+    assert GrypeParser().parse(data)[0].fixed_versions == ()
+
+
 class TestGrypeDetection:
     def test_detects_descriptor_identity(self):
         assert GrypeParser().can_parse(_grype_report([]))

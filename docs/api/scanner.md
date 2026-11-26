@@ -14,7 +14,7 @@ def scan_repository(
 ) -> tuple[list[Vulnerability], ScanInventory]
 ```
 
-Resolves dependency inventory for a repository, queries OSV.dev for known vulnerabilities, and returns both the vulnerabilities and inventory metadata.
+Resolves dependency inventory for a repository, queries OSV.dev for known vulnerabilities, and returns both the vulnerabilities and inventory metadata. `inventory.coverage().to_dict()` gives the scan status, package counts, and advisory source. With `offline=True`, only a current cached query for the exact package version counts as checked. A cached advisory can still provide a finding when the query is unavailable.
 
 The inventory resolver prefers declared repository dependencies with exact versions.
 Unresolved dependencies are skipped by default. Set `allow_environment_fallback=True`
@@ -65,8 +65,8 @@ Queries the [OSV.dev batch API](https://osv.dev/docs/) for vulnerabilities affec
 | Parameter | Type | Description |
 |---|---|---|
 | `packages` | `list[tuple[str, str]]` | List of `(name, version)` tuples |
-| `offline` | `bool` | Use cached OSV details only |
-| `refresh_cache` | `bool` | Clear cached OSV details before querying |
+| `offline` | `bool` | Use cached package queries and advisory details |
+| `refresh_cache` | `bool` | Clear cached OSV queries and details before querying |
 | `max_workers` | `int` | Concurrent OSV detail fetches |
 
 **Returns:** List of `Vulnerability` objects with severity, version ranges, references, advisory aliases, CWE/CPE metadata where OSV provides it, published/modified timestamps, and cache freshness metadata.

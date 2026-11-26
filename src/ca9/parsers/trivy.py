@@ -5,7 +5,7 @@ from typing import Any
 
 from ca9.advisory import extract_cpes, extract_cwes, normalize_ecosystem
 from ca9.models import Vulnerability, finding_key
-from ca9.parsers.base import normalize_dependency_chain, parse_package_ref
+from ca9.parsers.base import normalize_dependency_chain, parse_package_ref, reported_versions
 
 _DIRECT_MANIFEST_TARGETS = {
     "requirements.txt",
@@ -101,6 +101,7 @@ class TrivyParser:
                         cwes=extract_cwes(v),
                         cpes=extract_cpes(v),
                         advisory_source="trivy",
+                        fixed_versions=reported_versions(v.get("FixedVersion")),
                         advisory_url=v.get("PrimaryURL", ""),
                         published_at=v.get("PublishedDate"),
                         modified_at=v.get("LastModifiedDate"),

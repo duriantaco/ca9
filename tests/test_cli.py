@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
 from ca9 import __version__
@@ -344,20 +345,75 @@ class TestCLI:
         (repo / "requirements.txt").write_text("requests==2.31.0\n")
 
         runner = CliRunner()
+        args = ["scan", "--repo", str(repo), "-f", "json"]
         with (
+            patch("ca9.scanner.CACHE_DIR", tmp_path / "cache"),
             patch("ca9.scanner.get_installed_packages", return_value=[("unused", "0.1.0")]),
-            patch("ca9.scanner.query_osv_batch", return_value=[]) as mock_query,
+            patch("ca9.scanner._post_osv_batch", return_value={"results": [{}]}) as query,
         ):
-            result = runner.invoke(main, ["scan", "--repo", str(repo), "--no-auto-coverage"])
+            for flags in ([], ["--offline"]):
+                result = runner.invoke(main, [*args, *flags])
+                assert result.exit_code == 0, result.output
+                data = json.loads(result.stdout)
+                assert data["scan_coverage"]["status"] == "complete"
+                assert data["scan_coverage"]["checked"] == 1
+                assert data["warnings"] == []
+                assert data["results"] == []
 
-        assert result.exit_code == 0
-        mock_query.assert_called_once_with(
-            [("requests", "2.31.0")],
-            offline=False,
-            refresh_cache=False,
-            max_workers=8,
+        query.assert_called_once_with(
+            [{"package": {"name": "requests", "ecosystem": "PyPI"}, "version": "2.31.0"}]
         )
-        assert "Scanning repo dependency inventory" in result.output
+
+    @pytest.mark.parametrize("requirement,resolved", [("demo>=1", 0), ("demo==1", 1)])
+    def test_incomplete_scan_exits_two_without_creating_a_finding(
+        self, tmp_path, monkeypatch, requirement, resolved
+    ):
+        from ca9 import scanner
+
+        monkeypatch.setattr(scanner, "CACHE_DIR", tmp_path / "empty-cache")
+        (tmp_path / "requirements.txt").write_text(requirement)
+        for fmt in (
+            "json",
+            "sarif",
+            "action-plan",
+            "remediation",
+            "vex",
+            "table",
+            "markdown",
+            "html",
+        ):
+            out = tmp_path / "report"
+            result = CliRunner().invoke(
+                main, ["scan", "--repo", str(tmp_path), "--offline", "-f", fmt, "-o", str(out)]
+            )
+            assert result.exit_code == 2, result.output
+            assert "No known vulnerabilities" not in result.output
+            if fmt in ("table", "markdown", "html"):
+                assert "Incomplete dependency scan" in out.read_text()
+                continue
+            data = json.loads(out.read_text())
+            if fmt == "sarif":
+                assert data["runs"][0]["results"] == []
+                coverage = data["runs"][0]["properties"]["scan_coverage"]
+            elif fmt == "vex":
+                assert data["statements"] == []
+                coverage = data["tooling"]["scan_coverage"]
+            else:
+                coverage = data["scan_coverage"]
+            assert coverage == {
+                "status": "partial",
+                "advisory_source": "osv_cache",
+                "inventory_source": "repo" if resolved else "none",
+                "declared": 1,
+                "resolved": resolved,
+                "checked": 0,
+                "unresolved": 1 - resolved,
+            }
+            if fmt == "json":
+                assert data["results"] == []
+                assert len(data["warnings"]) == 1
+            if fmt == "action-plan":
+                assert (data["decision"], data["exit_code"], data["actions"]) == ("warn", 2, [])
 
 
 class TestCLINewCommands:

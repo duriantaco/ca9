@@ -29,6 +29,20 @@ class VersionRange:
 
 
 @dataclass(frozen=True)
+class AdvisoryRange:
+    """Original OSV comparison scheme and events used to check patch candidates."""
+
+    kind: str
+    events: tuple[tuple[str, str], ...]
+
+    def includes(self, ecosystem: str, version: str) -> bool | None:
+        from ca9.version_order import osv_range_includes
+
+        bounds = {"type": self.kind, "events": [{key: value} for key, value in self.events]}
+        return osv_range_includes(ecosystem, bounds, version)
+
+
+@dataclass(frozen=True)
 class Vulnerability:
     id: str
     package_name: str
@@ -51,6 +65,9 @@ class Vulnerability:
     fetched_at: str | None = None
     cache_stale: bool | None = None
     malicious: bool = False
+    fixed_versions: tuple[str, ...] = ()
+    affected_versions: tuple[str, ...] = ()
+    advisory_ranges: tuple[AdvisoryRange, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -237,6 +254,33 @@ def finding_key(vuln_id: str, package_name: str, package_version: str) -> tuple[
     return (vuln_id, package_name.lower(), package_version)
 
 
+@dataclass(frozen=True)
+class ScanCoverage:
+    """Advisory lookup coverage of the selected Python dependency inventory."""
+
+    inventory_source: str
+    advisory_source: str
+    declared: int
+    resolved: int
+    checked: int
+    unresolved: int
+
+    @property
+    def complete(self) -> bool:
+        return self.resolved > 0 and self.checked == self.resolved and self.unresolved == 0
+
+    def to_dict(self) -> dict:
+        return {
+            "status": "complete" if self.complete else "partial",
+            "inventory_source": self.inventory_source,
+            "advisory_source": self.advisory_source,
+            "declared": self.declared,
+            "resolved": self.resolved,
+            "checked": self.checked,
+            "unresolved": self.unresolved,
+        }
+
+
 @dataclass
 class Report:
     results: list[VerdictResult]
@@ -245,6 +289,7 @@ class Report:
     proof_standard: str = "strict"
     warnings: list[str] = field(default_factory=list)
     ignored_results: list[PolicyIgnoredResult] = field(default_factory=list)
+    scan_coverage: ScanCoverage | None = None
 
     @property
     def total(self) -> int:
@@ -274,6 +319,6 @@ class Report:
     def exit_code(self) -> int:
         if self.reachable_count > 0:
             return 1
-        if self.inconclusive_count > 0:
+        if self.inconclusive_count > 0 or (self.scan_coverage and not self.scan_coverage.complete):
             return 2
         return 0

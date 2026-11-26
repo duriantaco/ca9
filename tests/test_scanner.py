@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ca9 import scanner
 from ca9.models import VersionRange
 from ca9.scanner import (
     ScanInventory,
@@ -20,6 +21,11 @@ from ca9.scanner import (
     scan_installed,
     scan_repository,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated_osv_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(scanner, "CACHE_DIR", tmp_path / "osv-cache")
 
 
 class TestGetInstalledPackages:
@@ -507,6 +513,8 @@ class TestResolveScanInventory:
         inventory = resolve_scan_inventory(repo)
 
         assert isinstance(inventory, ScanInventory)
+        assert inventory.coverage().checked == 0
+        assert inventory.coverage().advisory_source == "none"
         assert inventory.source == "repo"
         assert inventory.packages == (("requests", "2.31.0"),)
         assert inventory.pinned_dependencies == 1
@@ -609,25 +617,97 @@ dependencies = [
 
 
 class TestScanRepository:
-    @patch("ca9.scanner.query_osv_batch")
+    @patch("ca9.scanner._post_osv_batch")
     @patch("ca9.scanner.get_installed_packages")
     def test_uses_repo_inventory_for_osv_query(self, mock_get, mock_query, tmp_path):
         repo = tmp_path / "repo"
         repo.mkdir()
         (repo / "requirements.txt").write_text("requests==2.31.0\n")
         mock_get.return_value = [("unused", "1.0.0")]
-        mock_query.return_value = []
+        mock_query.return_value = {"results": [{}]}
 
         vulns, inventory = scan_repository(repo)
 
         assert vulns == []
         assert inventory.source == "repo"
+        assert inventory.coverage().checked == len(inventory.packages)
         mock_query.assert_called_once_with(
-            [("requests", "2.31.0")],
-            offline=False,
-            refresh_cache=False,
-            max_workers=8,
+            [{"package": {"name": "requests", "ecosystem": "PyPI"}, "version": "2.31.0"}]
         )
+
+    def test_offline_replays_exact_positive_and_negative_queries(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("alpha==1\nzeta==1\n")
+        with (
+            patch(
+                "ca9.scanner._post_osv_batch",
+                return_value={"results": [{}, {"vulns": [{"id": "TEST-1"}]}]},
+            ),
+            patch("ca9.scanner._fetch_vuln_details", return_value={}),
+        ):
+            online, inventory = scan_repository(tmp_path)
+        assert inventory.coverage().checked == len(inventory.packages)
+
+        # Even if the detail lookup failed, batch membership still identifies the finding.
+        with patch("ca9.scanner.urllib.request.urlopen", side_effect=AssertionError("offline")):
+            offline, inventory = scan_repository(tmp_path, offline=True)
+        assert (
+            [(v.id, v.package_name) for v in offline]
+            == [(v.id, v.package_name) for v in online]
+            == [("TEST-1", "zeta")]
+        )
+        assert inventory.coverage().checked == len(inventory.packages)
+        assert not inventory.warnings
+
+    def test_partial_offline_cache_is_isolated_by_package_version_and_ecosystem(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("alpha==1\nbeta==1\ngamma==1\n")
+        with patch("ca9.scanner._post_osv_batch", return_value={"results": [{}]}):
+            query_osv_batch([("alpha", "1")])
+            query_osv_batch([("beta", "2")])
+            query_osv_batch([("gamma", "1")], ecosystem="npm")
+        findings, inventory = scan_repository(tmp_path, offline=True)
+        assert findings == []
+        assert len(inventory.packages) - inventory.coverage().checked == 2
+        assert len(inventory.warnings) == 1
+        assert "2 of 3 resolved packages" in inventory.warnings[0]
+
+    @pytest.mark.parametrize(
+        "bad_record", ["missing", "invalid-json", "wrong-query", "wrong-ids", "expired", "future"]
+    )
+    def test_unusable_receipt_cannot_verify_absence(self, tmp_path, bad_record):
+        (tmp_path / "requirements.txt").write_text("alpha==1\n")
+        with patch("ca9.scanner._post_osv_batch", return_value={"results": [{}]}):
+            query_osv_batch([("alpha", "1")])
+        (receipt,) = (scanner.CACHE_DIR / "queries").glob("*.json")
+        data = json.loads(receipt.read_text())
+        if bad_record == "missing":
+            receipt.unlink()
+        elif bad_record == "invalid-json":
+            receipt.write_text("{")
+        else:
+            changes = {
+                "wrong-query": {"query": ["pypi", "beta", "1"]},
+                "wrong-ids": {"advisory_ids": [None]},
+                "expired": {"queried_at": time.time() - scanner.CACHE_TTL_SECONDS - 10},
+                "future": {"queried_at": time.time() + 60},
+            }
+            receipt.write_text(json.dumps({**data, **changes[bad_record]}))
+        findings, inventory = scan_repository(tmp_path, offline=True)
+        assert findings == []
+        assert inventory.coverage().checked == 0
+
+    def test_legacy_cached_advisory_preserved_without_proving_coverage(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("alpha==1\n")
+        record = {"id": "TEST-1", "affected": [{"package": {"ecosystem": "PyPI", "name": "alpha"}}]}
+        _write_cached_advisory(scanner.CACHE_DIR, record)
+        findings, inventory = scan_repository(tmp_path, offline=True)
+        assert [v.id for v in findings] == ["TEST-1"]
+        assert inventory.coverage().checked == 0
+        # A newer complete answer supersedes that fallback.
+        with patch("ca9.scanner._post_osv_batch", return_value={"results": [{}]}):
+            query_osv_batch([("alpha", "1")])
+        findings, inventory = scan_repository(tmp_path, offline=True)
+        assert findings == []
+        assert inventory.coverage().checked == len(inventory.packages)
 
 
 # An ordinary GHSA whose prose uses words the old free-text classifier keyed on.
@@ -821,6 +901,50 @@ def _http_error(code, headers=None):
 
 
 class TestOsvBatchTransport:
+    def test_batch_response_accepts_additive_metadata(self):
+        reply = {"results": [{"vulns": [], "extra": 1}], "newMetadata": 1}
+        with patch("ca9.scanner._post_osv_batch", return_value=reply):
+            assert query_osv_batch([("sample", "1")]) == []
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            None,
+            {},
+            {"results": []},
+            {"results": [{}, {}]},
+            {"results": [None]},
+            {"error": "unavailable", "results": [{}]},
+            {"results": [{"unexpected": "missing membership"}]},
+            {"results": [{"error": "unavailable"}]},
+            {"results": [{"vulns": None}]},
+            {"results": [{"vulns": {}}]},
+            {"results": [{"vulns": [42]}]},
+            {"results": [{"vulns": [{}]}]},
+            {"results": [{"vulns": [{"id": ""}]}]},
+            {"results": [{"vulns": [{"id": "bad id"}]}]},
+            {"results": [{"next_page_token": 12}]},
+        ],
+    )
+    def test_invalid_response_cannot_be_cached_as_complete(self, reply, tmp_path):
+        with (
+            patch("ca9.scanner._post_osv_batch", return_value=reply),
+            pytest.raises(ValueError, match="OSV.dev"),
+        ):
+            query_osv_batch([("sample", "1")])
+        (tmp_path / "requirements.txt").write_text("sample==1\n")
+        _, inventory = scan_repository(tmp_path, offline=True)
+        assert inventory.coverage().checked == 0
+
+    def test_incomplete_continuation_does_not_publish_receipts(self):
+        pages = [
+            {"results": [{}, {"vulns": [{"id": "TEST-1"}], "next_page_token": "more"}]},
+            {"results": []},
+        ]
+        with patch("ca9.scanner._post_osv_batch", side_effect=pages), pytest.raises(ValueError):
+            query_osv_batch([("first", "1"), ("second", "1")])
+        assert not (scanner.CACHE_DIR / "queries").exists()
+
     @patch("ca9.scanner._fetch_vuln_details", return_value={})
     def test_large_inventories_are_chunked_at_osv_limit(self, _mock_fetch):
         def responder(payload, _call):

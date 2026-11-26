@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ca9.models import Report, Verdict, VerdictResult
+from ca9.models import AdvisoryRange, Report, Verdict, VerdictResult, Vulnerability
+from ca9.version_order import OSV_VERSION_RANGE_TYPES, same_version, version_key
 
 
 @dataclass
@@ -21,6 +22,7 @@ class RemediationAction:
     blast_radius_capabilities: list[str] = field(default_factory=list)
     blast_radius_risk: str = "low"
     confidence_score: int = 0
+    reported_fix_versions: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -35,6 +37,8 @@ class RemediationAction:
         }
         if self.fix_version:
             d["fix_version"] = self.fix_version
+        elif self.reported_fix_versions:
+            d["reported_fix_versions"] = list(self.reported_fix_versions)
         if not self.is_direct_dependency:
             d["is_direct_dependency"] = False
             if self.dependency_chain:
@@ -64,10 +68,63 @@ def _get_blast_radius(result: VerdictResult):
     return br
 
 
-def _extract_fix_version(result: VerdictResult) -> str | None:
-    for r in result.vulnerability.affected_ranges:
-        if r.fixed:
-            return r.fixed
+def _supports_fix(vuln: Vulnerability, candidate: str) -> bool:
+    """Check exact patch evidence and every reported affected interval."""
+    ecosystem = vuln.ecosystem
+    if any(same_version(ecosystem, v, candidate) for v in vuln.affected_versions):
+        return False
+    explicit = any(same_version(ecosystem, v, candidate) for v in vuln.fixed_versions)
+    installed_in_range = False
+    ranges = vuln.advisory_ranges
+    if not ranges:
+        intervals = []
+        for interval in vuln.affected_ranges:
+            if not interval.introduced:
+                # Some callers supply a patch version alone, without range evidence.
+                explicit |= same_version(ecosystem, interval.fixed, candidate)
+                continue
+            events = [("introduced", interval.introduced)]
+            if interval.fixed:
+                events.append(("fixed", interval.fixed))
+            if interval.last_affected:
+                events.append(("last_affected", interval.last_affected))
+            intervals.append(AdvisoryRange("ECOSYSTEM", tuple(events)))
+        ranges = tuple(intervals)
+    for bounds in ranges:
+        if bounds.includes(ecosystem, candidate) is not False:
+            return False
+        if bounds.includes(ecosystem, vuln.package_version):
+            installed_in_range = True
+    return explicit or installed_in_range
+
+
+def common_fix_version(vulnerabilities: list[Vulnerability]) -> str | None:
+    """Find the lowest reported forward patch supported by every advisory in one group."""
+    if not vulnerabilities:
+        return None
+    first = vulnerabilities[0]
+    installed = version_key(first.ecosystem, first.package_version)
+    if installed is None:
+        return None
+    candidates: set[str] = set()
+    for vuln in vulnerabilities:
+        candidates.update(vuln.fixed_versions)
+        candidates.update(interval.fixed for interval in vuln.affected_ranges if interval.fixed)
+        candidates.update(
+            version
+            for interval in vuln.advisory_ranges
+            if interval.kind in OSV_VERSION_RANGE_TYPES
+            for event, version in interval.events
+            if event == "fixed"
+        )
+    ordered = []
+    for candidate in candidates:
+        parsed = version_key(first.ecosystem, candidate)
+        if parsed is not None and parsed > installed:
+            ordered.append((parsed, candidate))
+    for _, candidate in sorted(ordered):
+        if all(_supports_fix(vuln, candidate) for vuln in vulnerabilities):
+            return candidate
     return None
 
 
@@ -114,9 +171,9 @@ def _compute_priority(result: VerdictResult) -> str:
     return "low"
 
 
-def _determine_action(result: VerdictResult) -> str:
+def _determine_action(result: VerdictResult, fix_version: str | None) -> str:
     if result.verdict == Verdict.REACHABLE:
-        if _extract_fix_version(result):
+        if fix_version:
             return "upgrade"
         return "mitigate"
 
@@ -203,7 +260,7 @@ def _build_summary(result: VerdictResult, action: str, fix_version: str | None) 
         if fix_version:
             base = f"Upgrade {pkg} to {fix_version} — vulnerability is reachable"
         else:
-            base = f"No fix available for {pkg} — apply compensating controls"
+            base = f"No forward fix confirmed for {pkg} — apply compensating controls"
 
         br = _get_blast_radius(result)
         if br and br.risk_level in ("high", "critical"):
@@ -231,8 +288,8 @@ def _build_summary(result: VerdictResult, action: str, fix_version: str | None) 
 
 
 def generate_remediation(result: VerdictResult) -> RemediationAction:
-    fix_version = _extract_fix_version(result)
-    action = _determine_action(result)
+    fix_version = common_fix_version([result.vulnerability])
+    action = _determine_action(result, fix_version)
     priority = _compute_priority(result)
     if result.runtime_adjusted_priority:
         priority = result.runtime_adjusted_priority
@@ -266,6 +323,7 @@ def generate_remediation(result: VerdictResult) -> RemediationAction:
         blast_radius_capabilities=br_caps,
         blast_radius_risk=br_risk,
         confidence_score=result.confidence_score,
+        reported_fix_versions=result.vulnerability.fixed_versions,
     )
 
 

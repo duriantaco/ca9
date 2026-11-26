@@ -75,26 +75,43 @@ def load_accepted_risks(path: Path) -> list[AcceptedRisk]:
     return risks
 
 
-def _baseline_keys(path: Path) -> set[tuple[str, str, str]]:
+def _baseline_alerts(path: Path) -> set[tuple[str, str, str, Verdict]]:
     try:
         data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return set()
 
-    results = data.get("results", []) if isinstance(data, dict) else []
-    if not isinstance(results, list):
+    if not isinstance(data, dict):
         return set()
 
-    keys: set[tuple[str, str, str]] = set()
+    results = data.get("results")
+    results = list(results) if isinstance(results, list) else []
+    ignored = data.get("ignored_results")
+    if isinstance(ignored, list):
+        # Carry a baseline suppression forward without extending an accepted risk.
+        results.extend(
+            row for row in ignored if isinstance(row, dict) and row.get("policy") == "baseline"
+        )
+
+    alerts: set[tuple[str, str, str, Verdict]] = set()
     for item in results:
         if not isinstance(item, dict):
             continue
         vuln_id = item.get("id")
         package = item.get("package")
         version = item.get("version")
-        if isinstance(vuln_id, str) and isinstance(package, str) and isinstance(version, str):
-            keys.add(finding_key(vuln_id, package, version))
-    return keys
+        if not (isinstance(vuln_id, str) and isinstance(package, str) and isinstance(version, str)):
+            continue
+        # Legacy baselines contained only the identity and suppressed both alert types.
+        try:
+            previous = Verdict(item.get("verdict", Verdict.REACHABLE.value))
+        except ValueError:
+            continue
+        key = finding_key(vuln_id, package, version)
+        alerts.add((*key, Verdict.INCONCLUSIVE))
+        if previous == Verdict.REACHABLE:
+            alerts.add((*key, Verdict.REACHABLE))
+    return alerts
 
 
 def apply_policy(
@@ -105,7 +122,7 @@ def apply_policy(
     today: date | None = None,
 ) -> Report:
     accepted_risks = load_accepted_risks(accepted_risks_path) if accepted_risks_path else []
-    baseline = _baseline_keys(baseline_path) if baseline_path and new_only else set()
+    baseline = _baseline_alerts(baseline_path) if baseline_path and new_only else set()
     warnings = list(report.warnings)
 
     if accepted_risks_path is not None and not accepted_risks:
@@ -146,12 +163,7 @@ def apply_policy(
 
         vuln = result.vulnerability
         key = finding_key(vuln.id, vuln.package_name, vuln.package_version)
-        if (
-            new_only
-            and baseline
-            and key in baseline
-            and result.verdict in (Verdict.REACHABLE, Verdict.INCONCLUSIVE)
-        ):
+        if (*key, result.verdict) in baseline:
             baseline_count += 1
             ignored.append(
                 PolicyIgnoredResult(
@@ -187,4 +199,5 @@ def apply_policy(
         proof_standard=report.proof_standard,
         warnings=warnings,
         ignored_results=ignored,
+        scan_coverage=report.scan_coverage,
     )

@@ -180,15 +180,20 @@ def scan_dependencies(
     except (ConnectionError, ValueError) as exc:
         return _json_error(str(exc), error_type=type(exc).__name__)
 
+    coverage = inventory.coverage()
+    context = {
+        "packages_scanned": len(inventory.packages),
+        "inventory_source": inventory.source,
+        "inventory_warnings": list(inventory.warnings),
+        "scan_coverage": coverage.to_dict(),
+    }
     if not vulnerabilities:
-        return _json_response(
-            {
-                "message": "No known vulnerabilities found in scanned packages.",
-                "packages_scanned": len(inventory.packages),
-                "inventory_source": inventory.source,
-                "inventory_warnings": list(inventory.warnings),
-            }
+        message = (
+            "No known vulnerabilities found in scanned packages."
+            if coverage.complete
+            else "Dependency scan incomplete."
         )
+        return _json_response({"message": message, **context})
 
     try:
         report = analyze(vulnerabilities, repo, cov_path, proof_standard=proof_standard)
@@ -197,12 +202,8 @@ def scan_dependencies(
             f"Reachability analysis failed: {exc}",
             error_type=type(exc).__name__,
         )
-    if inventory.warnings:
-        report.warnings = list(inventory.warnings) + report.warnings
-    result = report_to_dict(report)
-    result["packages_scanned"] = len(inventory.packages)
-    result["inventory_source"] = inventory.source
-    result["inventory_warnings"] = list(inventory.warnings)
+    report.warnings = list(inventory.warnings) + report.warnings
+    result = {**report_to_dict(report), **context}
     return _json_response(result)
 
 

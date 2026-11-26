@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ca9.action_plan import generate_action_plan
 from ca9.capabilities.models import BlastRadius, CapabilityHit
 from ca9.models import Evidence, Report, Verdict, VerdictResult, VersionRange, Vulnerability
@@ -20,6 +22,42 @@ def _vuln(pkg="requests", severity="high", fix="2.32.0"):
 def _blast_radius(caps=("exec.shell",), risk="high"):
     hits = tuple(CapabilityHit(name=c, scope="*", source_file="a.py", asset_ref="a") for c in caps)
     return BlastRadius(capabilities=caps, details=hits, risk_level=risk, risk_reasons=())
+
+
+def test_grouped_upgrade_covers_all_reported_ranges():
+    a = _vuln(fix="2.32.0")
+    b = replace(_vuln(fix="2.33.0"), id="CVE-2")
+    c = replace(a, package_version="2.30.0")
+    for vulnerabilities in ((a, b, c), (c, b, a)):
+        report = Report([VerdictResult(v, Verdict.REACHABLE, "test") for v in vulnerabilities], ".")
+        upgrades = [
+            a.details for a in generate_action_plan(report).actions if a.action_type == "open_pr"
+        ]
+        assert len(upgrades) == 2
+        by_version = {item["current_version"]: item for item in upgrades}
+        assert by_version["2.31.0"]["fix_version"] == "2.33.0"
+        assert by_version["2.31.0"]["vuln_ids"] == ["CVE-1", "CVE-2"]
+        assert by_version["2.30.0"]["fix_version"] == "2.32.0"
+
+
+def test_disjoint_exact_patch_evidence_produces_single_review():
+    a = replace(_vuln(fix=None), fixed_versions=("2.32.0",))
+    b = replace(a, id="CVE-2", fixed_versions=("2.33.0",))
+    report = Report([VerdictResult(v, Verdict.REACHABLE, "test") for v in (a, b)], ".")
+    [action] = generate_action_plan(report).actions
+    assert action.action_type == "notify"
+    assert action.details["individual_fixes"] == {"CVE-1": "2.32.0", "CVE-2": "2.33.0"}
+
+
+def test_unconfirmed_installed_version_keeps_both_advisories_and_candidate_versions():
+    a = replace(_vuln(fix=None), package_version="<2", fixed_versions=("2.0",))
+    b = replace(a, id="CVE-2", fixed_versions=("1.9",))
+    report = Report([VerdictResult(v, Verdict.REACHABLE, "test") for v in (a, b)], ".")
+    [action] = generate_action_plan(report).actions
+    assert action.action_type == "notify"
+    assert action.details["vuln_ids"] == ["CVE-1", "CVE-2"]
+    assert action.details["individual_fixes"] == {"CVE-1": None, "CVE-2": None}
+    assert action.details["reported_fix_versions"] == {"CVE-1": ["2.0"], "CVE-2": ["1.9"]}
 
 
 class TestActionPlan:

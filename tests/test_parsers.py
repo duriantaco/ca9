@@ -10,6 +10,11 @@ from ca9.parsers.trivy import TrivyParser
 
 
 class TestSnykParser:
+    def test_keeps_explicit_patches(self, snyk_path):
+        data = json.loads(snyk_path.read_text())
+        data["vulnerabilities"][0]["fixedIn"] = ["2.20.0", None, "2.20.0"]
+        assert SnykParser().parse(data)[0].fixed_versions == ("2.20.0",)
+
     def test_can_parse_snyk(self, snyk_path):
         data = json.loads(snyk_path.read_text())
         parser = SnykParser()
@@ -129,6 +134,13 @@ class TestSnykParser:
 
 
 class TestDependabotParser:
+    def test_keeps_first_patched_release_separate_from_installed_range(self, dependabot_path):
+        data = json.loads(dependabot_path.read_text())
+        data[0]["security_vulnerability"]["first_patched_version"] = {"identifier": "2.20.0"}
+        vuln = DependabotParser().parse(data)[0]
+        assert vuln.fixed_versions == ("2.20.0",)
+        assert vuln.package_version == ">= 2.0, < 2.20.0"
+
     def test_can_parse_dependabot(self, dependabot_path):
         data = json.loads(dependabot_path.read_text())
         parser = DependabotParser()

@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
+
+import pytest
+from click.testing import CliRunner
+
 from ca9.capabilities.models import BlastRadius, CapabilityHit
+from ca9.cli import main
 from ca9.models import Evidence, Report, Verdict, VerdictResult, VersionRange, Vulnerability
 from ca9.remediation import (
     generate_remediation,
@@ -28,6 +35,68 @@ def _blast_radius(caps=("exec.shell",), risk="high"):
     return BlastRadius(capabilities=caps, details=hits, risk_level=risk, risk_reasons=())
 
 
+@pytest.mark.parametrize("filename", ["trivy_sample.json", "pip_audit_sample.json"])
+@pytest.mark.parametrize("output_format", ["action-plan", "remediation"])
+def test_reported_patch_reaches_cli_plan(
+    fixtures_dir, sample_repo, coverage_path, filename, output_format
+):
+    run = CliRunner().invoke(
+        main,
+        [
+            "check",
+            str(fixtures_dir / filename),
+            "--repo",
+            str(sample_repo),
+            "--coverage",
+            str(coverage_path),
+            "-f",
+            output_format,
+        ],
+    )
+    assert run.exit_code == 1, run.output
+    actions = json.loads(run.stdout)["actions"]
+    requested = [
+        action for action in actions if action.get("package", action.get("target")) == "requests"
+    ]
+    assert len(requested) == 1
+    assert requested[0].get("details", requested[0])["fix_version"] == "2.31.0"
+
+
+def test_fix_selection_respects_release_lines_and_explicitly_affected_versions():
+    vuln = replace(
+        _vuln(version="2.1"),
+        affected_ranges=(
+            VersionRange("1", "1.1"),
+            VersionRange("2", "2.2"),
+            VersionRange("2.2", "2.3"),
+        ),
+    )
+    finding = VerdictResult(vulnerability=vuln, verdict=Verdict.REACHABLE, reason="test")
+    assert generate_remediation(finding).fix_version == "2.3"
+    assert (
+        generate_remediation(
+            replace(
+                finding,
+                vulnerability=replace(
+                    vuln,
+                    affected_versions=("2.3.0",),
+                ),
+            )
+        ).fix_version
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "installed,candidate", [("2", "1.9"), ("2.0", "2.0.0"), ("<2", "2.1"), ("2", ">=2.1")]
+)
+def test_unverified_forward_targets_are_only_reported(installed, candidate):
+    vuln = replace(_vuln(version=installed, fix=None), fixed_versions=(candidate,))
+    action = generate_remediation(VerdictResult(vuln, Verdict.REACHABLE, "test"))
+    assert action.fix_version is None
+    assert action.to_dict()["reported_fix_versions"] == [candidate]
+
+
 class TestActionDetermination:
     def test_reachable_with_fix_suggests_upgrade(self):
         result = VerdictResult(
@@ -50,7 +119,7 @@ class TestActionDetermination:
         )
         action = generate_remediation(result)
         assert action.action == "mitigate"
-        assert "No fix available" in action.summary
+        assert "No forward fix confirmed" in action.summary
 
     def test_inconclusive_suggests_investigate(self):
         result = VerdictResult(
