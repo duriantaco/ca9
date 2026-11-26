@@ -283,6 +283,10 @@ because a package version or source line number changes. Missing artifacts and
 inspection gaps remain explicit; a pass covers only the declared comparison
 scope. See the [dependency review guide](docs/guide/dependency-review.md).
 
+On GitHub, use the Action's `command: review` with a full checkout. It finds
+changed npm lockfiles across the PR and puts new behavior and inspection gaps
+in the job summary. Clean updates get a short result. [Workflow example](docs/integrations/github-action.md#review-dependency-updates-on-pull-requests)
+
 ### Run supply-chain risk checks
 
 ```bash

@@ -97,7 +97,7 @@ def review_lockfiles(
     evidence remains unknown, including when the baseline cannot be inspected.
     Registry origins are explicit trust input; lockfile URLs never expand trust.
     """
-    origins = tuple(sorted({_registry_origin(value) for value in trusted_registries}))
+    origins = trusted_registry_origins(trusted_registries)
     config = ArtifactScanConfig(
         url_validator=lambda url: _permitted_url(url, origins),
         allowed_local_roots=(),
@@ -288,6 +288,10 @@ class _Scanner:
         )
         self.memo[key] = result
         return result
+
+
+def trusted_registry_origins(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(sorted({_registry_origin(value) for value in values}))
 
 
 def _registry_origin(value: str) -> str:

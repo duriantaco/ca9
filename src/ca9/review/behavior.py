@@ -400,7 +400,9 @@ def _manifest_facts(manifest: dict[str, Any], issues: list[str]) -> list[Behavio
             if not name or not isinstance(specifier, str):
                 issues.append(f"Invalid manifest dependency declaration: {group}:{name}")
                 continue
-            facts.append(BehaviorFact("dependency", f"{group}:{name}", specifier, "review"))
+            # Registry consumers do not install the published package's own devDependencies.
+            action = "info" if group == "devDependencies" else "review"
+            facts.append(BehaviorFact("dependency", f"{group}:{name}", specifier, action))
     for field in ("bundledDependencies", "bundleDependencies", "peerDependenciesMeta"):
         if field in manifest:
             value = manifest[field]

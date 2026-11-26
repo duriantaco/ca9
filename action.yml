@@ -1,5 +1,5 @@
 name: ca9 Supply Chain Security
-description: Run ca9 dependency posture, CVE reachability, and SCA triage in GitHub Actions
+description: Review dependency updates, check protection posture, and triage CVE reachability in GitHub Actions
 author: duriantaco
 
 branding:
@@ -8,7 +8,7 @@ branding:
 
 inputs:
   command:
-    description: ca9 command to run. Use scan, check, or protect.
+    description: ca9 command to run. Use scan, check, protect, or review. Review runs on a pull_request event.
     required: false
     default: scan
   report:
@@ -16,7 +16,7 @@ inputs:
     required: false
     default: ""
   repo:
-    description: Repository path to analyze.
+    description: Repository path to analyze. For review, use a checkout inside GITHUB_WORKSPACE with both PR commits available.
     required: false
     default: "."
   policy:
@@ -39,13 +39,16 @@ inputs:
     required: false
     default: ""
   format:
-    description: "Output format: sarif, json, vex, remediation, action-plan, markdown, html, or table."
+    description: >-
+      Review supports json (default) and markdown. Other commands default to sarif.
+      Scan and check also support json, vex, remediation, action-plan, markdown,
+      html, and table. Protect also supports json, markdown, and table.
     required: false
-    default: sarif
+    default: ""
   output:
-    description: Output file path.
+    description: Output file path. Review defaults to ca9-review.json or ca9-review.md. Other commands default to ca9.sarif.
     required: false
-    default: ca9.sarif
+    default: ""
   proof-standard:
     description: "Proof policy for suppressions: strict or balanced."
     required: false
@@ -91,7 +94,7 @@ inputs:
     required: false
     default: "true"
   fail-on-findings:
-    description: Fail on blocking posture, reachable findings, or inconclusive scans. Execution errors always fail.
+    description: Fail on a nonzero findings exit code, including a dependency review that needs attention. Execution errors always fail.
     required: false
     default: "false"
   extra-args:
@@ -105,7 +108,7 @@ outputs:
     value: ${{ steps.ca9.outputs.exit-code }}
   output-path:
     description: Path to the report produced by this run.
-    value: ${{ steps.ca9.outputs.report-written == 'true' && inputs.output || '' }}
+    value: ${{ steps.ca9.outputs.report-written == 'true' && (steps.ca9.outputs.output-path || inputs.output || 'ca9.sarif') || '' }}
 
 runs:
   using: composite
@@ -147,11 +150,16 @@ runs:
       run: |
         set -u
 
+        if [[ "$CA9_COMMAND" == "review" ]]; then
+          exec python "$GITHUB_ACTION_PATH/scripts/run_pr_review.py"
+        fi
         if [[ "$CA9_COMMAND" != "scan" && "$CA9_COMMAND" != "check" && "$CA9_COMMAND" != "protect" ]]; then
-          echo "command must be 'scan', 'check', or 'protect'" >&2
+          echo "command must be 'scan', 'check', 'protect', or 'review'" >&2
           exit 64
         fi
 
+        export CA9_FORMAT="${CA9_FORMAT:-sarif}"
+        export CA9_OUTPUT="${CA9_OUTPUT:-ca9.sarif}"
         cmd=("$CA9_COMMAND")
         if [[ "$CA9_COMMAND" == "check" ]]; then
           if [[ -z "$CA9_REPORT" ]]; then
@@ -210,10 +218,10 @@ runs:
         python "$GITHUB_ACTION_PATH/scripts/run_action.py" "${cmd[@]}" -f "$CA9_FORMAT"
 
     - name: Upload SARIF
-      if: inputs.upload-sarif == 'true' && inputs.format == 'sarif' && steps.ca9.outputs.report-written == 'true'
+      if: inputs.command != 'review' && inputs.upload-sarif == 'true' && (inputs.format == '' || inputs.format == 'sarif') && steps.ca9.outputs.report-written == 'true'
       uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
       with:
-        sarif_file: ${{ inputs.output }}
+        sarif_file: ${{ inputs.output || 'ca9.sarif' }}
 
     - name: Enforce ca9 result
       if: inputs.fail-on-findings == 'true' && steps.ca9.outputs.exit-code != '0'
