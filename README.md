@@ -850,7 +850,7 @@ Common options:
   --otel-traces PATH               Production runtime evidence from OTLP JSON
   --accepted-risks PATH            Accepted-risk TOML/JSON file
   --baseline PATH                  Previous ca9 JSON report for new-only gating
-  --new-only                       Only gate on new reachable/inconclusive findings
+  --new-only                       Gate on new findings and findings that have become reachable
 
 Scan-only options:
   --offline                        Use only cached OSV data, no network requests
@@ -907,7 +907,7 @@ Shell setup options:
 Exit codes:
   0  No blocking findings for the selected command
   1  Blocking findings or command/policy errors
-  2  Reachability scan produced inconclusive-only CVE results
+  2  Inconclusive reachability or incomplete dependency scan
 ```
 
 ### Config file
@@ -929,7 +929,7 @@ Accepted-risk and baseline options keep ignored findings visible in report outpu
 
 ### Caching and offline mode
 
-ca9 caches OSV vulnerability details (`~/.cache/ca9/osv/`, 24h TTL), GitHub
+ca9 caches exact package/version OSV query results and vulnerability details (`~/.cache/ca9/osv/`, 24h TTL), GitHub
 commit file lists (`~/.cache/ca9/commits/`, 7-day TTL), and package
 intelligence feeds (`~/.cache/ca9/feed/`) to reduce network dependence and make
 CI runs deterministic. Runtime preflight writes redacted audit events to

@@ -63,7 +63,7 @@ Common options:
 | `--otel-traces PATH` | Add production runtime evidence from an OTLP JSON export. |
 | `--accepted-risks PATH` | TOML or JSON file listing findings that should not affect gates. |
 | `--baseline PATH` | Previous ca9 JSON report for baseline comparison. |
-| `--new-only` | Only gate on reachable or inconclusive findings not present in `--baseline`. |
+| `--new-only` | Gate on new findings and findings that have become reachable since `--baseline`. |
 
 Examples:
 
@@ -456,7 +456,7 @@ For baseline gating, first save a full JSON report:
 ca9 check report.json --repo . -f json -o ca9-baseline.json
 ```
 
-Then gate only on new reachable or inconclusive findings:
+Then gate on new findings and findings that have become reachable.
 
 ```bash
 ca9 check report.json --repo . --baseline ca9-baseline.json --new-only
@@ -527,7 +527,7 @@ ca9 enrich-sbom sbom.json --repo . --coverage coverage.json -o sbom.ca9.json
 |---|---|
 | `0` | No reachable CVEs were found, or the command completed without an action-blocking result. |
 | `1` | Reachable CVEs, VEX regressions, or blocking supply-chain findings require attention. |
-| `2` | Only inconclusive findings remain, or a capability/action policy produced a blocking decision. |
+| `2` | Reachability is inconclusive, dependency scan coverage is partial, or a capability/action policy produced a blocking decision. |
 
 Input errors such as invalid JSON, missing files, or unsupported formats also return a non-zero exit code with a Click error message.
 

@@ -10,6 +10,7 @@ from ca9.advisory import (
     normalize_ecosystem,
 )
 from ca9.models import Vulnerability, finding_key
+from ca9.parsers.base import reported_versions
 
 _GRYPE_SCHEMA_MARKERS = (
     "github.com/anchore/grype/",
@@ -287,6 +288,10 @@ class GrypeParser:
             modified_at = _text(
                 vulnerability.get("lastModifiedDate", vulnerability.get("modified"))
             )
+            fix = vulnerability.get("fix")
+            fixed_versions = ()
+            if isinstance(fix, dict) and fix.get("state") == "fixed":
+                fixed_versions = reported_versions(fix.get("versions"))
 
             vulns.append(
                 Vulnerability(
@@ -303,6 +308,7 @@ class GrypeParser:
                     cwes=extract_cwes(vulnerability),
                     cpes=extract_cpes({"vulnerability": vulnerability, "artifact": artifact}),
                     advisory_source="grype",
+                    fixed_versions=fixed_versions,
                     advisory_url=advisory_url,
                     published_at=published_at or None,
                     modified_at=modified_at or None,

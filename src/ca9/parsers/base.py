@@ -13,6 +13,16 @@ class SCAParser(Protocol):
     def parse(self, data: Any) -> list[Vulnerability]: ...
 
 
+def reported_versions(raw: Any) -> tuple[str, ...]:
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, list):
+        return ()
+    return tuple(
+        dict.fromkeys(item.strip() for item in raw if isinstance(item, str) and item.strip())
+    )
+
+
 def parse_package_ref(value: Any) -> str | None:
     if isinstance(value, dict):
         package = value.get("package")

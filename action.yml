@@ -83,7 +83,7 @@ inputs:
     required: false
     default: ""
   new-only:
-    description: Only gate on reachable or inconclusive findings not present in the baseline.
+    description: Gate on new reachable or inconclusive findings and findings that became reachable since the baseline.
     required: false
     default: "false"
   upload-sarif:
@@ -91,7 +91,7 @@ inputs:
     required: false
     default: "true"
   fail-on-findings:
-    description: Fail the workflow when ca9 exits non-zero for blocking posture or findings.
+    description: Fail on blocking posture, reachable findings, or inconclusive scans. Execution errors always fail.
     required: false
     default: "false"
   extra-args:
@@ -104,8 +104,8 @@ outputs:
     description: ca9 exit code.
     value: ${{ steps.ca9.outputs.exit-code }}
   output-path:
-    description: Path to the ca9 output file.
-    value: ${{ inputs.output }}
+    description: Path to the report produced by this run.
+    value: ${{ steps.ca9.outputs.report-written == 'true' && inputs.output || '' }}
 
 runs:
   using: composite
@@ -152,7 +152,7 @@ runs:
           exit 64
         fi
 
-        cmd=(ca9 "$CA9_COMMAND")
+        cmd=("$CA9_COMMAND")
         if [[ "$CA9_COMMAND" == "check" ]]; then
           if [[ -z "$CA9_REPORT" ]]; then
             echo "report is required when command is 'check'" >&2
@@ -162,8 +162,6 @@ runs:
         fi
 
         cmd+=(--repo "$CA9_REPO")
-        cmd+=(-f "$CA9_FORMAT")
-        cmd+=(-o "$CA9_OUTPUT")
 
         if [[ "$CA9_COMMAND" == "protect" ]]; then
           if [[ -n "$CA9_POLICY" ]]; then
@@ -205,39 +203,14 @@ runs:
           fi
         fi
         if [[ -n "$CA9_EXTRA_ARGS" ]]; then
-          read -r -a extra_args <<< "$CA9_EXTRA_ARGS"
+          IFS=$' \t\r' read -r -a extra_args <<< "${CA9_EXTRA_ARGS//$'\n'/ }"
           cmd+=("${extra_args[@]}")
         fi
 
-        set +e
-        "${cmd[@]}"
-        status=$?
-        set -e
-
-        if [[ "$CA9_FORMAT" == "sarif" && ! -f "$CA9_OUTPUT" ]]; then
-          python - "$CA9_OUTPUT" <<'PY'
-        import json
-        import sys
-        from pathlib import Path
-
-        out = Path(sys.argv[1])
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({
-            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
-            "version": "2.1.0",
-            "runs": [{
-                "tool": {"driver": {"name": "ca9", "rules": []}},
-                "results": [],
-            }],
-        }, indent=2))
-        PY
-        fi
-
-        echo "exit-code=$status" >> "$GITHUB_OUTPUT"
-        exit 0
+        python "$GITHUB_ACTION_PATH/scripts/run_action.py" "${cmd[@]}" -f "$CA9_FORMAT"
 
     - name: Upload SARIF
-      if: inputs.upload-sarif == 'true' && inputs.format == 'sarif'
+      if: inputs.upload-sarif == 'true' && inputs.format == 'sarif' && steps.ca9.outputs.report-written == 'true'
       uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
       with:
         sarif_file: ${{ inputs.output }}

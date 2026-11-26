@@ -197,6 +197,8 @@ def write_openvex(report: Report, output: Path | TextIO | None = None) -> str:
         },
         "statements": statements,
     }
+    if report.scan_coverage:
+        doc["tooling"]["scan_coverage"] = report.scan_coverage.to_dict()
 
     text = json.dumps(doc, indent=2)
 

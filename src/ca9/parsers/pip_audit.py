@@ -4,6 +4,7 @@ from typing import Any
 
 from ca9.advisory import extract_cwes, normalize_advisory_aliases
 from ca9.models import Vulnerability, finding_key
+from ca9.parsers.base import reported_versions
 
 
 class PipAuditParser:
@@ -34,7 +35,7 @@ class PipAuditParser:
                 seen.add(key)
 
                 description = v.get("description", "")
-                fix_versions = v.get("fix_versions", [])
+                fix_versions = reported_versions(v.get("fix_versions"))
 
                 if description:
                     title = description[:120]
@@ -55,6 +56,7 @@ class PipAuditParser:
                         aliases=normalize_advisory_aliases(vuln_id, v.get("aliases", [])),
                         cwes=extract_cwes(v),
                         advisory_source="pip-audit",
+                        fixed_versions=fix_versions,
                     )
                 )
 

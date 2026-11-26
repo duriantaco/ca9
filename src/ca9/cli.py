@@ -69,7 +69,10 @@ def _output_report(
         from ca9.remediation import generate_remediation_plan, remediation_plan_to_dict
 
         plan = generate_remediation_plan(report)
-        text = json.dumps(remediation_plan_to_dict(plan), indent=2)
+        payload = remediation_plan_to_dict(plan)
+        if report.scan_coverage:
+            payload["scan_coverage"] = report.scan_coverage.to_dict()
+        text = json.dumps(payload, indent=2)
         if output_path:
             output_path.write_text(text)
         else:
@@ -1792,7 +1795,7 @@ def ingest_sarif_cmd(
     "--new-only",
     is_flag=True,
     default=False,
-    help="Only gate on reachable or inconclusive findings not present in --baseline.",
+    help="Gate on new findings and findings that have become reachable.",
 )
 @click.pass_context
 def check(
@@ -2057,7 +2060,7 @@ def check(
     "--new-only",
     is_flag=True,
     default=False,
-    help="Only gate on reachable or inconclusive findings not present in --baseline.",
+    help="Gate on new findings and findings that have become reachable.",
 )
 @click.pass_context
 def scan(
@@ -2086,7 +2089,7 @@ def scan(
     new_only: bool,
 ) -> None:
     """Scan repository dependency versions via OSV.dev."""
-    from ca9.scanner import query_osv_batch, resolve_scan_inventory
+    from ca9.scanner import scan_repository
 
     repo_path = _resolve_option(ctx, "repo_path", repo_path)
     coverage_path = _resolve_option(ctx, "coverage_path", coverage_path)
@@ -2107,96 +2110,60 @@ def scan(
         auto_generate=bool(auto_coverage) and not no_auto_coverage,
     )
 
-    inventory = resolve_scan_inventory(
-        repo_path,
-        allow_environment_fallback=allow_env_fallback,
-    )
-
-    if inventory.source == "repo":
-        click.echo(
-            "Scanning repo dependency inventory "
-            f"({len(inventory.packages)} package(s), {inventory.pinned_dependencies} exact pin(s), "
-            f"{inventory.environment_fallbacks} environment fallback(s))...",
-            err=True,
-        )
-    elif inventory.source == "environment":
-        click.echo(
-            f"No resolvable repo inventory found. Falling back to {len(inventory.packages)} installed package(s)...",
-            err=True,
-        )
-    else:
-        click.echo("No exact repo dependency versions found to scan.", err=True)
-
-    for warning in inventory.warnings:
-        click.echo(f"ca9: {warning}", err=True)
-
-    if not inventory.packages:
-        from ca9.models import Report
-
-        report = Report(results=[], repo_path=str(repo_path), warnings=list(inventory.warnings))
-        _output_report(
-            report,
-            output_format,
-            output_path,
-            verbose=verbose,
-            show_confidence=show_confidence,
-            show_evidence_source=show_evidence_source,
-        )
-        return
-
+    click.echo("Scanning repo dependency inventory...", err=True)
     try:
-        vulnerabilities = query_osv_batch(
-            list(inventory.packages),
+        vulnerabilities, inventory = scan_repository(
+            repo_path,
             offline=offline,
             refresh_cache=refresh_cache,
             max_workers=max_osv_workers,
+            allow_environment_fallback=allow_env_fallback,
         )
-    except (ConnectionError, ValueError) as e:
-        raise click.ClickException(str(e)) from None
+    except (ConnectionError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from None
 
-    if not vulnerabilities:
-        from ca9.models import Report
+    coverage = inventory.coverage()
+    if vulnerabilities:
+        click.echo(
+            f"Found {len(vulnerabilities)} known vulnerabilities. Analyzing reachability...",
+            err=True,
+        )
+        report = analyze(
+            vulnerabilities,
+            repo_path,
+            coverage_path,
+            proof_standard=proof_standard,
+            scan_capabilities=capabilities,
+            trace_exploit_paths=trace_paths,
+            threat_intel=threat_intel,
+            otel_traces_path=otel_traces_path,
+        )
+        if runtime_ctx_path:
+            from ca9.runtime_context import apply_runtime_context, load_runtime_context
 
-        click.echo("No known vulnerabilities found in scanned packages.")
-        report = Report(results=[], repo_path=str(repo_path), warnings=list(inventory.warnings))
-        _output_report(
+            runtime_ctx = load_runtime_context(runtime_ctx_path)
+            report = apply_runtime_context(report, runtime_ctx)
+
+        report = apply_policy(
             report,
-            output_format,
-            output_path,
-            verbose=verbose,
-            show_confidence=show_confidence,
-            show_evidence_source=show_evidence_source,
+            accepted_risks_path=accepted_risks_path,
+            baseline_path=baseline_path,
+            new_only=new_only,
         )
-        return
+    else:
+        report = Report(results=[], repo_path=str(repo_path), proof_standard=proof_standard)
+        if coverage.complete:
+            click.echo("No known vulnerabilities found in scanned packages.", err=True)
 
-    click.echo(
-        f"Found {len(vulnerabilities)} known vulnerabilities. Analyzing reachability...", err=True
-    )
-    report = analyze(
-        vulnerabilities,
-        repo_path,
-        coverage_path,
-        proof_standard=proof_standard,
-        scan_capabilities=capabilities,
-        trace_exploit_paths=trace_paths,
-        threat_intel=threat_intel,
-        otel_traces_path=otel_traces_path,
-    )
-    if inventory.warnings:
-        report.warnings = list(inventory.warnings) + report.warnings
-
-    if runtime_ctx_path:
-        from ca9.runtime_context import apply_runtime_context, load_runtime_context
-
-        runtime_ctx = load_runtime_context(runtime_ctx_path)
-        report = apply_runtime_context(report, runtime_ctx)
-
-    report = apply_policy(
-        report,
-        accepted_risks_path=accepted_risks_path,
-        baseline_path=baseline_path,
-        new_only=new_only,
-    )
+    report.scan_coverage = coverage
+    scan_warnings = list(inventory.warnings)
+    if not coverage.complete:
+        scan_warnings = ["Incomplete dependency scan. " + " ".join(scan_warnings)]
+    report.warnings = scan_warnings + report.warnings
+    # Human-readable reports already display these warnings.
+    if output_path or output_format not in ("table", "markdown", "html"):
+        for warning in scan_warnings:
+            click.echo(f"ca9: {warning}", err=True)
 
     _output_report(
         report,
@@ -2505,7 +2472,7 @@ def vex_diff_cmd(base_path: Path, head_path: Path, output_path: Path | None) -> 
     "--new-only",
     is_flag=True,
     default=False,
-    help="Only gate on reachable or inconclusive findings not present in --baseline.",
+    help="Gate on new findings and findings that have become reachable.",
 )
 def action_plan_cmd(
     sca_report: Path,

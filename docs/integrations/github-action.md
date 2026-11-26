@@ -103,9 +103,13 @@ instead when you can.
 
 ## Strict release gate
 
-By default, the action records ca9's exit code but does not fail before
-uploading SARIF. Turn on `fail-on-findings` when you want blocking protection
-posture, reachable findings, or inconclusive findings to block the workflow:
+By default, completed checks publish their report and record ca9's `exit-code`
+even when they find issues. A missing input, invalid report, or other execution
+error fails the step and skips SARIF upload. The `output-path` output is populated
+only after this run writes a report.
+
+Turn on `fail-on-findings` when you want blocking protection posture, reachable
+findings, or inconclusive scans to block the workflow after upload.
 
 ```yaml
 - uses: duriantaco/ca9@main

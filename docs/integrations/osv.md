@@ -33,6 +33,8 @@ ca9 scan --repo . --offline
 ca9 scan --repo . --refresh-cache
 ```
 
-Use `--offline` for repeatable local checks when OSV data was already cached.
+An online scan saves the advisory IDs returned for each exact package and version, including empty results. Offline scans reuse those results for 24 hours. A missing or expired query leaves advisory coverage partial. Previously cached advisories can still produce findings.
+
+Scan JSON includes `scan_coverage` with the inventory source and counts of declared, resolved, checked, and unresolved packages. `checked` counts resolved packages with a complete OSV query for that version. The scope is the Python dependencies ca9 discovers in the selected inventory. With no resolved packages, skipped declarations, or missing current advisory results, the scan exits `2` unless a reachable finding requires exit `1`. A complete scan with zero findings exits `0`.
 
 OSV detail records are cached locally and each finding carries freshness metadata in JSON, SARIF, and OpenVEX outputs. ca9 records when advisory data was fetched, whether the cache entry was stale at read time, and the OSV published/modified timestamps when OSV provides them.

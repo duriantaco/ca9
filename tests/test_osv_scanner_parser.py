@@ -3,15 +3,63 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from ca9.models import VersionRange
 from ca9.parsers import detect_parser
 from ca9.parsers.osv_scanner import OsvScannerParser
+from ca9.remediation import common_fix_version
 
 SAMPLE_PATH = Path(__file__).parent / "fixtures" / "osv_scanner_sample.json"
 
 
 def _sample() -> dict:
     return json.loads(SAMPLE_PATH.read_text())
+
+
+def test_keeps_additional_explicit_affected_versions_for_matching_package():
+    data = _sample()
+    record = data["results"][0]["packages"][0]["vulnerabilities"][0]
+    record["affected"][0]["versions"] = ["2.20", "2.20"]
+    record["affected"].append(
+        {"package": {"ecosystem": "npm", "name": "requests"}, "versions": ["99"]}
+    )
+    assert OsvScannerParser().parse(data)[0].affected_versions == ("2.20",)
+
+
+@pytest.mark.parametrize(
+    "additional,expected",
+    [
+        (
+            {
+                "ranges": [
+                    {"type": "SEMVER", "events": [{"introduced": "2.20.0"}, {"fixed": "2.21.0"}]}
+                ]
+            },
+            "2.21.0",
+        ),
+        (
+            {
+                "ranges": [
+                    {"type": "SEMVER", "events": [{"introduced": "2.19.0"}, {"limit": "2.20.0"}]}
+                ]
+            },
+            "2.20.0",
+        ),
+        ({"ranges": [{"type": "GIT", "events": [{"introduced": "0"}, {"fixed": "abc"}]}]}, None),
+        ({"ranges": [{"type": "SEMVER", "events": [{"fixed": "2.20.0"}]}]}, None),
+        ({}, None),
+    ],
+)
+def test_patch_selection_checks_all_osv_entries_without_changing_reachability_ranges(
+    additional, expected
+):
+    data = _sample()
+    record = data["results"][0]["packages"][0]["vulnerabilities"][0]
+    record["affected"].append({"package": {"ecosystem": "PyPI", "name": "requests"}, **additional})
+    vuln = OsvScannerParser().parse(data)[0]
+    assert vuln.affected_ranges == (VersionRange("0", "2.20.0"),)
+    assert common_fix_version([vuln]) == expected
 
 
 class TestOSVScannerDetection:

@@ -97,7 +97,7 @@ def _component_to_dict(component) -> dict | None:
 
 
 def _advisory_to_dict(vuln) -> dict:
-    return {
+    advisory = {
         "ecosystem": vuln.ecosystem,
         "aliases": list(vuln.aliases),
         "cwes": list(vuln.cwes),
@@ -109,6 +109,9 @@ def _advisory_to_dict(vuln) -> dict:
         "fetched_at": vuln.fetched_at,
         "cache_stale": vuln.cache_stale,
     }
+    if vuln.fixed_versions:
+        advisory["fixed_versions"] = list(vuln.fixed_versions)
+    return advisory
 
 
 def _result_to_dict(r) -> dict:
@@ -178,6 +181,7 @@ def _ignored_result_to_dict(ignored) -> dict:
 
 def report_to_dict(report: Report) -> dict:
     return {
+        **({"scan_coverage": report.scan_coverage.to_dict()} if report.scan_coverage else {}),
         "repo_path": report.repo_path,
         "coverage_path": report.coverage_path,
         "proof_standard": report.proof_standard,
@@ -681,6 +685,8 @@ def write_sarif(report: Report, output: Path | TextIO | None = None) -> str:
     }
     if report.warnings:
         run["properties"] = {"warnings": list(report.warnings)}
+    if report.scan_coverage:
+        run.setdefault("properties", {})["scan_coverage"] = report.scan_coverage.to_dict()
 
     sarif = {
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",

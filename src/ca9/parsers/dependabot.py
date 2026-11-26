@@ -4,6 +4,7 @@ from typing import Any
 
 from ca9.advisory import extract_cwes, normalize_advisory_aliases, normalize_ecosystem
 from ca9.models import Vulnerability, finding_key
+from ca9.parsers.base import reported_versions
 
 
 def _github_identifier_values(advisory: dict) -> list[str]:
@@ -47,6 +48,7 @@ class DependabotParser:
             pkg_name = pkg.get("name", "")
             pkg_version = sec_vuln.get("vulnerable_version_range", "")
             ecosystem = normalize_ecosystem(pkg.get("ecosystem", ""))
+            patch = sec_vuln.get("first_patched_version")
             relationship = dep.get("relationship")
             if relationship == "indirect":
                 relationship = "transitive"
@@ -77,6 +79,9 @@ class DependabotParser:
                     ),
                     cwes=extract_cwes(advisory),
                     advisory_source="github_advisory",
+                    fixed_versions=reported_versions(patch.get("identifier"))
+                    if isinstance(patch, dict)
+                    else (),
                     advisory_url=advisory.get("html_url", "") or advisory.get("url", ""),
                     published_at=advisory.get("published_at"),
                     modified_at=advisory.get("updated_at"),

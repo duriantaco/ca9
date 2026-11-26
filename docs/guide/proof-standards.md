@@ -66,3 +66,14 @@ ca9 check report.json --repo . \
 ```
 
 Accepted risks require an active `expires` date when provided. Expired or invalid exceptions are ignored and reported as warnings.
+
+`--new-only` matches findings by advisory ID, package name, and version. If a finding
+was `inconclusive`, `unreachable_static`, or `unreachable_dynamic` in the baseline
+and is now `reachable`, it reopens and causes exit code 1. For example, a coverage
+report can confirm that the affected code ran. An unchanged alert stays quiet, as
+does a known finding whose current verdict is `inconclusive`.
+
+You can use the JSON from a previous `--new-only` run as the next baseline. ca9
+also reads findings that the previous baseline suppressed. Findings covered by an
+accepted risk need an active exception on the current run. Legacy baseline entries
+that omit the verdict retain their original identity-only matching behavior.

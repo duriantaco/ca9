@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
 import json
 import os
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from packaging.utils import canonicalize_name
@@ -15,7 +17,7 @@ from packaging.version import InvalidVersion, Version
 
 from ca9.advisory import attach_cache_freshness, metadata_from_osv, normalize_ecosystem
 from ca9.analysis.ast_scanner import discover_declared_dependency_inventory
-from ca9.models import VersionRange, Vulnerability, finding_key
+from ca9.models import AdvisoryRange, ScanCoverage, VersionRange, Vulnerability, finding_key
 
 OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 OSV_VULN_URL = "https://api.osv.dev/v1/vulns"
@@ -48,6 +50,18 @@ class ScanInventory:
     pinned_dependencies: int = 0
     environment_fallbacks: int = 0
     unresolved_dependencies: tuple[str, ...] = ()
+    advisory_source: str = "none"
+    advisories_checked: int = 0
+
+    def coverage(self) -> ScanCoverage:
+        return ScanCoverage(
+            inventory_source=self.source,
+            advisory_source=self.advisory_source,
+            declared=self.declared_dependencies,
+            resolved=len(self.packages),
+            checked=self.advisories_checked,
+            unresolved=len(self.unresolved_dependencies),
+        )
 
 
 def get_installed_packages() -> list[tuple[str, str]]:
@@ -73,7 +87,7 @@ def resolve_scan_inventory(
             return ScanInventory(
                 packages=(),
                 source="none",
-                warnings=("no declared dependencies with exact versions were found",),
+                warnings=("no declared dependencies were found in the supported Python manifests",),
             )
         return ScanInventory(
             packages=tuple(installed_packages),
@@ -118,8 +132,7 @@ def resolve_scan_inventory(
         sample = ", ".join(sorted(unresolved)[:5])
         suffix = " ..." if len(unresolved) > 5 else ""
         warnings.append(
-            "skipped declared package(s) with no exact version and no matching installed distribution: "
-            f"{sample}{suffix}"
+            f"skipped declared package(s) without a resolved exact version: {sample}{suffix}"
         )
 
     if packages:
@@ -267,19 +280,75 @@ def _cvss_to_level(score: float) -> str:
     return "unknown"
 
 
+def _affected_entries(osv_vuln: dict, package_name: str, ecosystem: str):
+    normalized_ecosystem = normalize_ecosystem(ecosystem) or "pypi"
+    name = _comparable_package_name(package_name, normalized_ecosystem)
+    entries = osv_vuln.get("affected")
+    if not isinstance(entries, list):
+        return
+    for affected in entries:
+        if not isinstance(affected, dict):
+            continue
+        pkg = affected.get("package", {})
+        if not isinstance(pkg, dict):
+            continue
+        if normalize_ecosystem(pkg.get("ecosystem", "")) != normalized_ecosystem:
+            continue
+        if _comparable_package_name(str(pkg.get("name", "")), normalized_ecosystem) == name:
+            yield affected
+
+
+def _affected_versions(osv_vuln: dict, package_name: str, ecosystem: str) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            version
+            for entry in _affected_entries(osv_vuln, package_name, ecosystem)
+            if isinstance(entry.get("versions"), list)
+            for version in entry["versions"]
+            if isinstance(version, str)
+        )
+    )
+
+
+def _advisory_ranges(
+    osv_vuln: dict, package_name: str, ecosystem: str
+) -> tuple[AdvisoryRange, ...]:
+    ranges = []
+    unknown = AdvisoryRange("", ())
+    for entry in _affected_entries(osv_vuln, package_name, ecosystem):
+        raw_ranges = entry.get("ranges", [])
+        if not isinstance(raw_ranges, list) or not raw_ranges and not entry.get("versions"):
+            # A whole-package entry cannot establish any fixed release.
+            ranges.append(unknown)
+            continue
+        for raw in raw_ranges:
+            events = raw.get("events") if isinstance(raw, dict) else None
+            if not isinstance(events, list) or not all(
+                isinstance(event, dict) and len(event) == 1 for event in events
+            ):
+                ranges.append(unknown)
+                continue
+            pairs = tuple(next(iter(event.items())) for event in events)
+            kinds = {key for key, _ in pairs}
+            if (
+                "introduced" not in kinds
+                or {"last_affected", "fixed"} <= kinds
+                or not kinds <= {"introduced", "fixed", "last_affected", "limit"}
+                or not all(isinstance(value, str) and value for _, value in pairs)
+            ):
+                ranges.append(unknown)
+                continue
+            ranges.append(AdvisoryRange(str(raw.get("type", "")), pairs))
+    return tuple(dict.fromkeys(ranges))
+
+
 def _extract_version_ranges(
     osv_vuln: dict,
     package_name: str,
     ecosystem: str = "pypi",
 ) -> tuple[VersionRange, ...]:
     ranges: list[VersionRange] = []
-    normalized_ecosystem = normalize_ecosystem(ecosystem) or "pypi"
-    for affected in osv_vuln.get("affected", []):
-        pkg = affected.get("package", {})
-        if normalize_ecosystem(pkg.get("ecosystem", "")) != normalized_ecosystem:
-            continue
-        if pkg.get("name", "").lower() != package_name.lower():
-            continue
+    for affected in _affected_entries(osv_vuln, package_name, ecosystem):
         for r in affected.get("ranges", []):
             if r.get("type") != "ECOSYSTEM":
                 continue
@@ -371,22 +440,57 @@ def _read_cache(vuln_id: str, *, allow_stale: bool = False) -> dict | None:
         if is_stale and not allow_stale:
             return None
         data = json.loads(path.read_text())
+        if not isinstance(data, dict) or data.get("id") != vuln_id:
+            return None
         return attach_cache_freshness(
             data,
             source="osv.dev",
             ttl_seconds=CACHE_TTL_SECONDS,
             path=path,
         )
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return None
 
 
-def _write_cache(vuln_id: str, data: dict) -> None:
+def _write_cache_record(path: Path, data: dict) -> None:
+    # Readers should see a whole previous or new record even during concurrent scans.
     try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        _cache_path(vuln_id).write_text(json.dumps(data))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, pending = tempfile.mkstemp(dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(data, stream)
+            os.replace(pending, path)
+        finally:
+            Path(pending).unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _query_cache_path(key: list[str]) -> Path:
+    digest = hashlib.sha256(json.dumps(key).encode()).hexdigest()
+    return CACHE_DIR / "queries" / f"{digest}.json"
+
+
+def _cached_query(key: list[str]) -> tuple[list[str], bool]:
+    """A stale query can still provide positive leads, but cannot establish coverage."""
+    try:
+        record = json.loads(_query_cache_path(key).read_bytes())
+    except (OSError, ValueError, RecursionError):
+        return [], False
+    if not isinstance(record, dict) or record.get("query") != key:
+        return [], False
+    ids = record.get("advisory_ids")
+    queried_at = record.get("queried_at")
+    if not isinstance(ids, list) or not all(_valid_id(item) for item in ids):
+        return [], False
+    now = time.time()
+    current = type(queried_at) in (int, float) and now - CACHE_TTL_SECONDS <= queried_at <= now
+    return ids, current
+
+
+def _valid_id(value: object) -> bool:
+    return isinstance(value, str) and bool(value) and value.isprintable() and " " not in value
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -410,7 +514,9 @@ def _fetch_vuln_details(vuln_id: str, offline: bool = False) -> dict:
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
-            _write_cache(vuln_id, data)
+            if not isinstance(data, dict) or data.get("id") != vuln_id:
+                return _read_cache(vuln_id, allow_stale=True) or {}
+            _write_cache_record(_cache_path(vuln_id), data)
             return attach_cache_freshness(
                 data,
                 source="osv.dev",
@@ -425,13 +531,13 @@ def _fetch_vuln_details(vuln_id: str, offline: bool = False) -> dict:
     return {}
 
 
-def _query_osv_batch_results(queries: list[dict]) -> list[list[dict]]:
+def _query_osv_batch_results(queries: list[dict]) -> list[list[str]]:
     """Run OSV querybatch for any number of queries; return vulns per query, in order.
 
     Queries are sent in chunks of at most ``OSV_BATCH_MAX_QUERIES`` and any
     per-query ``next_page_token`` is followed until OSV reports no more pages.
     """
-    results: list[list[dict]] = [[] for _ in queries]
+    results: list[list[str]] = [[] for _ in queries]
     for start in range(0, len(queries), OSV_BATCH_MAX_QUERIES):
         pending = [
             (index, queries[index])
@@ -446,18 +552,32 @@ def _query_osv_batch_results(queries: list[dict]) -> list[list[dict]]:
                     "refusing to continue with incomplete results"
                 )
             data = _post_osv_batch([query for _, query in pending])
-            batch_results = data.get("results") if isinstance(data, dict) else None
-            if not isinstance(batch_results, list):
-                batch_results = []
+            if not isinstance(data, dict) or "error" in data:
+                raise ValueError("OSV.dev returned an invalid batch response")
+            batch_results = data.get("results")
+            if not isinstance(batch_results, list) or len(batch_results) != len(pending):
+                raise ValueError("OSV.dev batch response must contain one result per query")
             next_pending: list[tuple[int, dict]] = []
-            for (index, query), result in zip(pending, batch_results, strict=False):
-                if not isinstance(result, dict):
-                    continue
-                vulns = result.get("vulns") or []
-                if isinstance(vulns, list):
-                    results[index].extend(v for v in vulns if isinstance(v, dict))
-                token = result.get("next_page_token")
-                if isinstance(token, str) and token:
+            for (index, query), result in zip(pending, batch_results, strict=True):
+                # OSV uses {} for an empty result. Error objects and unrecognised
+                # fields cannot be interpreted as a successful negative query.
+                if (
+                    not isinstance(result, dict)
+                    or "error" in result
+                    or (result and not result.keys() & {"vulns", "next_page_token"})
+                ):
+                    raise ValueError("OSV.dev returned an invalid batch result")
+                vulns = result.get("vulns", [])
+                if not isinstance(vulns, list):
+                    raise ValueError("OSV.dev returned an invalid vulnerability list")
+                for item in vulns:
+                    if not isinstance(item, dict) or not _valid_id(item.get("id")):
+                        raise ValueError("OSV.dev returned a vulnerability without a valid ID")
+                    results[index].append(item["id"])
+                token = result.get("next_page_token", "")
+                if not isinstance(token, str) or token != token.strip():
+                    raise ValueError("OSV.dev returned an invalid next_page_token")
+                if token:
                     next_pending.append((index, {**query, "page_token": token}))
             pending = next_pending
     return results
@@ -503,39 +623,66 @@ def query_osv_batch(
     max_workers: int = DEFAULT_MAX_WORKERS,
     ecosystem: str = "pypi",
 ) -> list[Vulnerability]:
+    vulns, _ = _query_packages(packages, offline, refresh_cache, max_workers, ecosystem)
+    return vulns
+
+
+def _query_packages(
+    packages: list[tuple[str, str]],
+    offline: bool,
+    refresh_cache: bool,
+    max_workers: int,
+    ecosystem: str,
+) -> tuple[list[Vulnerability], int]:
     if not packages:
-        return []
+        return [], 0
 
     normalized_ecosystem = normalize_ecosystem(ecosystem) or "pypi"
 
     if refresh_cache:
         try:
-            if CACHE_DIR.exists():
-                for f in CACHE_DIR.iterdir():
-                    if f.suffix == ".json":
-                        f.unlink(missing_ok=True)
+            for directory in (CACHE_DIR, CACHE_DIR / "queries"):
+                for path in directory.glob("*.json"):
+                    path.unlink(missing_ok=True)
         except OSError:
             pass
 
-    if offline:
-        return _query_from_cache_only(packages, ecosystem=normalized_ecosystem)
-
-    osv_ecosystem = _osv_ecosystem_name(normalized_ecosystem)
-    queries = [
-        {"package": {"name": name, "ecosystem": osv_ecosystem}, "version": version}
+    keys = [
+        [
+            normalized_ecosystem,
+            canonicalize_name(name) if normalized_ecosystem == "pypi" else name,
+            version,
+        ]
         for name, version in packages
     ]
+    unverified = []
+    if offline:
+        query_results = []
+        for key, package in zip(keys, packages, strict=True):
+            ids, current = _cached_query(key)
+            query_results.append(ids)
+            if not current:
+                unverified.append(package)
+    else:
+        osv_ecosystem = _osv_ecosystem_name(normalized_ecosystem)
+        queried_at = time.time()
+        query_results = _query_osv_batch_results(
+            [
+                {"package": {"name": name, "ecosystem": osv_ecosystem}, "version": version}
+                for name, version in packages
+            ]
+        )
+        for key, ids in zip(keys, query_results, strict=True):
+            _write_cache_record(
+                _query_cache_path(key),
+                {"query": key, "queried_at": queried_at, "advisory_ids": ids},
+            )
 
     seen_keys: set[tuple[str, str, str]] = set()
     vuln_refs: list[tuple[str, str, str]] = []
 
-    for i, result_vulns in enumerate(_query_osv_batch_results(queries)):
-        pkg_name, pkg_version = packages[i]
-
-        for osv_vuln in result_vulns:
-            vuln_id = osv_vuln.get("id", "")
-            if not vuln_id:
-                continue
+    for (pkg_name, pkg_version), ids in zip(packages, query_results, strict=True):
+        for vuln_id in ids:
             key = finding_key(vuln_id, pkg_name, pkg_version)
             if key in seen_keys:
                 continue
@@ -574,6 +721,8 @@ def query_osv_batch(
             title = details.get("summary", "") or details.get("details", "No description")[:120]
             description = details.get("details", "")
             affected_ranges = _extract_version_ranges(details, pkg_name, normalized_ecosystem)
+            affected_versions = _affected_versions(details, pkg_name, normalized_ecosystem)
+            advisory_ranges = _advisory_ranges(details, pkg_name, normalized_ecosystem)
             references = _extract_references(details)
             metadata = metadata_from_osv(details, vuln_id)
             malicious = _is_malicious_osv(details, vuln_id)
@@ -582,6 +731,8 @@ def query_osv_batch(
             title = vuln_id
             description = ""
             affected_ranges = ()
+            affected_versions = ()
+            advisory_ranges = ()
             references = ()
             metadata = metadata_from_osv({}, vuln_id)
             malicious = _is_malware_advisory_id(vuln_id)
@@ -605,12 +756,18 @@ def query_osv_batch(
                 fetched_at=metadata.fetched_at,
                 cache_stale=metadata.cache_stale,
                 affected_ranges=affected_ranges,
+                affected_versions=affected_versions,
+                advisory_ranges=advisory_ranges,
                 references=references,
                 malicious=malicious,
             )
         )
 
-    return vulns
+    if unverified:
+        for vuln in _query_from_cache_only(unverified, normalized_ecosystem):
+            if finding_key(vuln.id, vuln.package_name, vuln.package_version) not in seen_keys:
+                vulns.append(vuln)
+    return vulns, len(unverified)
 
 
 def _query_from_cache_only(
@@ -626,8 +783,11 @@ def _query_from_cache_only(
             if path.suffix != ".json":
                 continue
             try:
+                raw = json.loads(path.read_text())
+                if not isinstance(raw, dict) or not _valid_id(raw.get("id")):
+                    continue
                 data = attach_cache_freshness(
-                    json.loads(path.read_text()),
+                    raw,
                     source="osv.dev",
                     ttl_seconds=CACHE_TTL_SECONDS,
                     path=path,
@@ -635,7 +795,7 @@ def _query_from_cache_only(
                 vuln_id = data.get("id", "")
                 if vuln_id:
                     cached_vulns[vuln_id] = data
-            except (json.JSONDecodeError, OSError):
+            except (ValueError, OSError):
                 continue
     except OSError:
         return []
@@ -679,6 +839,8 @@ def _query_from_cache_only(
                     affected_ranges=_extract_version_ranges(
                         details, pkg_name, normalized_ecosystem
                     ),
+                    affected_versions=_affected_versions(details, pkg_name, normalized_ecosystem),
+                    advisory_ranges=_advisory_ranges(details, pkg_name, normalized_ecosystem),
                     references=_extract_references(details),
                     malicious=_is_malicious_osv(details, vuln_id),
                 )
@@ -806,10 +968,22 @@ def scan_repository(
         repo_path,
         allow_environment_fallback=allow_environment_fallback,
     )
-    vulnerabilities = query_osv_batch(
+    vulnerabilities, unverified = _query_packages(
         list(inventory.packages),
         offline=offline,
         refresh_cache=refresh_cache,
         max_workers=max_workers,
+        ecosystem="pypi",
     )
-    return vulnerabilities, inventory
+    warnings = inventory.warnings
+    if unverified:
+        warnings += (
+            f"No current complete OSV query is cached for {unverified} of {len(inventory.packages)} "
+            "resolved packages. Run an online scan to refresh coverage.",
+        )
+    return vulnerabilities, replace(
+        inventory,
+        advisory_source="osv_cache" if offline else "osv",
+        advisories_checked=len(inventory.packages) - unverified,
+        warnings=warnings,
+    )

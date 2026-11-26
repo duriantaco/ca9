@@ -4,7 +4,7 @@ from typing import Any
 
 from ca9.advisory import extract_cwes, normalize_advisory_aliases, normalize_ecosystem
 from ca9.models import Vulnerability, finding_key
-from ca9.parsers.base import normalize_dependency_chain, parse_package_ref
+from ca9.parsers.base import normalize_dependency_chain, parse_package_ref, reported_versions
 
 
 def _snyk_identifier_values(vuln: dict) -> list[str]:
@@ -100,6 +100,7 @@ class SnykParser:
                         aliases=normalize_advisory_aliases(vuln_id, _snyk_identifier_values(v)),
                         cwes=extract_cwes(v),
                         advisory_source="snyk",
+                        fixed_versions=reported_versions(v.get("fixedIn")),
                         advisory_url=v.get("url", ""),
                         published_at=v.get("publicationTime"),
                         modified_at=v.get("modificationTime"),

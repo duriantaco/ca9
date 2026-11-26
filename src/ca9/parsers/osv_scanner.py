@@ -4,8 +4,10 @@ from collections.abc import Iterable
 from typing import Any
 
 from ca9.advisory import metadata_from_osv, normalize_advisory_aliases, normalize_ecosystem
-from ca9.models import VersionRange, Vulnerability, finding_key
+from ca9.models import AdvisoryRange, VersionRange, Vulnerability, finding_key
 from ca9.scanner import (
+    _advisory_ranges,
+    _affected_versions,
     _extract_references,
     _extract_severity,
     _extract_version_ranges,
@@ -189,6 +191,8 @@ def _build_vulnerability(
     title = ""
     description = ""
     ranges: list[VersionRange] = []
+    versions: list[str] = []
+    advisory_ranges: list[AdvisoryRange] = []
     references: list[str] = []
     cwes: list[str] = []
     cpes: list[str] = []
@@ -217,6 +221,9 @@ def _build_vulnerability(
             description = details
 
         ranges.extend(_safe_ranges(record, package_name, ecosystem))
+        if ecosystem:
+            versions.extend(_affected_versions(record, package_name, ecosystem))
+            advisory_ranges.extend(_advisory_ranges(record, package_name, ecosystem))
         references.extend(_safe_references(record))
 
         metadata = metadata_from_osv(record, record_id or vuln_id)
@@ -238,6 +245,8 @@ def _build_vulnerability(
         title=title or vuln_id,
         description=description,
         affected_ranges=tuple(dict.fromkeys(ranges)),
+        affected_versions=_ordered_unique(versions),
+        advisory_ranges=tuple(dict.fromkeys(advisory_ranges)),
         references=_ordered_unique(references),
         ecosystem=ecosystem,
         aliases=normalize_advisory_aliases(vuln_id, alias_values),
