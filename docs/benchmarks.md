@@ -54,9 +54,9 @@ the expected decision.
 
 The updated engine matched **6/6** reviewed decisions, up from **4/6**.
 Four of the six call for investigation. The Flask positive establishes that the
-named routine ran on an ordinary file read. It does not establish that the
-advisory's operating-system or input conditions applied. These cases were chosen
-to exercise specific decisions and give no estimate of overall accuracy.
+named routine ran on an ordinary file read. Deployment exposure also depends on
+the operating system and inputs. These six deliberately selected cases measure
+specific decisions. Estimating overall accuracy would require a representative sample.
 [Werkzeug advisory](https://osv.dev/vulnerability/GHSA-g6x2-hccm-hh4m) ·
 [PyYAML advisory](https://osv.dev/vulnerability/GHSA-8q59-q68h-6hv4) ·
 [Requests advisory](https://osv.dev/vulnerability/GHSA-j8r2-6x86-q33q) ·
@@ -77,6 +77,24 @@ PYTHONPATH="$flask_repo/src" /tmp/ca9-flask-probe/bin/python tests/fixtures/tria
 diff tests/fixtures/triage_benchmark/flask_calls.json /tmp/flask_calls.json
 ```
 
+### Held-out version decisions
+
+After freezing the engine, we labelled two additional cases from pip 23.2.1
+before running either check. Its vendoring manifest pins Requests 2.31.0 and
+urllib3 1.26.16. The respective fixes shipped in 2.31.0 and 1.26.5. Both
+reports should therefore say `not_affected` on version grounds. The strict
+JSON verdicts and OpenVEX statements matched both labels. This check supplies
+the package versions and measures the decision after an alert is received.
+[pip manifest](https://github.com/pypa/pip/blob/4a79e65cb6aac84505ad92d272a29f0c3c1aedce/src/pip/_vendor/vendor.txt)
+· [Requests advisory](https://github.com/psf/requests/security/advisories/GHSA-j8r2-6x86-q33q)
+· [urllib3 advisory](https://github.com/urllib3/urllib3/security/advisories/GHSA-q2q7-5pp4-w6pg)
+
+```bash
+git clone --branch 23.2.1 --depth 1 https://github.com/pypa/pip /tmp/ca9-pip
+git -C /tmp/ca9-pip rev-parse HEAD
+PYTHONPATH=src python -m ca9.cli check tests/fixtures/triage_benchmark/pip_holdout.json --repo /tmp/ca9-pip --proof-standard strict -f vex
+```
+
 ### Live scans without runtime coverage
 
 | Project | Pinned commit | Package versions checked | Returned findings | Interpretation |
@@ -88,8 +106,10 @@ diff tests/fixtures/triage_benchmark/flask_calls.json /tmp/flask_calls.json
 | Flask 3.1.3 | `22d924701a6ae2e4cd01e9a15bbaf3946094af65` | 8 | 5 | All inconclusive |
 
 The live run generated 155 findings. Without runtime coverage the engine left
-all 155 inconclusive. Only the six controls above have independent verdict
-labels. Counts can change as OSV records change. The former PinTrace commit
+all 155 inconclusive. The reported reasons cite missing dependency source in
+42 cases and an unverified distribution-to-import name in 35. Determining
+deployment impact in these cases requires additional evidence. Counts can change
+as OSV records change. The former PinTrace commit
 `04b343779b49faf1691823a225858ef93c52c747` was unavailable upstream during
 this run. Its historical results are excluded.
 
