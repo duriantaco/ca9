@@ -5,6 +5,20 @@ All notable changes to ca9 will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0](https://github.com/duriantaco/ca9/compare/v0.9.0...v0.10.0) (2026-11-26)
+
+
+### Features
+
+* **api:** check if a package is new ([52a69eb](https://github.com/duriantaco/ca9/commit/52a69eb8a69ab50b541997f3ca24d9c916733870))
+* **review:** show dependency behavior changes in pull requests ([#52](https://github.com/duriantaco/ca9/issues/52)) ([3977bd8](https://github.com/duriantaco/ca9/commit/3977bd8193fb41d4b239b855e508f75995e499bd))
+
+
+### Bug Fixes
+
+* **scan:** report incomplete checks and preserve actionable triage results ([#51](https://github.com/duriantaco/ca9/issues/51)) ([ad2c629](https://github.com/duriantaco/ca9/commit/ad2c62903a3907979a0f3b1268d9e346b15c3515))
+* **triage:** correct Python dependency selection and reachability verdicts ([#53](https://github.com/duriantaco/ca9/issues/53)) ([8638fbc](https://github.com/duriantaco/ca9/commit/8638fbc7dfc8a1ed0be7180636e0f762f3391a5b))
+
 ## [0.9.0](https://github.com/duriantaco/ca9/compare/v0.8.0...v0.9.0) (2026-11-10)
 
 
