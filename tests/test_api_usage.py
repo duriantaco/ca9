@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
+
 from ca9.analysis.api_usage import (
     _MATCH_TYPE_CONFIDENCE,
     _build_parent_map,
-    _match_fqname,
     build_file_index,
     find_api_usage,
     scan_file_for_api_usage,
 )
-from ca9.models import ApiTarget
+from ca9.engine import analyze
+from ca9.models import ApiTarget, Verdict, Vulnerability
 
 
 class TestBuildFileIndex:
@@ -62,6 +64,11 @@ class TestScanFileForApiUsage:
         assert hits[0].matched_target == "requests.get"
         assert hits[0].line == 2
 
+    def test_dotted_module_import_binds_top_level_package(self):
+        source = "import werkzeug.utils\nwerkzeug.utils.send_file('example.txt')\n"
+        hits = scan_file_for_api_usage("app.py", source, self._targets("werkzeug.utils.send_file"))
+        assert [(hit.matched_target, hit.line) for hit in hits] == [("werkzeug.utils.send_file", 2)]
+
     def test_from_import_call(self):
         source = "from yaml import load\ndata = load(open('f.yml'))\n"
         targets = self._targets("yaml.load")
@@ -75,6 +82,112 @@ class TestScanFileForApiUsage:
         hits = scan_file_for_api_usage("t.py", source, targets)
         assert len(hits) == 1
         assert hits[0].matched_target == "requests.get"
+
+    def test_callback_in_sibling_scope_is_not_the_imported_api(self):
+        source = (
+            "def original():\n"
+            "    from requests.auth import HTTPBasicAuth as render\n"
+            "    return render('user', 'password')\n"
+            "def label(render):\n"
+            "    return render('hello')\n"
+            "def another():\n"
+            "    from html import escape as render\n"
+            "    return render('hello')\n"
+            "label(str.upper)\n"
+        )
+        hits = scan_file_for_api_usage(
+            "app.py", source, self._targets("requests.auth.HTTPBasicAuth")
+        )
+        assert [hit.line for hit in hits] == [3]
+
+    def test_reassigned_import_only_matches_prior_calls(self):
+        source = (
+            "from package import transform\n"
+            "transform('first')\n"
+            "transform = str.upper\n"
+            "transform('second')\n"
+        )
+        hits = scan_file_for_api_usage("app.py", source, self._targets("package.transform"))
+        assert [hit.line for hit in hits] == [2]
+
+    def test_lexical_shadowing_and_late_module_rebinding(self):
+        source = (
+            "from package import transform\n"
+            "def called_later():\n"
+            "    return transform('hello')\n"
+            "def callback(*, transform):\n"
+            "    return transform('hello')\n"
+            "values = [transform('hello') for transform in [str.upper]]\n"
+            "to_upper = lambda transform: transform('hello')\n"
+            "transform = str.upper\n"
+            "called_later()\n"
+        )
+        assert scan_file_for_api_usage("app.py", source, self._targets("package.transform")) == []
+
+    def test_nested_function_inherits_import_and_ignores_class_namespace(self):
+        source = (
+            "import package as lib\n"
+            "class Formatter:\n"
+            "    lib = str\n"
+            "    def format(self):\n"
+            "        return lib.transform('hello')\n"
+            "def wrapper():\n"
+            "    from package import transform as apply\n"
+            "    def inner():\n"
+            "        return apply('hello')\n"
+        )
+        hits = scan_file_for_api_usage("app.py", source, self._targets("package.transform"))
+        assert sorted(hit.line for hit in hits) == [5, 9]
+
+    def test_ambiguous_conditional_rebinding_is_inconclusive(self):
+        source = (
+            "def run(use_custom):\n"
+            "    from package import transform\n"
+            "    if use_custom:\n"
+            "        transform = str.upper\n"
+            "    return transform('hello')\n"
+        )
+        assert scan_file_for_api_usage("app.py", source, self._targets("package.transform")) == []
+
+    def test_nested_global_and_nonlocal_writes_block_only_shared_bindings(self):
+        source = (
+            "from package import transform as shared\n"
+            "def outer():\n"
+            "    from package import transform as closed\n"
+            "    def change():\n"
+            "        global shared\n"
+            "        nonlocal closed\n"
+            "        shared = closed = str.upper\n"
+            "    change()\n"
+            "    return shared('hello'), closed('hello')\n"
+            "def isolated():\n"
+            "    from package import transform as shared\n"
+            "    return shared('hello')\n"
+        )
+        hits = scan_file_for_api_usage("app.py", source, self._targets("package.transform"))
+        assert [hit.line for hit in hits] == [12]
+
+    def test_conditional_import_can_leave_builtin_or_class_fallback_in_effect(self):
+        source = (
+            "if use_custom:\n"
+            "    from package import transform as sorted\n"
+            "sorted([])\n"
+            "render = str.upper\n"
+            "class Formatter:\n"
+            "    if use_custom:\n"
+            "        from package import transform as render\n"
+            "    value = render('hello')\n"
+        )
+        assert scan_file_for_api_usage("app.py", source, self._targets("package.transform")) == []
+
+    def test_references_do_not_mask_a_genuine_call_on_the_same_line(self):
+        source = "from package import transform\nfunctions = (transform, transform('hello'))\n"
+        hits = scan_file_for_api_usage("app.py", source, self._targets("package.transform"))
+        assert [(hit.line, hit.match_type) for hit in hits] == [(2, "attribute_call")]
+
+    def test_relative_import_cannot_identify_external_api(self):
+        source = "from .package import transform\ntransform('hello')\n"
+        assert scan_file_for_api_usage("app.py", source, self._targets("package.transform")) == []
 
     def test_class_instantiation(self):
         source = "from requests.auth import HTTPBasicAuth\nauth = HTTPBasicAuth('u', 'p')\n"
@@ -146,24 +259,28 @@ class TestScanFileForApiUsage:
         assert len(hits) == 1
 
 
-class TestMatchFqname:
-    def test_exact_match(self):
-        assert _match_fqname("yaml.load", {"yaml.load"}) == "yaml.load"
-
-    def test_no_match(self):
-        assert _match_fqname("yaml.safe_load", {"yaml.load"}) is None
-
-    def test_fuzzy_match_same_package(self):
-        assert _match_fqname("requests.api.get", {"requests.get"}) == "requests.get"
-
-    def test_no_cross_package_match(self):
-        assert _match_fqname("myapp.utils.load", {"yaml.load"}) is None
-
-    def test_no_match_different_symbol(self):
-        assert _match_fqname("requests.post", {"requests.get"}) is None
-
-    def test_single_segment_target_skipped_in_fuzzy(self):
-        assert _match_fqname("mymodule.yaml", {"yaml"}) is None
+def test_match_requires_exact_owner_or_explicit_reexport():
+    targets = [
+        ApiTarget(
+            package="requests",
+            fqname="requests.Session.send",
+            aliases=("requests.sessions.Session.send",),
+        ),
+        ApiTarget(package="requests", fqname="requests.get", aliases=("requests.api.get",)),
+    ]
+    source = (
+        "from requests.adapters import BaseAdapter\n"
+        "from requests.sessions import Session\n"
+        "from requests.api import get\n"
+        "BaseAdapter.send(None, None)\n"
+        "Session.send(None, None)\n"
+        "get('example')\n"
+    )
+    hits = scan_file_for_api_usage("app.py", source, targets)
+    assert [(h.line, h.matched_target) for h in hits] == [
+        (5, "requests.Session.send"),
+        (6, "requests.get"),
+    ]
 
 
 class TestConfidenceGradation:
@@ -243,3 +360,30 @@ class TestFindApiUsage:
         (tmp_path / "app.py").write_text("import requests\nrequests.get('x')\n")
         hits = find_api_usage(tmp_path, [])
         assert hits == []
+
+
+def test_covered_callback_does_not_prove_imported_api_execution(tmp_path):
+    (tmp_path / "app.py").write_text(
+        "def unused():\n"
+        "    from requests.auth import HTTPBasicAuth as render\n"
+        "\n"
+        "def label(render):\n"
+        "    return render('hello')\n"
+        "\n"
+        "label(str.upper)\n"
+    )
+    coverage = tmp_path / "coverage.json"
+    coverage.write_text(
+        json.dumps({"files": {"app.py": {"executed_lines": [1, 4, 5, 7], "missing_lines": [2]}}})
+    )
+    advisory = Vulnerability(
+        id="LOCAL-TEST",
+        package_name="requests",
+        package_version="2.30.0",
+        severity="medium",
+        title="authentication",
+    )
+    result = analyze([advisory], tmp_path, coverage_path=coverage).results[0]
+    assert result.verdict == Verdict.INCONCLUSIVE
+    assert "requests.auth.HTTPBasicAuth" in result.evidence.api_targets
+    assert result.evidence.api_usage_hits == ()

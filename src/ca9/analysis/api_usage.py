@@ -4,7 +4,8 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ca9.analysis.ast_scanner import _is_runtime_python_file
+from ca9.analysis._import_bindings import ImportBindings
+from ca9.analysis.ast_scanner import iter_runtime_python_files, read_python_source
 from ca9.models import ApiTarget, ApiUsageHit
 
 
@@ -21,7 +22,7 @@ def build_file_index(file_path: str, source: str) -> FileSymbolIndex:
 
     try:
         tree = ast.parse(source, filename=file_path)
-    except SyntaxError as e:
+    except (SyntaxError, ValueError, RecursionError) as e:
         index.parse_error = str(e)
         return index
 
@@ -131,39 +132,34 @@ def scan_file_for_api_usage(
     source: str,
     targets: list[ApiTarget],
 ) -> list[ApiUsageHit]:
-    index = build_file_index(file_path, source)
-    if index.parse_error:
-        return []
-
-    fqname_set: set[str] = set()
-    fqname_to_target: dict[str, ApiTarget] = {}
-    for t in targets:
-        fqname_set.add(t.fqname)
-        fqname_to_target[t.fqname] = t
-        for alias in t.aliases:
-            fqname_set.add(alias)
-            fqname_to_target[alias] = t
+    # Match exact owners or a re-export explicitly named by the rule.
+    # Different classes in a package can implement unrelated methods of the same name.
+    targets_by_name = {alias: target for target in targets for alias in target.aliases}
+    targets_by_name.update((target.fqname, target) for target in targets)
 
     try:
         tree = ast.parse(source, filename=file_path)
-    except SyntaxError:
+    except (SyntaxError, ValueError, RecursionError):
         return []
 
     parent_map = _build_parent_map(tree)
+    bindings = ImportBindings(tree, parent_map)
     source_lines = source.splitlines()
     hits: list[ApiUsageHit] = []
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
-            resolved = _resolve_call_fqname(node.func, index)
+            base = node.func
+            attributes: list[str] = []
+            while isinstance(base, ast.Attribute):
+                attributes.append(base.attr)
+                base = base.value
+            binding = bindings.resolve(base) if isinstance(base, ast.Name) else None
+            resolved = ".".join((binding.qualified, *reversed(attributes))) if binding else None
             if resolved is None:
                 continue
 
-            matched_target = _match_fqname(resolved, fqname_set)
-            if matched_target is None:
-                continue
-
-            target = fqname_to_target.get(matched_target)
+            target = targets_by_name.get(resolved)
             if target is None:
                 continue
 
@@ -174,57 +170,39 @@ def scan_file_for_api_usage(
                     line=node.lineno,
                     col=node.col_offset,
                     match_type=match_type,
-                    matched_target=matched_target,
+                    matched_target=target.fqname,
                     code_snippet=_get_source_line(source_lines, node.lineno),
                     confidence=_MATCH_TYPE_CONFIDENCE.get(match_type, 80),
                 )
             )
 
-        elif isinstance(node, ast.Name):
-            if node.id in index.symbol_aliases:
-                resolved = index.symbol_aliases[node.id]
-                matched = _match_fqname(resolved, fqname_set)
-                if matched and not _is_call_func(node, parent_map):
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if _is_call_func(node, parent_map):
+                continue
+            binding = bindings.resolve(node)
+            if binding and binding.from_import:
+                target = targets_by_name.get(binding.qualified)
+                if target:
                     hits.append(
                         ApiUsageHit(
                             file_path=file_path,
                             line=node.lineno,
                             col=node.col_offset,
                             match_type="symbol_reference",
-                            matched_target=matched,
+                            matched_target=target.fqname,
                             code_snippet=_get_source_line(source_lines, node.lineno),
                             confidence=_MATCH_TYPE_CONFIDENCE["symbol_reference"],
                         )
                     )
 
-    seen: set[tuple[int, str]] = set()
-    deduped: list[ApiUsageHit] = []
+    by_location: dict[tuple[int, str], ApiUsageHit] = {}
     for hit in hits:
         key = (hit.line, hit.matched_target)
-        if key not in seen:
-            seen.add(key)
-            deduped.append(hit)
+        previous = by_location.get(key)
+        if previous is None or previous.match_type == "symbol_reference":
+            by_location[key] = hit
 
-    return deduped
-
-
-def _match_fqname(resolved: str, fqname_set: set[str]) -> str | None:
-    if resolved in fqname_set:
-        return resolved
-
-    for fq in fqname_set:
-        if "." not in fq:
-            continue
-        fq_module, fq_symbol = fq.rsplit(".", 1)
-        if not resolved.endswith(f".{fq_symbol}"):
-            continue
-        resolved_module = resolved.rsplit(".", 1)[0]
-        fq_top = fq_module.split(".")[0]
-        resolved_top = resolved_module.split(".")[0]
-        if fq_top == resolved_top:
-            return fq
-
-    return None
+    return list(by_location.values())
 
 
 def _is_call_func(node: ast.Name, parent_map: dict[int, ast.AST]) -> bool:
@@ -241,13 +219,10 @@ def find_api_usage(
 
     all_hits: list[ApiUsageHit] = []
 
-    for py_file in repo_root.rglob("*.py"):
-        if not _is_runtime_python_file(py_file, repo_root):
-            continue
-
+    for py_file in iter_runtime_python_files(repo_root):
         try:
-            source = py_file.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            source = read_python_source(py_file)
+        except (OSError, SyntaxError, UnicodeError):
             continue
 
         hits = scan_file_for_api_usage(str(py_file), source, targets)

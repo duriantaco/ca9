@@ -8,12 +8,12 @@ from packaging.utils import canonicalize_name
 from ca9.advisory import normalize_ecosystem
 from ca9.analysis.api_usage import find_api_usage
 from ca9.analysis.ast_scanner import (
-    collect_imports_from_repo,
     discover_declared_dependencies,
     find_unresolved_imports,
     imports_any_module,
     resolve_optional_dependents,
     resolve_transitive_deps,
+    scan_repo_imports,
 )
 from ca9.analysis.coverage_reader import (
     FileCoverage,
@@ -47,7 +47,7 @@ from ca9.models import (
     Vulnerability,
 )
 from ca9.scoring import compute_confidence
-from ca9.version import check_version
+from ca9.version import check_version, listed_pypi_version
 
 
 def _report_dependency_kind(vuln: Vulnerability) -> str | None:
@@ -143,11 +143,21 @@ def collect_evidence(
     references: RepoReferences | None = None,
     optional_dependents: dict[str, str] | None = None,
     unresolved_imports: tuple[str, ...] = (),
+    source_imports_complete: bool | None = None,
 ) -> Evidence:
     warnings: list[str] = list(global_warnings)
 
     version_result = check_version(vuln.package_version, vuln.affected_ranges)
     version_in_range = version_result.affected
+    version_scope_conflict = None
+    if version_in_range is False and vuln.affected_versions:
+        listed = listed_pypi_version(vuln.package_version, vuln.affected_versions)
+        if listed is not None:
+            version_in_range = None
+            version_scope_conflict = (
+                f"The advisory explicitly lists {listed} as affected, although "
+                f"{vuln.package_version} is outside its reported release ranges"
+            )
     if version_result.error:
         warnings.append(version_result.error)
 
@@ -313,6 +323,7 @@ def collect_evidence(
 
     return Evidence(
         version_in_range=version_in_range,
+        version_scope_conflict=version_scope_conflict,
         dependency_kind=dependency_kind,
         dependency_graph_available=environment_graph_complete or report_graph_available,
         dependency_graph_source=dependency_graph_source,
@@ -345,6 +356,7 @@ def collect_evidence(
         unproven_import_mappings=tuple(unproven_import_mappings),
         submodule_evidence=submodule_evidence,
         dependency_graph_unresolved=graph_unresolved,
+        source_imports_complete=source_imports_complete,
     )
 
 
@@ -448,6 +460,23 @@ def derive_verdict(
 
     has_submodule_info = component.submodule_paths and component.confidence in ("high", "medium")
 
+    if evidence.version_scope_conflict:
+        affected_call = evidence.api_usage_seen and (
+            evidence.package_imported or evidence.api_call_sites_covered
+        )
+        affected_component_executed = has_coverage and has_submodule_info and evidence.coverage_seen
+        if not (affected_call or affected_component_executed):
+            return VerdictResult(
+                vulnerability=vuln,
+                verdict=Verdict.INCONCLUSIVE,
+                reason=f"{evidence.version_scope_conflict}. Use of the affected code is unconfirmed.",
+                imported_as=import_name,
+                dependency_of=dep_of,
+                affected_component=component,
+                evidence=evidence,
+            )
+        trace = f"{evidence.version_scope_conflict}. {trace}"
+
     # Observed execution takes precedence over an incomplete static import view.
     # The affected-version check above remains independent of execution evidence.
     if has_coverage and evidence.api_usage_seen is True and evidence.api_call_sites_covered is True:
@@ -493,6 +522,24 @@ def derive_verdict(
         # A package-level production observation refutes absence, but does not
         # identify which affected submodule or API executed.
         return _inconclusive_coverage(vuln, evidence, import_name, component, dep_of, trace)
+
+    if (
+        evidence.source_imports_complete is False
+        and not evidence.api_usage_seen
+        and (not evidence.package_imported or evidence.submodule_imported is False)
+    ):
+        return VerdictResult(
+            vulnerability=vuln,
+            verdict=Verdict.INCONCLUSIVE,
+            reason=(
+                f"ca9 could not check all runtime Python source for imports of "
+                f"'{vuln.package_name}' or its affected modules"
+            ),
+            imported_as=import_name,
+            affected_component=component,
+            dependency_of=dep_of,
+            evidence=evidence,
+        )
 
     if not evidence.package_imported:
         if evidence.api_usage_seen is True:
@@ -724,7 +771,7 @@ def analyze(
 ) -> Report:
     # Read installed metadata fresh for each analysis.
     reset_environment_index()
-    repo_imports = collect_imports_from_repo(repo_path)
+    repo_imports, source_warning = scan_repo_imports(repo_path)
     declared_direct_deps = discover_declared_dependencies(repo_path)
     transitive_deps, dependency_graph_available = resolve_transitive_deps(repo_imports)
     references = scan_repo_references(repo_path)
@@ -842,6 +889,7 @@ def analyze(
             references=references,
             optional_dependents=optional_dependents,
             unresolved_imports=unresolved_imports,
+            source_imports_complete=source_warning is None,
         )
 
         if evidence.dependency_kind == "transitive":
@@ -889,6 +937,9 @@ def analyze(
         coverage_path_str = str(coverage_path)
     else:
         coverage_path_str = None
+
+    if source_warning:
+        analysis_warnings.append(source_warning)
 
     return Report(
         results=results,

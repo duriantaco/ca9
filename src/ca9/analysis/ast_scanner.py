@@ -6,9 +6,17 @@ import json
 import os
 import re
 import sys
+import tokenize
+from collections.abc import Callable
 from pathlib import Path
 
-from packaging.markers import InvalidMarker, Marker, default_environment
+from packaging.markers import (
+    InvalidMarker,
+    Marker,
+    UndefinedComparison,
+    UndefinedEnvironmentName,
+    default_environment,
+)
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 
@@ -40,10 +48,12 @@ def pypi_to_import_names(package_name: str) -> tuple[str, ...]:
 
 def collect_imports_from_source(source: str) -> set[str]:
     try:
-        tree = ast.parse(source)
-    except SyntaxError:
+        return _imports_from_tree(ast.parse(source))
+    except (SyntaxError, ValueError, RecursionError):
         return set()
 
+
+def _imports_from_tree(tree: ast.AST) -> set[str]:
     imports: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -152,10 +162,10 @@ def _is_runtime_python_file(py_file: Path, repo_path: Path) -> bool:
     )
 
 
-def iter_runtime_python_files(repo_path: Path):
-    for dirpath, dirnames, filenames in os.walk(repo_path):
-        # Prune vendored environments instead of walking and discarding them.
-        dirnames[:] = sorted(d for d in dirnames if d not in _EXCLUDED_DIRS)
+def iter_runtime_python_files(repo_path: Path, *, onerror: Callable[[OSError], None] | None = None):
+    skipped = _EXCLUDED_DIRS | _NON_RUNTIME_DIRS
+    for dirpath, dirnames, filenames in os.walk(repo_path, onerror=onerror):
+        dirnames[:] = sorted(d for d in dirnames if d not in skipped)
         for filename in sorted(filenames):
             if not filename.endswith(".py"):
                 continue
@@ -164,15 +174,49 @@ def iter_runtime_python_files(repo_path: Path):
                 yield py_file
 
 
-def collect_imports_from_repo(repo_path: Path) -> set[str]:
+def read_python_source(path: Path) -> str:
+    """Decode source using Python's BOM and encoding declaration rules."""
+    try:
+        with tokenize.open(path) as stream:
+            return stream.read()
+    except (LookupError, UnicodeError) as exc:
+        raise SyntaxError("invalid Python source encoding") from exc
+
+
+def scan_repo_imports(repo_path: Path) -> tuple[set[str], str | None]:
     all_imports: set[str] = set()
-    for py_file in iter_runtime_python_files(repo_path):
+    skipped_count = 0
+    examples: list[str] = []
+
+    def record_skip(path: Path, exc: Exception) -> None:
+        nonlocal skipped_count
+        skipped_count += 1
+        if len(examples) < 3:
+            relative = path.relative_to(repo_path).as_posix()
+            examples.append(f"{relative[:160]!r} ({type(exc).__name__})")
+
+    def walk_error(exc: OSError) -> None:
+        record_skip(Path(exc.filename) if exc.filename else repo_path, exc)
+
+    for py_file in iter_runtime_python_files(repo_path, onerror=walk_error):
         try:
-            source = py_file.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        all_imports.update(collect_imports_from_source(source))
-    return all_imports
+            tree = ast.parse(read_python_source(py_file), filename=str(py_file))
+        except (OSError, SyntaxError, ValueError, RecursionError) as exc:
+            record_skip(py_file, exc)
+        else:
+            all_imports.update(_imports_from_tree(tree))
+    warning = None
+    if skipped_count:
+        warning = (
+            f"Runtime Python source analysis is incomplete. Could not read or parse "
+            f"{skipped_count} path(s), including {', '.join(examples)}."
+        )
+    return all_imports, warning
+
+
+def collect_imports_from_repo(repo_path: Path) -> set[str]:
+    imports, _warning = scan_repo_imports(repo_path)
+    return imports
 
 
 def is_package_imported(package_name: str, repo_imports: set[str]) -> bool:
@@ -381,6 +425,8 @@ def _iter_requirement_inventory(
     path: Path,
     seen: set[Path],
     hashes: dict[str, tuple[str, ...]] | None = None,
+    *,
+    active_markers: bool = False,
 ) -> dict[str, tuple[str, str | None]]:
     try:
         resolved = path.resolve()
@@ -414,15 +460,23 @@ def _iter_requirement_inventory(
                 constraint_target = path.parent / option[1]
 
         if include_target is not None:
-            nested = _iter_requirement_inventory(include_target, seen, hashes)
+            nested = _iter_requirement_inventory(
+                include_target, seen, hashes, active_markers=active_markers
+            )
             for nested_name, nested_data in nested.items():
                 declared[nested_name] = nested_data
             continue
 
         if constraint_target is not None:
-            constraints.update(_iter_constraint_inventory(constraint_target, seen, hashes))
+            constraints.update(
+                _iter_constraint_inventory(
+                    constraint_target, seen, hashes, active_markers=active_markers
+                )
+            )
             continue
 
+        if active_markers and not _requirement_applies(line):
+            continue
         name = _extract_req_name_from_line(line)
         if name:
             version = _extract_req_exact_version_from_line(line)
@@ -437,6 +491,8 @@ def _iter_constraint_inventory(
     path: Path,
     seen: set[Path],
     hashes: dict[str, tuple[str, ...]] | None = None,
+    *,
+    active_markers: bool = False,
 ) -> dict[str, tuple[str, str | None]]:
     try:
         resolved = path.resolve()
@@ -460,9 +516,15 @@ def _iter_constraint_inventory(
 
         option = requirement_option(line)
         if option is not None and option[0] == "--constraint" and option[1]:
-            constraints.update(_iter_constraint_inventory(path.parent / option[1], seen, hashes))
+            constraints.update(
+                _iter_constraint_inventory(
+                    path.parent / option[1], seen, hashes, active_markers=active_markers
+                )
+            )
             continue
 
+        if active_markers and not _requirement_applies(line):
+            continue
         name = _extract_req_name_from_line(line)
         if not name:
             continue
@@ -508,7 +570,29 @@ def discover_requirement_hashes(repo_path: Path) -> dict[str, tuple[str, ...]]:
     return hashes
 
 
-def _parse_dependency_requirement(req: str) -> tuple[str | None, str | None]:
+def _active_requirement(parsed: Requirement, extra: str) -> bool:
+    if not parsed.marker:
+        return True
+    try:
+        return parsed.marker.evaluate({"extra": extra})
+    except (UndefinedComparison, UndefinedEnvironmentName):
+        return True  # An unevaluable marker cannot rule out the dependency.
+
+
+def _requirement_applies(line: str) -> bool:
+    if ";" not in line:
+        return True
+    value, _hashes = split_requirement_options(line)
+    try:
+        parsed = Requirement(value)
+    except InvalidRequirement:
+        return True  # Retain legacy URL/path requirements and their evidence.
+    return _active_requirement(parsed, "")
+
+
+def _parse_dependency_requirement(
+    req: str, *, active_extra: str | None = None
+) -> tuple[str | None, str | None]:
     req, _hashes = split_requirement_options(req.strip())
     try:
         parsed = Requirement(req)
@@ -516,6 +600,8 @@ def _parse_dependency_requirement(req: str) -> tuple[str | None, str | None]:
         name = _parse_requirement_name(req)
         return name, None
 
+    if active_extra is not None and not _active_requirement(parsed, active_extra):
+        return None, None
     return parsed.name, _extract_exact_version(parsed.specifier)
 
 
@@ -705,12 +791,17 @@ def _merge_lockfile_versions(
     repo_path: Path,
     declared: dict[str, tuple[str, str | None]],
     pyproject_data: dict,
+    include_uv: bool,
 ) -> None:
     project_name = _discover_project_name(pyproject_data)
 
     uv_lock_path = repo_path / "uv.lock"
-    if uv_lock_path.is_file():
-        uv_data = _load_toml(uv_lock_path)
+    if include_uv and uv_lock_path.is_file():
+        try:
+            uv_data = _load_toml(uv_lock_path)
+        except ValueError:
+            # The scan inventory reports invalid locks explicitly.
+            uv_data = {}
         resolved = _resolve_uv_locked_versions(uv_data, declared, project_name)
         for dep_key, version in resolved.items():
             name, existing_version = declared[dep_key]
@@ -757,7 +848,9 @@ def _merge_pipfile_inventory(
         _merge_declared_dependency(declared, name, version)
 
 
-def discover_declared_dependency_inventory(repo_path: Path) -> dict[str, tuple[str, str | None]]:
+def discover_declared_dependency_inventory(
+    repo_path: Path, *, active_markers: bool = False, include_uv_pins: bool = True
+) -> dict[str, tuple[str, str | None]]:
     declared: dict[str, tuple[str, str | None]] = {}
     pyproject_data: dict = {}
 
@@ -768,17 +861,21 @@ def discover_declared_dependency_inventory(repo_path: Path) -> dict[str, tuple[s
         if isinstance(project, dict):
             for req in project.get("dependencies", []):
                 if isinstance(req, str):
-                    name, version = _parse_dependency_requirement(req)
+                    name, version = _parse_dependency_requirement(
+                        req, active_extra="" if active_markers else None
+                    )
                     if name:
                         _merge_declared_dependency(declared, name, version)
             optional_deps = project.get("optional-dependencies", {})
             if isinstance(optional_deps, dict):
-                for reqs in optional_deps.values():
+                for extra, reqs in optional_deps.items():
                     if not isinstance(reqs, list):
                         continue
                     for req in reqs:
                         if isinstance(req, str):
-                            name, version = _parse_dependency_requirement(req)
+                            name, version = _parse_dependency_requirement(
+                                req, active_extra=extra if active_markers else None
+                            )
                             if name:
                                 _merge_declared_dependency(declared, name, version)
 
@@ -798,12 +895,14 @@ def discover_declared_dependency_inventory(repo_path: Path) -> dict[str, tuple[s
 
     seen_requirement_files: set[Path] = set()
     for req_file in sorted(repo_path.glob("requirements*.txt")):
-        inventory = _iter_requirement_inventory(req_file, seen_requirement_files)
+        inventory = _iter_requirement_inventory(
+            req_file, seen_requirement_files, active_markers=active_markers
+        )
         for name, data in inventory.items():
             declared[name] = data
 
     _merge_pipfile_inventory(repo_path, declared)
-    _merge_lockfile_versions(repo_path, declared, pyproject_data)
+    _merge_lockfile_versions(repo_path, declared, pyproject_data, include_uv_pins)
 
     return declared
 
@@ -975,8 +1074,8 @@ def find_unresolved_imports(repo_path: Path, repo_imports: set[str]) -> tuple[st
     unguarded: set[str] = set()
     for py_file in iter_runtime_python_files(repo_path):
         try:
-            source = py_file.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
+            source = read_python_source(py_file)
+        except (OSError, SyntaxError):
             continue
         if any(name in source for name in unresolved - unguarded):
             unguarded |= _unguarded_import_roots(source) & unresolved
@@ -1000,7 +1099,7 @@ def _catches_import_error(handler: ast.ExceptHandler) -> bool:
 def _unguarded_import_roots(source: str) -> set[str]:
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError, RecursionError):
         return set()
 
     try_types = tuple(t for t in (ast.Try, getattr(ast, "TryStar", None)) if t is not None)

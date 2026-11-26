@@ -1,0 +1,94 @@
+{
+  "results": [
+    {
+      "source": {
+        "type": "lockfile",
+        "path": "src/pip/_vendor/vendor.txt"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "requests",
+            "ecosystem": "PyPI",
+            "purl": "pkg:pypi/requests",
+            "version": "2.31.0"
+          },
+          "vulnerabilities": [
+            {
+              "id": "GHSA-j8r2-6x86-q33q",
+              "aliases": [
+                "CVE-2023-32681",
+                "PYSEC-2023-74"
+              ],
+              "modified": "2026-09-10T03:50:01.756149727Z",
+              "summary": "Unintended leak of Proxy-Authorization header in requests",
+              "affected": [
+                {
+                  "package": {
+                    "name": "requests",
+                    "ecosystem": "PyPI",
+                    "purl": "pkg:pypi/requests"
+                  },
+                  "ranges": [
+                    {
+                      "type": "ECOSYSTEM",
+                      "events": [
+                        {
+                          "introduced": "2.3.0"
+                        },
+                        {
+                          "fixed": "2.31.0"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "urllib3",
+            "ecosystem": "PyPI",
+            "purl": "pkg:pypi/urllib3",
+            "version": "1.26.16"
+          },
+          "vulnerabilities": [
+            {
+              "id": "GHSA-q2q7-5pp4-w6pg",
+              "aliases": [
+                "CVE-2021-33503",
+                "PYSEC-2021-108"
+              ],
+              "modified": "2026-07-08T06:00:54.217433740Z",
+              "summary": "Catastrophic backtracking in URL authority parser when passed URL containing many @ characters",
+              "affected": [
+                {
+                  "package": {
+                    "name": "urllib3",
+                    "ecosystem": "PyPI",
+                    "purl": "pkg:pypi/urllib3"
+                  },
+                  "ranges": [
+                    {
+                      "type": "ECOSYSTEM",
+                      "events": [
+                        {
+                          "introduced": "1.25.4"
+                        },
+                        {
+                          "fixed": "1.26.5"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -54,6 +54,10 @@ def _evidence_to_dict(evidence) -> dict | None:
         "coverage_unmeasured_targets": list(evidence.coverage_unmeasured_targets),
         "external_fetch_warnings": list(evidence.external_fetch_warnings),
     }
+    if evidence.source_imports_complete is not None:
+        d["source_imports_complete"] = evidence.source_imports_complete
+    if evidence.version_scope_conflict:
+        d["version_scope_conflict"] = evidence.version_scope_conflict
     if evidence.api_targets:
         d["api_targets"] = list(evidence.api_targets)
     if evidence.api_usage_seen is not None:

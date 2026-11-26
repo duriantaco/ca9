@@ -78,9 +78,10 @@ _CURATED: dict[str, list[tuple[re.Pattern[str], tuple[str, ...], tuple[str, ...]
         (re.compile(r"(?:cache|caching)", re.I), ("django.core.cache",), ()),
     ],
     "werkzeug": [
+        (re.compile(r"\bsafe_join\b", re.I), ("werkzeug.security",), ()),
         (re.compile(r"debug|Debug", re.I), ("werkzeug.debug",), ("debugger.py",)),
         (re.compile(r"formparser|FormDataParser|multipart", re.I), ("werkzeug.formparser",), ()),
-        (re.compile(r"safe_join|utils", re.I), ("werkzeug.utils",), ()),
+        (re.compile(r"\bwerkzeug\.utils\b", re.I), ("werkzeug.utils",), ()),
     ],
     "jinja2": [
         (re.compile(r"sandbox|Sandbox", re.I), ("jinja2.sandbox",), ("sandbox.py",)),
