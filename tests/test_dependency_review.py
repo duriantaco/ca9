@@ -4,6 +4,7 @@ import base64
 import hashlib
 import io
 import json
+import subprocess
 import tarfile
 
 import pytest
@@ -11,6 +12,8 @@ import pytest
 from ca9.artifacts import fetch
 from ca9.review import locks
 from ca9.review.behavior import BehaviorFact
+from ca9.review.pr_git import review_pull_request
+from ca9.review.pr_report import write_job_summary
 from ca9.review.service import (
     Inspection,
     _behavior_deltas,
@@ -107,6 +110,62 @@ def _deltas(report, kind=None):
         for item in package["deltas"]
         if kind is None or item["kind"] == kind
     ]
+
+
+def test_pr_summary_flags_a_new_hook_once_across_releases(registry):
+    def git(*args):
+        return subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                *args,
+            ],
+            cwd=registry.root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    commits = []
+    for version in ("1.0.0", "1.1.0", "1.2.0"):
+        has_hook = version != "1.0.0"
+        manifest = {"scripts": {"postinstall": "node setup.js"}} if has_hook else {}
+        if version == "1.2.0":
+            manifest["devDependencies"] = {"test-runner": "^2.0.0"}
+        entry = registry.release(
+            version,
+            manifest=manifest,
+            files={"setup.js": "console.log('fixture');\n"} if has_hook else {},
+        )
+        registry.lock("package-lock.json", entry)
+        git("add", "package-lock.json")
+        git("commit", "-qm", version)
+        commits.append(git("rev-parse", "HEAD"))
+
+    cache = registry.root / "cache"
+    added = review_pull_request(registry.root, commits[0], commits[1], cache_dir=cache)
+    assert added.complete and added.decision == "review"
+    summary = write_job_summary(added)
+    assert "postinstall" in summary and "node setup.js" in summary
+
+    retained = review_pull_request(registry.root, commits[1], commits[2], cache_dir=cache)
+    assert retained.complete and retained.decision == "pass"
+    assert len(write_job_summary(retained).splitlines()) == 1
+    assert "postinstall" not in write_job_summary(retained)
+    assert any(
+        d["key"] == "devDependencies:test-runner"
+        and d["status"] == "added"
+        and d["action"] == "info"
+        for d in retained.lockfiles[0].report.packages[0]["deltas"]
+    )
 
 
 def test_version_and_formatting_only_update_has_no_new_behavior(registry):

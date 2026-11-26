@@ -1,12 +1,58 @@
 ---
 title: GitHub Action
-description: Use the ca9 GitHub Action to check dependency protection posture, run Python CVE reachability analysis, and upload SARIF.
+description: Review npm dependency updates on pull requests, check install protection, and run Python CVE reachability analysis in GitHub Actions.
 ---
 
 # GitHub Action
 
-ca9 includes a composite GitHub Action for dependency posture and reachability
-analysis in CI.
+## Review dependency updates on pull requests
+
+Use `command: review` to see whether an npm update introduces an install hook,
+changes an executable, or adds other behavior that deserves a closer look. ca9
+compares the lockfiles from the PR head and its common ancestor with the base
+branch. It verifies published tarballs against their lockfile hashes before
+inspecting their contents. Package code is read as data.
+
+```yaml
+name: Dependency update review
+
+on: pull_request
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: duriantaco/ca9@main
+        id: review
+        with:
+          command: review
+```
+
+The job summary shows new behavior that needs review and any gaps in inspection.
+A PR with no changed `package-lock.json` files gets a one-line result. The full
+report is written to `ca9-review.json` in the workspace. A later step can save
+it with `actions/upload-artifact` using `${{ steps.review.outputs.output-path }}`.
+Set `format: markdown` for a detailed Markdown file or set `output` to choose
+its path. The job summary is available in either format.
+
+The action finds changed npm v2/v3 lockfiles in nested projects. Use `repo`
+to limit it to a checkout subdirectory. When a project first adds a lockfile,
+the report identifies a missing baseline if its manifest already existed.
+The checkout needs both event commits and their common ancestor. A missing
+commit fails the step with instructions for fetching the history.
+
+By default, reviews are advisory. Set `fail-on-findings: "true"` to enforce
+the result after the report is written. The `exit-code` output is `0` for a
+complete pass, `1` for a complete review or a block, and `2` for incomplete
+inspection without a block. To limit the review to lock metadata, use
+`extra-args: --no-scan-artifacts`. Artifact comparisons then remain incomplete.
+To allow a private artifact registry, use `extra-args: --trusted-registry https://registry.example.org`.
 
 ## Dependency protection posture
 

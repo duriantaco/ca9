@@ -10,6 +10,10 @@ v2/v3 `package-lock.json` files, keeps separate installed occurrences and depend
 chains, and inspects the release artifacts for changed dependencies. Package code
 is never executed.
 
+For GitHub pull requests, the ca9 Action selects the event commits, discovers
+changed lockfiles, and writes a compact job summary with a detailed report
+available as a file. [Configure the Action](../integrations/github-action.md#review-dependency-updates-on-pull-requests)
+
 ```bash
 git show main:package-lock.json > /tmp/base-package-lock.json
 ca9 review --base /tmp/base-package-lock.json --head package-lock.json
@@ -45,6 +49,10 @@ Each observation has a status (`added`, `removed`, `changed`, `unchanged`, or
 `uninspectable`) and an action (`info`, `review`, or `block`). A new install hook
 requires review. New blocking package-code findings or failed artifact integrity
 checks can block. Existing observations remain available as context.
+
+Changes to a published package's own `devDependencies` appear as informational
+deltas. npm uses these tools during development of that package. A new install
+hook or a new runtime dependency still gets its own review decision.
 
 Unchanged lockfile occurrences are counted without downloading their artifacts.
 The result covers the update; it is not a fresh audit of every installed package.
