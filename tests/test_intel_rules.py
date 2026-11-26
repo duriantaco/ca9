@@ -334,3 +334,54 @@ class TestBuiltinRulesWithoutPyYAML:
         with pytest.warns(RuntimeWarning, match="invalid JSON rule file"):
             intel_rules._load_builtin_rules()
         assert intel_rules._BUILTIN_RULES == []
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from werkzeug.utils import send_file\nsend_file('report.txt', {})\n", False),
+        ("from werkzeug.security import safe_join\nsafe_join('docs', 'report.txt')\n", True),
+        ("from werkzeug.utils import safe_join\nsafe_join('docs', 'report.txt')\n", True),
+    ],
+)
+def test_safe_join_advisory_only_matches_named_helper(tmp_path, source, expected):
+    from ca9.engine import analyze
+    from ca9.models import Verdict
+
+    (tmp_path / "app.py").write_text(source)
+    advisory = Vulnerability(
+        id="PYSEC-2026-4312",
+        aliases=("GHSA-g6x2-hccm-hh4m",),
+        package_name="werkzeug",
+        package_version="3.1.8",
+        severity="low",
+        title="Werkzeug safe_join() allows Windows special device names",
+    )
+    result = analyze([advisory], tmp_path).results[0]
+    assert result.verdict == (Verdict.REACHABLE if expected else Verdict.INCONCLUSIVE)
+    targets = [hit.matched_target for hit in result.evidence.api_usage_hits]
+    assert targets == (["werkzeug.security.safe_join"] if expected else [])
+
+
+@pytest.mark.parametrize(
+    ("source", "matched"),
+    [
+        ("from requests.adapters import BaseAdapter\nBaseAdapter.send(None, None)\n", []),
+        (
+            "from requests.sessions import Session\nSession.send(None, None)\n",
+            ["requests.Session.send"],
+        ),
+        ("from requests.api import get\nget('example')\n", ["requests.get"]),
+    ],
+)
+def test_requests_rule_preserves_reexports_and_distinguishes_method_owners(
+    tmp_path, source, matched
+):
+    from ca9.engine import analyze
+    from ca9.models import Verdict
+
+    (tmp_path / "app.py").write_text(source)
+    advisory = Vulnerability("CVE-2023-32681", "requests", "2.30.0", "medium", "Report")
+    result = analyze([advisory], tmp_path).results[0]
+    assert [hit.matched_target for hit in result.evidence.api_usage_hits] == matched
+    assert result.verdict == (Verdict.REACHABLE if matched else Verdict.INCONCLUSIVE)

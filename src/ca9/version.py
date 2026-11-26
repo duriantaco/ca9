@@ -24,6 +24,16 @@ def _try_parse(v: str) -> Version | None:
         return None
 
 
+def listed_pypi_version(version: str, affected_versions: tuple[str, ...] | list[str]) -> str | None:
+    """Return the advisory spelling for an explicitly listed PyPI release."""
+    if version in affected_versions:
+        return version
+    installed = _try_parse(version)
+    if installed is None:
+        return None
+    return next((item for item in affected_versions if _try_parse(item) == installed), None)
+
+
 def is_version_affected(version: str, ranges: tuple[VersionRange, ...]) -> bool | None:
     if not ranges:
         return None

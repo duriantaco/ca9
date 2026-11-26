@@ -15,9 +15,16 @@ from pathlib import Path
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
-from ca9.advisory import attach_cache_freshness, metadata_from_osv, normalize_ecosystem
+from ca9.advisory import (
+    advisory_ids_for_matching,
+    attach_cache_freshness,
+    metadata_from_osv,
+    normalize_ecosystem,
+)
 from ca9.analysis.ast_scanner import discover_declared_dependency_inventory
 from ca9.models import AdvisoryRange, ScanCoverage, VersionRange, Vulnerability, finding_key
+from ca9.readers.locked_runtime import select_locked_runtime
+from ca9.version import listed_pypi_version
 
 OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 OSV_VULN_URL = "https://api.osv.dev/v1/vulns"
@@ -52,6 +59,7 @@ class ScanInventory:
     unresolved_dependencies: tuple[str, ...] = ()
     advisory_source: str = "none"
     advisories_checked: int = 0
+    lock_complete: bool = True
 
     def coverage(self) -> ScanCoverage:
         return ScanCoverage(
@@ -61,6 +69,7 @@ class ScanInventory:
             resolved=len(self.packages),
             checked=self.advisories_checked,
             unresolved=len(self.unresolved_dependencies),
+            lock_complete=self.lock_complete,
         )
 
 
@@ -79,8 +88,31 @@ def resolve_scan_inventory(
     *,
     allow_environment_fallback: bool = False,
 ) -> ScanInventory:
-    declared = discover_declared_dependency_inventory(repo_path)
-    installed_packages = get_installed_packages()
+    declared = discover_declared_dependency_inventory(
+        repo_path, active_markers=True, include_uv_pins=False
+    )
+    locked = select_locked_runtime(repo_path, declared)
+    selected = declared | locked.packages
+    for key in locked.local | locked.unresolved:
+        selected.pop(key, None)
+    inventory = _resolve_selected_packages(
+        selected, allow_environment_fallback and not locked.warnings
+    )
+    return replace(
+        inventory,
+        declared_dependencies=len((declared.keys() | locked.direct) - locked.local),
+        warnings=(*locked.warnings, *inventory.warnings),
+        unresolved_dependencies=tuple(
+            sorted(set(inventory.unresolved_dependencies) | locked.unresolved)
+        ),
+        lock_complete=not locked.warnings,
+    )
+
+
+def _resolve_selected_packages(
+    declared: dict[str, tuple[str, str | None]], allow_environment_fallback: bool
+) -> ScanInventory:
+    installed_packages = get_installed_packages() if allow_environment_fallback else []
 
     if not declared:
         if not allow_environment_fallback:
@@ -767,7 +799,68 @@ def _query_packages(
         for vuln in _query_from_cache_only(unverified, normalized_ecosystem):
             if finding_key(vuln.id, vuln.package_name, vuln.package_version) not in seen_keys:
                 vulns.append(vuln)
-    return vulns, len(unverified)
+    return _coalesce_osv_aliases(vulns), len(unverified)
+
+
+def _coalesce_osv_aliases(rows: list[Vulnerability]) -> list[Vulnerability]:
+    """Combine reciprocal OSV aliases only when their evidence for this release agrees."""
+    results: list[Vulnerability] = []
+    first: dict[tuple[str, str, str, frozenset[str]], int] = {}
+    for row in rows:
+        # An unavailable or unsupported affected range cannot establish equal scope.
+        if (
+            not row.aliases
+            or row.malicious
+            or not (row.advisory_ranges or row.affected_versions)
+            or any(r.kind not in _VERSION_RANGE_TYPES for r in row.advisory_ranges)
+        ):
+            results.append(row)
+            continue
+        # Including each primary ID in the full set requires each record to
+        # name the other. A common CVE or a related advisory is insufficient.
+        key = (
+            row.ecosystem,
+            _comparable_package_name(row.package_name, row.ecosystem),
+            row.package_version,
+            advisory_ids_for_matching(row),
+        )
+        index = first.setdefault(key, len(results))
+        if index == len(results):
+            results.append(row)
+            continue
+        previous = results[index]
+        if (
+            row.title != previous.title
+            or row.description != previous.description
+            or row.severity != previous.severity
+            or row.affected_ranges != previous.affected_ranges
+            or row.advisory_ranges != previous.advisory_ranges
+            or row.affected_versions != previous.affected_versions
+            or row.fixed_versions != previous.fixed_versions
+            or row.cache_stale != previous.cache_stale
+            or [u for u in row.references if "/commit/" in u]
+            != [u for u in previous.references if "/commit/" in u]
+        ):
+            results.append(row)
+            continue
+        # Use the same primary record regardless of query or cache iteration order.
+        primary, alias = sorted((previous, row), key=lambda item: item.id)
+        results[index] = replace(
+            primary,
+            references=tuple(
+                dict.fromkeys(
+                    (
+                        *primary.references,
+                        *alias.references,
+                        primary.advisory_url,
+                        alias.advisory_url,
+                    )
+                )
+            ),
+            cwes=tuple(sorted(set(primary.cwes) | set(alias.cwes))),
+            cpes=tuple(sorted(set(primary.cpes) | set(alias.cpes))),
+        )
+    return results
 
 
 def _query_from_cache_only(
@@ -871,7 +964,7 @@ def _cached_advisory_affects(
             continue
         if _comparable_package_name(str(pkg.get("name") or ""), ecosystem) != target:
             continue
-        if _affected_entry_includes(affected, package_version):
+        if _affected_entry_includes(affected, package_version, ecosystem):
             return True
     return False
 
@@ -882,12 +975,14 @@ def _comparable_package_name(name: str, ecosystem: str) -> str:
     return name.strip().lower()
 
 
-def _affected_entry_includes(affected: dict, version: str) -> bool:
+def _affected_entry_includes(affected: dict, version: str, ecosystem: str) -> bool:
     versions = [str(v) for v in affected.get("versions") or []]
     ranges = [r for r in affected.get("ranges") or [] if isinstance(r, dict)]
     if not versions and not ranges:
         return True
-    if version in versions:
+    if version in versions or (
+        versions and ecosystem == "pypi" and listed_pypi_version(version, versions) is not None
+    ):
         return True
     for osv_range in ranges:
         if osv_range.get("type") not in _VERSION_RANGE_TYPES:

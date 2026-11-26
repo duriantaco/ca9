@@ -17,23 +17,38 @@
       "api_targets": [
         {
           "fqname": "requests.get",
-          "kind": "function"
+          "kind": "function",
+          "aliases": [
+            "requests.api.get"
+          ]
         },
         {
           "fqname": "requests.post",
-          "kind": "function"
+          "kind": "function",
+          "aliases": [
+            "requests.api.post"
+          ]
         },
         {
           "fqname": "requests.request",
-          "kind": "function"
+          "kind": "function",
+          "aliases": [
+            "requests.api.request"
+          ]
         },
         {
           "fqname": "requests.Session.send",
-          "kind": "method"
+          "kind": "method",
+          "aliases": [
+            "requests.sessions.Session.send"
+          ]
         },
         {
           "fqname": "requests.Session.request",
-          "kind": "method"
+          "kind": "method",
+          "aliases": [
+            "requests.sessions.Session.request"
+          ]
         }
       ],
       "signals": {

@@ -117,7 +117,7 @@ def _dependency_declaration_ids(tree: ast.AST) -> set[int]:
 def _scan_python(refs: RepoReferences, source: str, location: str) -> None:
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError, RecursionError):
         return
     skipped = _docstring_ids(tree) | _dependency_declaration_ids(tree)
     for node in ast.walk(tree):
@@ -202,7 +202,7 @@ def _iter_repo_files(repo_path: Path):
 
 
 def scan_repo_references(repo_path: Path) -> RepoReferences:
-    from ca9.analysis.ast_scanner import _is_runtime_python_file
+    from ca9.analysis.ast_scanner import _is_runtime_python_file, read_python_source
 
     refs = RepoReferences()
     for path in _iter_repo_files(repo_path):
@@ -226,8 +226,12 @@ def scan_repo_references(repo_path: Path) -> RepoReferences:
         try:
             if path.stat().st_size > _MAX_FILE_BYTES:
                 continue
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
+            text = (
+                read_python_source(path)
+                if is_python
+                else path.read_text(encoding="utf-8", errors="ignore")
+            )
+        except (OSError, SyntaxError):
             continue
 
         location = rel.as_posix()

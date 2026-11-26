@@ -17,6 +17,12 @@ those dependencies by default instead of using packages installed in the current
 Python environment. Use `--allow-env-fallback` only when you intentionally want to
 scan the active environment.
 
+With a supported `uv.lock` or `fyn.lock`, the scanner follows runtime dependencies
+from the project roots and checks exact public PyPI releases applicable to the
+Python interpreter and platform running ca9. Unresolved lock edges make the scan
+partial. A locked dependency is evidence that a release should be checked.
+Reachability still depends on the application's imports, calls, and execution evidence.
+
 ### Add dynamic analysis
 
 For more precise verdicts, generate coverage data first:

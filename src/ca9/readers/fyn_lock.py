@@ -97,7 +97,7 @@ def _load_toml(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
             import tomli as tomllib
         except ModuleNotFoundError:
             return None, [
-                "cannot parse fyn.lock because no TOML parser is available; "
+                f"cannot parse {path.name} because no TOML parser is available; "
                 "install tomli on Python 3.10"
             ]
 
@@ -105,12 +105,12 @@ def _load_toml(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
         with path.open("rb") as f:
             data = tomllib.load(f)
     except OSError as exc:
-        return None, [f"cannot read fyn.lock: {exc}"]
+        return None, [f"cannot read {path.name}: {exc}"]
     except Exception as exc:
-        return None, [f"cannot parse fyn.lock: {exc}"]
+        return None, [f"cannot parse {path.name}: {exc}"]
 
     if not isinstance(data, dict):
-        return None, ["fyn.lock did not parse to a TOML table"]
+        return None, [f"{path.name} did not parse to a TOML table"]
     return data, []
 
 

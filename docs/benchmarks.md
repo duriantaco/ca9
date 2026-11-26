@@ -19,42 +19,104 @@ Each benchmark should record:
 - Total, reachable, unreachable, and inconclusive counts.
 - Notes explaining why unreachable findings are considered noise.
 
-## Real-Repo Validation Gate
+## Python triage on public projects
 
-Before publishing reachability or supply-chain claims, run the pinned public-repo
-validation harness:
+The benchmark checks strict JSON verdicts and OpenVEX statements against six
+reviewed cases, then runs live OSV scans separately. Run these commands from a
+ca9 development checkout with the CLI dependencies installed.
 
 ```bash
-python scripts/real_repo_validation.py --output-dir /tmp/ca9-real-repo-validation
+PYTHONPATH=src python scripts/real_repo_validation.py --output-dir /tmp/ca9-real
+PYTHONPATH=src python scripts/real_repo_validation.py --replay-only --output-dir /tmp/ca9-replay
 ```
 
-The harness clones public repositories at fixed commits, runs `ca9 inventory` and
-`ca9 scan --no-auto-coverage`, writes per-case JSON artifacts, and fails on safety
-regressions. It is not a marketing benchmark. It is a guardrail for claims that ca9
-does not leak ambient environment packages into repository scans and does not emit
-unsafe unreachable suppressions when evidence is incomplete.
+Both commands verify the pinned upstream commits. The replay uses frozen OSV
+identity, title when available, and version evidence. It uses no live advisory
+lookup. Each case writes the input, ca9 JSON and OpenVEX under `artifacts/`.
+The full run also writes the live inventory and scan. A checkout or scan error
+is recorded in `summary.json` and causes a failing exit status.
 
-Current validation set:
+### Reviewed decisions
 
-| Case | Commit | Purpose | Expected contract |
-|---|---|---|---|
-| Flask | `954f5684e4841aad84a8eec7ace7b81a0d3f6831` | Real Python project with resolvable dependency inventory | Inventory resolves from repo evidence with no environment fallback |
-| Django REST Framework | `7433faa98f27c200e34c04586c20024d4d6aa935` | Real Python project with unresolved dependency versions | Scan skips unresolved versions instead of using the ambient environment |
-| SafeDep vet | `d4491496daec6f445803a039524ddab714be01b2` | Real non-Python supply-chain scanner repository | Scan reports no Python CVEs from the current environment |
-| PinTrace | `04b343779b49faf1691823a225858ef93c52c747` | Real Python repo with pinned vulnerable dependencies | Vulnerable imports remain inconclusive without coverage, not suppressed as unreachable |
+Tested on 2026-11-26 with CPython 3.13.18 on arm64 macOS. The comparison uses
+the same inputs and interpreter with the engine from `ad2c629` and the updated
+engine. Each row counts once and passes only if both output formats agree with
+the expected decision.
 
-Latest local run:
+| Project and input | Evidence available | Expected | Previous | Updated |
+|---|---|---|---|---|
+| Flask 3.1.3, Werkzeug 3.1.5 | Pinned source only, no recorded execution | Investigate | Investigate | Investigate |
+| Same release, `send_file` | A normal file read, trace shows zero calls to the named `safe_join` function | Investigate | Reachable | Investigate |
+| Same release, `send_from_directory` | The same file served successfully, trace confirms the named function ran | Reachable | Reachable | Reachable |
+| Docker Compose 1.29.2, PyYAML 5.4.1 | Project pin is past the advisory's 5.4 fix | Unaffected version | Unaffected version | Unaffected version |
+| Same release, Requests 2.24.0 | Version falls in range. The application imports Requests exceptions. No coverage establishes the affected call | Investigate | Investigate | Investigate |
+| Same release, certifi 2020.6.20 | The advisory's explicit affected list includes the equivalent `2020.06.20`, while its release range starts in 2021 | Investigate | Unaffected version | Investigate |
 
-| Case | Inventory Packages | Scan Total | Reachable | Unreachable | Inconclusive | Safety Result |
-|---|---:|---:|---:|---:|---:|---|
-| Flask | 8 | 0 | 0 | 0 | 0 | Pass |
-| Django REST Framework | 1 | 0 | 0 | 0 | 0 | Pass |
-| SafeDep vet | 0 | 0 | 0 | 0 | 0 | Pass |
-| PinTrace | 11 | 2 | 0 | 0 | 2 | Pass |
+The updated engine matched **6/6** reviewed decisions, up from **4/6**.
+Four of the six call for investigation. The Flask positive establishes that the
+named routine ran on an ordinary file read. It does not establish that the
+advisory's operating-system or input conditions applied. These cases were chosen
+to exercise specific decisions and give no estimate of overall accuracy.
+[Werkzeug advisory](https://osv.dev/vulnerability/GHSA-g6x2-hccm-hh4m) ·
+[PyYAML advisory](https://osv.dev/vulnerability/GHSA-8q59-q68h-6hv4) ·
+[Requests advisory](https://osv.dev/vulnerability/GHSA-j8r2-6x86-q33q) ·
+[certifi advisory](https://osv.dev/vulnerability/PYSEC-2024-230)
 
-Do not interpret this table as proof that ca9 catches every vulnerability. The stronger
-claim is narrower: when ca9 lacks enough evidence, it should prefer `INCONCLUSIVE` over
-an unsafe `UNREACHABLE` verdict.
+The Flask observations were collected after import. Each call served the same
+local `hello.txt`. The capture checks the response body, records executed lines
+in the two relevant Werkzeug modules and independently checks the function's
+code-object identity. To regenerate them with the pinned Flask checkout from
+the full run and a fresh Python 3.13 environment:
+
+```bash
+flask_repo=/tmp/ca9-real/repos/flask-release
+python3.13 -m venv /tmp/ca9-flask-probe
+uv export --project "$flask_repo" --frozen --offline --no-default-groups --no-dev --no-emit-project --no-annotate --format requirements.txt --python /tmp/ca9-flask-probe/bin/python --output-file /tmp/ca9-flask-requirements.txt
+/tmp/ca9-flask-probe/bin/python -m pip install --no-deps --only-binary=:all: --require-hashes -r /tmp/ca9-flask-requirements.txt
+PYTHONPATH="$flask_repo/src" /tmp/ca9-flask-probe/bin/python tests/fixtures/triage_benchmark/capture_flask.py > /tmp/flask_calls.json
+diff tests/fixtures/triage_benchmark/flask_calls.json /tmp/flask_calls.json
+```
+
+### Live scans without runtime coverage
+
+| Project | Pinned commit | Package versions checked | Returned findings | Interpretation |
+|---|---|---:|---:|---|
+| Flask development snapshot | `954f5684e4841aad84a8eec7ace7b81a0d3f6831` | 8 | 1 | Inconclusive |
+| Django REST Framework | `7433faa98f27c200e34c04586c20024d4d6aa935` | 0 | 0 | Partial, declared version unresolved |
+| SafeDep vet | `d4491496daec6f445803a039524ddab714be01b2` | 0 | 0 | Partial, no supported Python declarations |
+| Docker Compose 1.29.2 | `5becea4ca9f68875334c92f191a13482bcd6e5cf` | 54 | 149 | All inconclusive |
+| Flask 3.1.3 | `22d924701a6ae2e4cd01e9a15bbaf3946094af65` | 8 | 5 | All inconclusive |
+
+The live run generated 155 findings. Without runtime coverage the engine left
+all 155 inconclusive. Only the six controls above have independent verdict
+labels. Counts can change as OSV records change. The former PinTrace commit
+`04b343779b49faf1691823a225858ef93c52c747` was unavailable upstream during
+this run. Its historical results are excluded.
+
+### Package selection and Python call matching
+
+| Independent check | Previous | Updated |
+|---|---:|---:|
+| Production versions selected by uv across Skylos and Ravage | 24/85 | 85/85 |
+| Applicable Compose requirements on macOS, Python 3.13 | 54 matched, 4 extra | 54 matched, 0 extra |
+| Six reviewed Python call sites in Flask and packaging | 3/6 | 6/6 |
+
+The uv reference uses frozen, offline exports on macOS arm64 with Python 3.12.16
+and uv 0.13.10. Skylos contributed 71 production pins and Ravage 14. ca9 also
+checked five versions explicitly declared in Skylos optional dependencies. The
+lock benchmark verifies the commits inside each local checkout.
+
+```bash
+git clone https://github.com/duriantaco/skylos /tmp/ca9-skylos
+git clone https://github.com/duriantaco/ravage /tmp/ca9-ravage
+PYTHONPATH=src python3.12 scripts/validate_uv_scan.py --skylos /tmp/ca9-skylos --ravage /tmp/ca9-ravage
+PYTHONPATH=src python scripts/source_evidence_validation.py
+```
+
+The source benchmark verifies upstream file hashes, checks four actual calls
+and two references that resolve elsewhere at runtime, and checks how a parser
+reports unsupported syntax using unmodified CPython 3.14 source. That last
+check uses a synthetic advisory solely to test incomplete evidence.
 
 ## npm Lockfile Inventory Validation
 

@@ -59,6 +59,11 @@ class TestCuratedMappings:
         c = extract_affected_component(v)
         assert "django.http.multipartparser" in c.submodule_paths
 
+    def test_safe_join_scope_is_its_implementation_including_when_reexported(self):
+        for title in ("Werkzeug safe_join()", "Werkzeug werkzeug.utils.safe_join()"):
+            c = extract_affected_component(_vuln("Werkzeug", title=title))
+            assert c.submodule_paths == ("werkzeug.security",)
+
     def test_werkzeug_debug(self):
         v = _vuln("Werkzeug", title="RCE via Werkzeug debugger")
         c = extract_affected_component(v)

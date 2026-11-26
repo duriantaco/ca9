@@ -135,6 +135,9 @@ class Evidence:
     # Imported modules no installed distribution provides; they leave the
     # environment dependency graph incomplete.
     dependency_graph_unresolved: tuple[str, ...] = ()
+    # Whether every in-scope runtime Python source could be read and parsed.
+    source_imports_complete: bool | None = None
+    version_scope_conflict: str | None = None
 
 
 @dataclass(frozen=True)
@@ -264,10 +267,16 @@ class ScanCoverage:
     resolved: int
     checked: int
     unresolved: int
+    lock_complete: bool = True
 
     @property
     def complete(self) -> bool:
-        return self.resolved > 0 and self.checked == self.resolved and self.unresolved == 0
+        return (
+            self.lock_complete
+            and self.resolved > 0
+            and self.checked == self.resolved
+            and self.unresolved == 0
+        )
 
     def to_dict(self) -> dict:
         return {

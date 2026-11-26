@@ -190,40 +190,13 @@ pip workflows.**
 
 ## Real-world results
 
-These historical results predate the stricter coverage-scope rules. Current
-strict-mode results can include more inconclusive findings where earlier runs
-used test non-execution to suppress alerts.
-
-### Django REST Framework — 37 CVEs, 19% noise
-
-A focused library that genuinely uses most of its deps. Even here, ca9 found 7 CVEs in packages that are installed but never imported (redis, sentry-sdk, pip):
-
-```
-$ ca9 scan --repo /path/to/drf -v
-
-GHSA-g92j-qhmh-64v2  sentry-sdk  low       UNREACHABLE (static)
-                      -> 'sentry-sdk' is not imported and not a dependency of any imported package
-GHSA-8fww-64cx-x8p5  redis       high      UNREACHABLE (static)
-                      -> 'redis' is not imported and not a dependency of any imported package
-...
-Total: 37  |  Reachable: 0  |  Unreachable: 7  |  Inconclusive: 30
-```
-
-### Flask app with bloated deps — 61 CVEs, 59% noise
-
-A Flask app that imports 4 packages but has 19 pinned in `requirements.txt` (Django, tornado, Pygments added "just in case"):
-
-```
-$ ca9 scan --repo demo/ --coverage demo/coverage.json
-
-Total: 61  |  Reachable: 25  |  Unreachable: 36  |  Inconclusive: 0
-
-59% of flagged CVEs are unreachable — only 25 of 61 require action
-```
-
-Django alone brought 21 CVEs that were pure noise.
-
-**The pattern:** ca9's value scales with how bloated your dependency list is — which in enterprise codebases is typically *very*.
+The strict-mode benchmark checks six decisions on pinned Flask and Docker Compose
+releases. For example, two Flask requests return the same local file. The benchmark
+records whether each request actually called the Werkzeug function named in the
+advisory, then checks the ca9 verdict and OpenVEX status. Other cases cover an
+already-fixed dependency and conflicting version information in an advisory.
+The [benchmark results and commands](docs/benchmarks.md) include the expected
+decisions, the comparison with the previous engine, and the inconclusive cases.
 
 ## Quick start
 
