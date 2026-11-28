@@ -1,0 +1,134 @@
+{
+  "built_at": "2026-11-28T10:21:25Z",
+  "expires_at": "2026-12-05T10:21:25Z",
+  "malware_counts": {
+    "npm-malware": 238037,
+    "pypi-malware": 17663
+  },
+  "malware_range_counts": {
+    "npm-malware-ranges": 1405,
+    "pypi-malware-ranges": 14
+  },
+  "malware_stats": {
+    "npm-malware": {
+      "bounded_skipped": 806,
+      "cwe506_records": 391,
+      "malicious_records": 225101,
+      "versioned": 15371,
+      "whole_package": 209044,
+      "withdrawn_skipped": 340
+    },
+    "npm-malware-ranges": {
+      "range_unusable": 0,
+      "ranged": 1405
+    },
+    "pypi-malware": {
+      "bounded_skipped": 4,
+      "cwe506_records": 8,
+      "malicious_records": 12147,
+      "versioned": 5742,
+      "whole_package": 6404,
+      "withdrawn_skipped": 25
+    },
+    "pypi-malware-ranges": {
+      "range_unusable": 0,
+      "ranged": 14
+    }
+  },
+  "osv_built_at": "2026-11-28T10:21:25Z",
+  "osv_reason": "the previous OSV data is 8.4h old (rebuild every 6h)",
+  "osv_rebuilt": true,
+  "schema": "ca9.feed.v1",
+  "sentinel": {
+    "npm": {
+      "abandoned": 1,
+      "allowlisted": 0,
+      "budget_hit": false,
+      "checked": 4997,
+      "complete": false,
+      "deferred": 0,
+      "dropped_entries": 0,
+      "elapsed_seconds": 569.5,
+      "entries": 3,
+      "expired_entries": 0,
+      "failed_reasons": {
+        "timeout": 1
+      },
+      "flagged": 0,
+      "incomplete": 1,
+      "lagging": 0,
+      "metadata_errors": 0,
+      "new_versions": 103,
+      "not_found": 3,
+      "not_reached": 0,
+      "pending": 0,
+      "prereleases_skipped": 93,
+      "reviewed": 11,
+      "run_at": "2026-11-28T10:21:44Z",
+      "unchanged": 4961,
+      "unpublished": 0,
+      "unreviewed": [
+        {
+          "name": "@prisma/studio-core",
+          "reason": "timeout",
+          "version": "0.36.0"
+        }
+      ],
+      "watched": 5000,
+      "watermark_source": "previous",
+      "window": {
+        "since": "2026-11-28T01:37:09Z",
+        "until": "2026-11-28T10:01:44Z"
+      }
+    },
+    "pypi": {
+      "abandoned": 1,
+      "allowlisted": 0,
+      "budget_hit": false,
+      "checked": 4998,
+      "complete": false,
+      "deferred": 0,
+      "dropped_entries": 0,
+      "elapsed_seconds": 569.5,
+      "entries": 19,
+      "expired_entries": 0,
+      "failed_reasons": {
+        "timeout": 3
+      },
+      "flagged": 0,
+      "incomplete": 3,
+      "lagging": 0,
+      "metadata_errors": 0,
+      "new_versions": 21,
+      "not_found": 2,
+      "not_reached": 0,
+      "pending": 2,
+      "prereleases_skipped": 5,
+      "reviewed": 14,
+      "run_at": "2026-11-28T10:21:44Z",
+      "unchanged": 4866,
+      "unpublished": 0,
+      "unreviewed": [
+        {
+          "name": "openmed",
+          "reason": "timeout",
+          "version": "4.0.0"
+        }
+      ],
+      "watched": 5000,
+      "watermark_source": "previous",
+      "window": {
+        "since": "2026-11-28T01:37:09Z",
+        "until": "2026-11-28T10:01:44Z"
+      }
+    }
+  },
+  "sources": {
+    "PyPI": "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip",
+    "npm": "https://osv-vulnerabilities.storage.googleapis.com/npm/all.zip"
+  },
+  "suspicious_counts": {
+    "npm-suspicious": 3,
+    "pypi-suspicious": 19
+  }
+}
